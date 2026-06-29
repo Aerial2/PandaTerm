@@ -1,0 +1,23 @@
+[package]
+name = "pandaterm"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2.2.0", features = [] }
+
+[dependencies]
+panda-core = { path = "../crates/panda-core" }
+panda-session = { path = "../crates/panda-session" }
+panda-transfer = { path = "../crates/panda-transfer" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.2.5", features = [] }
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+encoding_rs = "0.8.35"
+portable-pty = "0.9.0"
+russh = "0.51"
