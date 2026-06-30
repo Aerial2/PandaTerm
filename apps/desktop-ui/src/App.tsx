@@ -2787,7 +2787,7 @@ export function App() {
     if (event.button !== 0) return;
     if ((event.target as HTMLElement).closest('button')) return;
 
-    paneTabPointerDownTs.current = Date.now();
+    paneTabDragActivated.current = false;
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture?.(event.pointerId);
@@ -2804,6 +2804,7 @@ export function App() {
       const distance = Math.hypot(dx, dy);
       if (!activated && distance < TERMINAL_TAB_DRAG_THRESHOLD) return;
       activated = true;
+      paneTabDragActivated.current = true;
 
       if (paneEl) {
         const paneRect = paneEl.getBoundingClientRect();
@@ -2970,8 +2971,7 @@ export function App() {
                 }}
                 onDoubleClick={(event) => {
                   event.stopPropagation();
-                  // Suppress dblclick if it was triggered by drag attempts (pointerdown within 400ms)
-                  if (Date.now() - paneTabPointerDownTs.current < 400) return;
+                  if (paneTabDragActivated.current) { paneTabDragActivated.current = false; return; }
                   void addTerminalTabToCurrentPane(tab.session);
                 }}
               >
