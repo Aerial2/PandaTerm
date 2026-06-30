@@ -1,14 +1,18 @@
 import { listen } from '@tauri-apps/api/event';
+
 import { Terminal, type ITheme } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
+import { EditorPanel, detectLanguage, type EditorTab } from './EditorPanel';
 import {
   ArrowLeft,
   ArrowRight,
   ChevronDown,
   ChevronRight,
+  Download,
   File,
+  FileText,
   FolderOpen,
   Home,
   PanelLeftClose,
@@ -23,15 +27,38 @@ import {
   Trash2,
   Upload,
   X,
+  Archive,
+  FileArchive,
+  Clipboard,
+  Scissors,
+  ClipboardPaste,
+  FilePlus,
+  FolderPlus,
 } from 'lucide-react';
 import {
   connectSession,
   disconnectSession,
   getLocalTerminalProfile,
   listLocalDirectory,
+  listRemoteDirectory,
   deleteSession,
   listSessions,
-  readLocalFilePreview,
+  readLocalFileFull,
+  readRemoteFileFull,
+  writeLocalFile,
+  writeRemoteFile,
+  uploadFile,
+  uploadLocalFile,
+  readFileAsDataUrl,
+  downloadRemoteFile,
+  extractArchive,
+  createArchive,
+  deletePath,
+  createFile,
+  createDirectory,
+  copyPath,
+  movePath,
+  getLocalIpv4,
   resizeLocalTerminal,
   resizeTerminal,
   sendLocalTerminalInput,
@@ -40,7 +67,7 @@ import {
   terminalWrite,
   saveSession,
 } from './api';
-import type { LocalDirectoryEntry, LocalDirectoryListing, LocalFilePreview, LocalTerminalProfile, Session, TerminalOutputEvent } from './api';
+import type { LocalDirectoryEntry, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent } from './api';
 
 type TabKind = 'terminal' | 'sftp';
 
@@ -86,6 +113,33 @@ const TERMINAL_PANE_EDGE_DROP_RATIO = 0.25;
 const TERMINAL_SPLIT_RATIO_MIN = 0.15;
 const TERMINAL_SPLIT_RATIO_MAX = 0.85;
 
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico']);
+const VIDEO_EXTS = new Set(['mp4', 'webm', 'ogg', 'ogv', 'mov', 'avi', 'mkv']);
+const AUDIO_EXTS = new Set(['mp3', 'wav', 'flac', 'aac', 'm4a', 'ogg']);
+const ARCHIVE_EXTS = new Set(['zip', 'tar', 'gz', 'tgz', 'bz2', 'tbz2', 'xz', 'txz', '7z', 'rar']);
+
+function getFileExt(name: string): string {
+  const lower = name.toLowerCase();
+  // Handle compound extensions like .tar.gz
+  for (const compound of ['.tar.gz', '.tar.bz2', '.tar.xz']) {
+    if (lower.endsWith(compound)) return compound.slice(1);
+  }
+  const idx = lower.lastIndexOf('.');
+  return idx > 0 ? lower.slice(idx + 1) : '';
+}
+
+function getMediaKind(name: string): 'image' | 'video' | 'audio' | null {
+  const ext = getFileExt(name);
+  if (IMAGE_EXTS.has(ext)) return 'image';
+  if (VIDEO_EXTS.has(ext)) return 'video';
+  if (AUDIO_EXTS.has(ext)) return 'audio';
+  return null;
+}
+
+function isArchive(name: string): boolean {
+  return ARCHIVE_EXTS.has(getFileExt(name));
+}
+
 type TerminalLayoutNode =
   | { type: 'leaf'; tabId: string; tabIds?: string[] }
   | { type: 'split'; id: string; direction: TerminalSplitDirection; ratio: number; first: TerminalLayoutNode; second: TerminalLayoutNode };
@@ -124,6 +178,28 @@ type ResourceFile = {
 
 type ResourceSortKey = 'name' | 'size' | 'modifiedTime';
 type ResourceBottomTab = 'transfer' | 'log';
+
+type TransferRecord = {
+  id: string;
+  fileName: string;
+  direction: 'upload' | 'download';
+  target: string;
+  size: number;
+  status: 'pending' | 'uploading' | 'success' | 'failed' | 'cancelled';
+  message: string;
+  time: string;
+  progress: number;
+  transferred: number;
+  speed: number;
+  startTime: number;
+};
+
+type LogEntry = {
+  id: string;
+  time: string;
+  level: 'info' | 'warn' | 'error';
+  text: string;
+};
 type ConnectionPanelMode = 'create' | 'manage' | null;
 type ConnectionAuthMethod = 'password' | 'public_key' | 'keyboard_interactive' | 'gssapi';
 
@@ -206,6 +282,19 @@ function formatFileSize(size: number) {
   return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
 }
 
+function formatSpeed(bytesPerSec: number): string {
+  if (bytesPerSec <= 0) return '0 B/s';
+  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+  const unitIndex = Math.min(Math.floor(Math.log(bytesPerSec) / Math.log(1024)), units.length - 1);
+  const value = bytesPerSec / 1024 ** unitIndex;
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function truncateStatus(text: string, max = 120): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max) + '...';
+}
+
 function formatModifiedTime(modifiedMs?: number | null) {
   if (!modifiedMs) return '-';
   return new Intl.DateTimeFormat('zh-CN', {
@@ -227,12 +316,6 @@ function toResourceFile(entry: LocalDirectoryEntry): ResourceFile {
     modifiedTime: formatModifiedTime(entry.modified_ms),
   };
 }
-
-const resourceLogs = [
-  '本地资源视图已接入真实目录读取。',
-  '当前已支持目录刷新、路径跳转、上级目录和双击进入目录。',
-  '文件预览、编辑、复制、移动和删除将按后续步骤接入。',
-];
 
 function compareResource(a: ResourceFile, b: ResourceFile, key: ResourceSortKey) {
   if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
@@ -484,16 +567,34 @@ export function App() {
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [fileListError, setFileListError] = useState('');
   const [pathInput, setPathInput] = useState('');
+  const [canNavigateBack, setCanNavigateBack] = useState(false);
+  const [canNavigateForward, setCanNavigateForward] = useState(false);
   const [fileSearchQuery, setFileSearchQuery] = useState('');
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
-  const [filePreview, setFilePreview] = useState<LocalFilePreview | null>(null);
-  const [filePreviewError, setFilePreviewError] = useState('');
-  const [isLoadingPreview, setIsLoadingPreview] = useState(false);
+  const [mediaViewer, setMediaViewer] = useState<{ url: string; name: string; kind: 'image' | 'video' | 'audio' } | null>(null);
+  const [isLoadingMedia, setIsLoadingMedia] = useState(false);
+  const [mediaError, setMediaError] = useState('');
   const [sortKey, setSortKey] = useState<ResourceSortKey>('name');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
   const [resourceBottomTab, setResourceBottomTab] = useState<ResourceBottomTab>('transfer');
+  const [transferRecords, setTransferRecords] = useState<TransferRecord[]>([]);
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
+  const [clipboard, setClipboard] = useState<{ path: string; operation: 'copy' | 'cut'; terminalId: string | null } | null>(null);
+  const [newItemDialog, setNewItemDialog] = useState<{ type: 'file' | 'directory' } | null>(null);
+  const [newItemName, setNewItemName] = useState('');
+  const [renameDialog, setRenameDialog] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
   const [connectionPanelMode, setConnectionPanelMode] = useState<ConnectionPanelMode>(null);
   const [pendingPaneTabId, setPendingPaneTabId] = useState<string | null>(null);
+  const [editorTabs, setEditorTabs] = useState<EditorTab[]>([]);
+  const [activeEditorTabId, setActiveEditorTabId] = useState<string | null>(null);
+  const [showEditor, setShowEditor] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: ResourceFile | null } | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadAbortRefs = useRef<Map<string, AbortController>>(new Map());
+  const localIpCacheRef = useRef<string | null>(null);
   const [connectionAuthMethod, setConnectionAuthMethod] = useState<ConnectionAuthMethod>('password');
   const [connectionForm, setConnectionForm] = useState<ConnectionFormState>(initialConnectionForm);
   const [isSavingConnection, setIsSavingConnection] = useState(false);
@@ -518,6 +619,7 @@ export function App() {
   const activePaneIdRef = useRef<string | null>(null);
   const terminalDragStateRef = useRef<TerminalDragState | null>(null);
   const terminalPointerDragRef = useRef<TerminalPointerDragCandidate | null>(null);
+  const paneTabDragActivated = useRef(false);
   const terminalSplitResizeRef = useRef<TerminalSplitResizeCandidate | null>(null);
   const paneTabElRefs = useRef<Map<string, HTMLElement>>(new Map());
   const tabsRef = useRef<WorkspaceTab[]>([]);
@@ -529,6 +631,9 @@ export function App() {
   const pendingOutputRef = useRef<Map<string, string[]>>(new Map());
   const currentPathRef = useRef('');
   const resourceFilesRef = useRef<ResourceFile[]>([]);
+  // Per-pane navigation history: each terminal pane keeps its own back/forward
+  // stack so switching between local and remote panes restores the right trail.
+  const navHistoryRef = useRef<Map<string, { history: string[]; index: number }>>(new Map());
 
   function getTerminalViewportSize(tabId: string) {
     const host = terminalHostsRef.current.get(tabId);
@@ -663,6 +768,51 @@ export function App() {
     };
   }
 
+  function addLogEntry(level: LogEntry['level'], text: string) {
+    const entry: LogEntry = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      level,
+      text,
+    };
+    setLogEntries((current) => [...current, entry].slice(-200));
+  }
+
+  function addTransferRecord(record: Omit<TransferRecord, 'id' | 'time' | 'progress' | 'transferred' | 'speed' | 'startTime'>): string {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const full: TransferRecord = {
+      ...record,
+      id,
+      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      progress: 0,
+      transferred: 0,
+      speed: 0,
+      startTime: Date.now(),
+    };
+    setTransferRecords((current) => [full, ...current].slice(0, 100));
+    return id;
+  }
+
+  function updateTransferRecord(id: string, patch: Partial<TransferRecord> | ((prev: TransferRecord) => Partial<TransferRecord>)) {
+    setTransferRecords((current) =>
+      current.map((r) => (r.id === id ? { ...r, ...(typeof patch === 'function' ? patch(r) : patch) } : r))
+    );
+  }
+
+  function deleteTransferRecord(id: string) {
+    setTransferRecords((current) => current.filter((r) => r.id !== id));
+  }
+
+  function cancelUpload(id: string) {
+    const abortCtrl = uploadAbortRefs.current.get(id);
+    if (abortCtrl) {
+      abortCtrl.abort();
+      uploadAbortRefs.current.delete(id);
+    }
+    updateTransferRecord(id, { status: 'cancelled', message: '已取消' });
+    addLogEntry('warn', `上传已取消`);
+  }
+
   function disposeTerminalRuntime(tab: WorkspaceTab) {
     if (tab.kind === 'terminal' && tab.terminalId) {
       if (tab.session.id !== localSession.id) {
@@ -733,9 +883,16 @@ export function App() {
       currentPathRef.current = listing.path;
       resourceFilesRef.current = nextFiles;
       setSelectedFile(null);
-      setFilePreview(null);
-      setFilePreviewError('');
-      setStatusMessage(`已读取本地目录：${listing.path}`);
+      setMediaViewer(null);
+      setMediaError('');
+      if (!localIpCacheRef.current) {
+        try {
+          localIpCacheRef.current = await getLocalIpv4();
+        } catch {
+          localIpCacheRef.current = '127.0.0.1';
+        }
+      }
+      setStatusMessage(localIpCacheRef.current);
       return listing;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -745,6 +902,106 @@ export function App() {
     } finally {
       setIsLoadingFiles(false);
     }
+  }
+
+  function isLocalResourceTab(tab: WorkspaceTab | null): boolean {
+    return !tab || tab.session.id === localSession.id;
+  }
+
+  function syncNavButtons(history: string[], index: number) {
+    setCanNavigateBack(index > 0);
+    setCanNavigateForward(index < history.length - 1);
+  }
+
+  // Route directory loading to local or remote based on the active pane tab.
+  // `recordHistory` controls whether the navigation pushes a new entry onto the
+  // back/forward stack (user-driven navigation) or just restores the view
+  // (back/forward/pane-switch).
+  async function loadResourceDirectory(path?: string | null, recordHistory = true): Promise<void> {
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    setIsLoadingFiles(true);
+    setFileListError('');
+    try {
+      const listing = local
+        ? await listLocalDirectory(path)
+        : tab?.terminalId
+          ? await listRemoteDirectory(tab.terminalId, path)
+          : null;
+      if (!listing) {
+        throw new Error('远程终端尚未连接，无法浏览文件');
+      }
+      const nextFiles = listing.entries.map(toResourceFile);
+      setCurrentPath(listing.path);
+      setPathInput(listing.path);
+      setParentPath(listing.parent ?? null);
+      setResourceFiles(nextFiles);
+      currentPathRef.current = listing.path;
+      resourceFilesRef.current = nextFiles;
+      setSelectedFile(null);
+      setMediaViewer(null);
+      setMediaError('');
+      if (local) {
+        if (!localIpCacheRef.current) {
+          try {
+            localIpCacheRef.current = await getLocalIpv4();
+          } catch {
+            localIpCacheRef.current = '127.0.0.1';
+          }
+        }
+        setStatusMessage(localIpCacheRef.current);
+      } else {
+        setStatusMessage(tab?.session.host ?? '');
+      }
+
+      // Update per-pane navigation history.
+      const paneKey = tab?.id ?? '__local__';
+      const entry = navHistoryRef.current.get(paneKey);
+      if (recordHistory) {
+        if (entry) {
+          const truncated = entry.history.slice(0, entry.index + 1);
+          if (truncated[truncated.length - 1] !== listing.path) {
+            truncated.push(listing.path);
+          }
+          const nextIndex = truncated.length - 1;
+          navHistoryRef.current.set(paneKey, { history: truncated, index: nextIndex });
+          syncNavButtons(truncated, nextIndex);
+        } else {
+          navHistoryRef.current.set(paneKey, { history: [listing.path], index: 0 });
+          syncNavButtons([listing.path], 0);
+        }
+      } else if (entry) {
+        syncNavButtons(entry.history, entry.index);
+      } else {
+        syncNavButtons([], -1);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setFileListError(message);
+      setStatusMessage(`读取目录失败：${message}`);
+    } finally {
+      setIsLoadingFiles(false);
+    }
+  }
+
+  function navigateBack() {
+    const tab = activePaneTabRef.current;
+    const paneKey = tab?.id ?? '__local__';
+    const entry = navHistoryRef.current.get(paneKey);
+    if (!entry || entry.index <= 0) return;
+    const nextIndex = entry.index - 1;
+    navHistoryRef.current.set(paneKey, { history: entry.history, index: nextIndex });
+    void loadResourceDirectory(entry.history[nextIndex], false);
+  }
+
+  function navigateForward() {
+    const tab = activePaneTabRef.current;
+    const paneKey = tab?.id ?? '__local__';
+    const entry = navHistoryRef.current.get(paneKey);
+    if (!entry || entry.index >= entry.history.length - 1) return;
+    const nextIndex = entry.index + 1;
+    navHistoryRef.current.set(paneKey, { history: entry.history, index: nextIndex });
+    void loadResourceDirectory(entry.history[nextIndex], false);
   }
 
   useEffect(() => {
@@ -801,6 +1058,39 @@ export function App() {
     activePaneIdRef.current = activePaneId;
   }, [activePaneId]);
 
+  // The terminal tab that currently owns the resource panel: the active pane
+  // inside the active workspace. Local panes browse the local filesystem;
+  // remote panes browse the remote filesystem via SFTP-like exec commands.
+  const activePaneTab = useMemo(
+    () => (activePaneId ? tabs.find((tab) => tab.id === activePaneId && tab.kind === 'terminal') ?? null : null),
+    [activePaneId, tabs],
+  );
+  const activePaneTabRef = useRef<WorkspaceTab | null>(null);
+  useEffect(() => {
+    activePaneTabRef.current = activePaneTab;
+  }, [activePaneTab]);
+
+  // When the active pane changes (switching tabs, focusing a different split
+  // pane, or after a remote connection establishes), reload the resource panel
+  // so it reflects the newly focused terminal's filesystem.
+  useEffect(() => {
+    if (!activePaneTab) return;
+    // Only auto-switch for remote panes once they are actually connected; local
+    // panes can be browsed immediately.
+    const ready = isLocalResourceTab(activePaneTab) || activePaneTab.status === 'connected';
+    if (!ready) return;
+    const paneKey = activePaneTab.id;
+    const entry = navHistoryRef.current.get(paneKey);
+    if (entry && entry.history[entry.index]) {
+      // Pane already has a navigation trail — restore its current position
+      // without pushing a new history entry.
+      void loadResourceDirectory(entry.history[entry.index], false);
+    } else {
+      void loadResourceDirectory(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePaneTab?.id, activePaneTab?.status]);
+
   useEffect(() => {
     terminalDragStateRef.current = terminalDragState;
   }, [terminalDragState]);
@@ -812,6 +1102,11 @@ export function App() {
   useEffect(() => {
     resourceFilesRef.current = resourceFiles;
   }, [resourceFiles]);
+
+  // File drag-drop is now handled entirely via HTML5 native events
+  // (onDragOver / onDrop / onDragLeave on the file panel <aside>).
+  // Setting dragDropEnabled: false in tauri.conf.json allows HTML5 events
+  // to work normally — no more forbidden-cursor icon when dragging files.
 
   useEffect(() => {
     if (!openingConnection) return;
@@ -1475,16 +1770,16 @@ export function App() {
 
   function submitPathInput() {
     const normalized = pathInput.trim();
-    loadLocalDirectory(normalized || null);
+    void loadResourceDirectory(normalized || null);
   }
 
   function navigateToPath(path: string) {
-    loadLocalDirectory(path);
+    void loadResourceDirectory(path);
   }
 
   function navigateUp() {
     if (!parentPath) return;
-    loadLocalDirectory(parentPath);
+    void loadResourceDirectory(parentPath);
   }
 
   function toggleSort(key: ResourceSortKey) {
@@ -1500,26 +1795,497 @@ export function App() {
   async function openSelectedFile(file: ResourceFile) {
     setSelectedFile(file.name);
     if (file.type === 'directory') {
-      loadLocalDirectory(file.path);
+      void loadResourceDirectory(file.path);
       return;
     }
 
-    setIsLoadingPreview(true);
-    setFilePreviewError('');
+    // Images / videos / audio -> media viewer
+    const kind = getMediaKind(file.name);
+    if (kind) {
+      void openMediaViewer(file, kind);
+      return;
+    }
 
+    // Everything else -> built-in editor
+    void openFileInEditor(file);
+  }
+
+  async function openMediaViewer(file: ResourceFile, kind: 'image' | 'video' | 'audio') {
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    setMediaViewer(null);
+    setMediaError('');
+    setIsLoadingMedia(true);
     try {
-      const preview = await readLocalFilePreview(file.path);
-      setFilePreview(preview);
-      setStatusMessage(`已预览文件：${preview.path}`);
+      const url = await readFileAsDataUrl(file.path, local ? null : tab?.terminalId ?? null);
+      setMediaViewer({ url, name: file.name, kind });
+      setStatusMessage(`正在查看：${file.name}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setFilePreview(null);
-      setFilePreviewError(message);
-      setStatusMessage(`预览文件失败：${message}`);
+      setMediaError(message);
+      setStatusMessage(`无法查看媒体文件：${message}`);
     } finally {
-      setIsLoadingPreview(false);
+      setIsLoadingMedia(false);
     }
   }
+
+  async function openFileInEditor(file: ResourceFile) {
+    // If already open, just focus it.
+    const existing = editorTabs.find((t) => t.path === file.path);
+    if (existing) {
+      setActiveEditorTabId(existing.id);
+      setShowEditor(true);
+      return;
+    }
+
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    const tabId = `${file.path}::${Date.now()}`;
+    const newTab: EditorTab = {
+      id: tabId,
+      path: file.path,
+      name: file.name,
+      language: detectLanguage(file.name),
+      content: '',
+      originalContent: '',
+      isRemote: !local,
+      terminalId: local ? undefined : tab?.terminalId,
+      loading: true,
+      error: '',
+    };
+    setEditorTabs((current) => [...current, newTab]);
+    setActiveEditorTabId(tabId);
+    setShowEditor(true);
+
+    try {
+      const full = local
+        ? await readLocalFileFull(file.path)
+        : tab?.terminalId
+          ? await readRemoteFileFull(tab.terminalId, file.path)
+          : null;
+      if (!full) {
+        throw new Error('远程终端尚未连接，无法读取文件');
+      }
+      setEditorTabs((current) => current.map((t) =>
+        t.id === tabId
+          ? { ...t, content: full.content, originalContent: full.content, loading: false }
+          : t,
+      ));
+      setStatusMessage(`已打开文件：${file.path}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setEditorTabs((current) => current.map((t) =>
+        t.id === tabId ? { ...t, loading: false, error: message } : t,
+      ));
+      setStatusMessage(`打开文件失败：${message}`);
+    }
+  }
+
+  function closeEditorTab(id: string) {
+    setEditorTabs((current) => {
+      const next = current.filter((t) => t.id !== id);
+      if (activeEditorTabId === id) {
+        setActiveEditorTabId(next.length > 0 ? next[next.length - 1].id : null);
+      }
+      if (next.length === 0) {
+        setShowEditor(false);
+      }
+      return next;
+    });
+  }
+
+  function updateEditorContent(id: string, content: string) {
+    setEditorTabs((current) => current.map((t) =>
+      t.id === id ? { ...t, content } : t,
+    ));
+  }
+
+  async function saveEditorFile(id: string) {
+    const tab = editorTabs.find((t) => t.id === id);
+    if (!tab || tab.content === tab.originalContent) return;
+    try {
+      if (tab.isRemote && tab.terminalId) {
+        await writeRemoteFile(tab.terminalId, tab.path, tab.content);
+      } else {
+        await writeLocalFile(tab.path, tab.content);
+      }
+      setEditorTabs((current) => current.map((t) =>
+        t.id === id ? { ...t, originalContent: tab.content } : t,
+      ));
+      setStatusMessage(`已保存：${tab.path}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`保存失败：${message}`);
+    }
+  }
+
+  function triggerFileUpload() {
+    fileInputRef.current?.click();
+  }
+
+  async function uploadFiles(fileList: File[], localPaths?: string[]) {
+    if (fileList.length === 0) return;
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    const destDir = currentPath || (local ? '.' : '~');
+    const targetLabel = local ? '本地' : `远程 ${tab?.session.name ?? ''}`;
+    const terminalId = local ? null : tab?.terminalId ?? null;
+    setIsUploading(true);
+    let uploaded = 0;
+    let failed = '';
+    addLogEntry('info', `开始上传 ${fileList.length} 个文件到 ${targetLabel}：${destDir}`);
+    try {
+      for (let i = 0; i < fileList.length; i++) {
+        const file = fileList[i];
+        const localPath = localPaths?.[i];
+        // 远程上传且有本地路径时，走流式上传，避免前端 base64 编码阻塞 UI。
+        const useStreamUpload = !local && terminalId && localPath;
+        const recordId = addTransferRecord({
+          fileName: file.name,
+          direction: 'upload',
+          target: destDir,
+          size: file.size,
+          status: 'uploading',
+          message: '上传中...',
+        });
+        const abortCtrl = new AbortController();
+        uploadAbortRefs.current.set(recordId, abortCtrl);
+        const startTime = Date.now();
+        // Listen for real progress events from the Rust backend.
+        let lastEventTime = startTime;
+        let lastEventTransferred = 0;
+        const progressUnlisten = await listen<{ transfer_id: string; transferred: number; total: number }>('upload-progress', (event) => {
+          if (event.payload.transfer_id !== recordId) return;
+          const transferred = event.payload.transferred;
+          const total = event.payload.total;
+          const progress = total > 0 ? Math.min((transferred / total) * 100, 100) : 0;
+          const now = Date.now();
+          const dt = (now - lastEventTime) / 1000;
+          const db = transferred - lastEventTransferred;
+          const instSpeed = dt > 0 ? db / dt : 0;
+          lastEventTime = now;
+          lastEventTransferred = transferred;
+          updateTransferRecord(recordId, (prev) => {
+            const smoothed = prev.speed > 0 ? prev.speed * 0.5 + instSpeed * 0.5 : instSpeed;
+            const sizePatch = prev.size === 0 && total > 0 ? { size: total } : {};
+            return { progress, transferred, speed: smoothed, message: '正在传输...', ...sizePatch };
+          });
+        });
+        try {
+          if (abortCtrl.signal.aborted) throw new DOMException('已取消', 'AbortError');
+          if (useStreamUpload) {
+            // 流式上传：Rust 端直接读取本地文件分块上传，前端不接触文件内容。
+            await uploadLocalFile(localPath!, destDir, recordId, terminalId!);
+          } else {
+            // 降级路径：前端读取文件内容并 base64 编码后上传。
+            const buffer = await file.arrayBuffer();
+            if (abortCtrl.signal.aborted) throw new DOMException('已取消', 'AbortError');
+            await uploadFile(file.name, new Uint8Array(buffer), destDir, recordId, terminalId);
+          }
+          progressUnlisten();
+          uploadAbortRefs.current.delete(recordId);
+          uploaded += 1;
+          const elapsed = (Date.now() - startTime) / 1000;
+          const avgSpeed = elapsed > 0 ? file.size / elapsed : 0;
+          updateTransferRecord(recordId, { status: 'success', progress: 100, transferred: file.size, speed: avgSpeed, message: '已完成' });
+          addLogEntry('info', `上传成功：${file.name} → ${destDir} (${formatFileSize(file.size)})`);
+        } catch (error) {
+          progressUnlisten();
+          uploadAbortRefs.current.delete(recordId);
+          if (abortCtrl.signal.aborted) {
+            updateTransferRecord(recordId, { status: 'cancelled', message: '已取消' });
+            continue;
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          failed += `${file.name}: ${message}; `;
+          updateTransferRecord(recordId, { status: 'failed', message });
+          addLogEntry('error', `上传失败：${file.name} - ${message}`);
+        }
+      }
+      if (uploaded > 0) {
+        setStatusMessage(`已上传 ${uploaded} 个文件到 ${targetLabel}：${destDir}`);
+        await loadResourceDirectory(destDir, false);
+      }
+      if (failed) {
+        setStatusMessage(`部分文件上传失败：${failed}`);
+      }
+    } finally {
+      setIsUploading(false);
+    }
+  }
+
+  async function handleFileUpload(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    await uploadFiles(Array.from(files));
+    // Reset input so selecting the same file again re-triggers change.
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  }
+
+  function handleDragOver(event: React.DragEvent) {
+    if (resourceCollapsed || isUploading) return;
+    // Must preventDefault on dragover to allow drop and clear the forbidden cursor.
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    if (!isDragOver) setIsDragOver(true);
+  }
+
+  function handleDragLeave(event: React.DragEvent) {
+    // Only clear when leaving the panel entirely (not when moving between children).
+    if (event.currentTarget === event.target) {
+      setIsDragOver(false);
+    }
+  }
+
+  async function handleDrop(event: React.DragEvent) {
+    event.preventDefault();
+    setIsDragOver(false);
+    const files = event.dataTransfer?.files;
+    if (!files || files.length === 0) return;
+    await uploadFiles(Array.from(files));
+  }
+
+  // Prevent the browser from showing the "forbidden" cursor when dragging
+  // files over the window. Calling preventDefault() on the top-level element
+  // tells the browser "this page handles drops", which removes the
+  // prohibitive icon. The actual upload only happens when the drop lands on
+  // the file-panel <aside> (handled by handleDrop above).
+  function handleGlobalDragOver(event: React.DragEvent) {
+    event.preventDefault();
+  }
+
+  function handleGlobalDrop(event: React.DragEvent) {
+    // Suppress browser default (open file in window) for drops outside the
+    // file panel. Drops inside the file panel are already handled by
+    // handleDrop which also calls preventDefault().
+    if (!(event.target as HTMLElement).closest('.file-panel:not(.collapsed)')) {
+      event.preventDefault();
+    }
+  }
+
+  async function downloadFileToLocal(file: ResourceFile) {
+    const tab = activePaneTabRef.current;
+    if (!tab?.terminalId) {
+      setStatusMessage('仅支持下载远程文件到本地');
+      return;
+    }
+    const localDir = currentPathRef.current || '.';
+    addLogEntry('info', `开始下载：${file.name} → ${localDir}`);
+    const recordId = addTransferRecord({
+      fileName: file.name,
+      direction: 'download',
+      target: localDir,
+      size: file.sizeBytes,
+      status: 'uploading',
+      message: '下载中...',
+    });
+    const startTime = Date.now();
+    const progressTimer = setInterval(() => {
+      updateTransferRecord(recordId, (prev) => {
+        const elapsed = (Date.now() - startTime) / 1000;
+        if (prev.progress >= 85) {
+          const transferredAt85 = Math.floor(0.85 * file.sizeBytes);
+          const realSpeed = elapsed > 0 ? transferredAt85 / elapsed : 0;
+          return { speed: realSpeed, message: '正在接收数据...' };
+        }
+        const inc = Math.random() * 2 + 1;
+        const newProgress = Math.min(prev.progress + inc, 85);
+        const newTransferred = Math.floor((newProgress / 100) * file.sizeBytes);
+        const realSpeed = elapsed > 0 ? newTransferred / elapsed : 0;
+        return { progress: newProgress, transferred: newTransferred, speed: realSpeed };
+      });
+    }, 300);
+    try {
+      const savedPath = await downloadRemoteFile(tab.terminalId, file.path, localDir);
+      clearInterval(progressTimer);
+      const elapsed = (Date.now() - startTime) / 1000;
+      const avgSpeed = elapsed > 0 ? file.sizeBytes / elapsed : 0;
+      updateTransferRecord(recordId, { status: 'success', progress: 100, transferred: file.sizeBytes, speed: avgSpeed, message: '已完成' });
+      addLogEntry('info', `下载完成：${file.name} → ${savedPath} (${formatFileSize(file.sizeBytes)})`);
+      setStatusMessage(`已下载到：${savedPath}`);
+    } catch (error) {
+      clearInterval(progressTimer);
+      const message = error instanceof Error ? error.message : String(error);
+      updateTransferRecord(recordId, { status: 'failed', message });
+      addLogEntry('error', `下载失败：${file.name} - ${message}`);
+      setStatusMessage(`下载失败：${message}`);
+    }
+  }
+
+  async function handleExtractArchive(file: ResourceFile) {
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    setStatusMessage(`正在解压：${file.name}...`);
+    addLogEntry('info', `开始解压：${file.name}`);
+    try {
+      await extractArchive(file.path, local ? null : tab?.terminalId ?? null);
+      setStatusMessage(`解压完成：${file.name}`);
+      addLogEntry('info', `解压完成：${file.name}`);
+      await loadResourceDirectory(currentPathRef.current || null, false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`解压失败：${message}`);
+      addLogEntry('error', `解压失败：${file.name} - ${message}`);
+    }
+  }
+
+  async function handleCreateArchive(file: ResourceFile) {
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    setStatusMessage(`正在压缩：${file.name}...`);
+    addLogEntry('info', `开始压缩：${file.name}`);
+    try {
+      const archiveName = await createArchive(file.path, local ? null : tab?.terminalId ?? null);
+      setStatusMessage(`压缩完成：${archiveName}`);
+      addLogEntry('info', `压缩完成：${archiveName}`);
+      await loadResourceDirectory(currentPathRef.current || null, false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`压缩失败：${message}`);
+      addLogEntry('error', `压缩失败：${file.name} - ${message}`);
+    }
+  }
+
+  function handleFileContextMenu(event: React.MouseEvent, file: ResourceFile) {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({ x: event.clientX, y: event.clientY, file });
+  }
+
+  function handleBlankContextMenu(event: React.MouseEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({ x: event.clientX, y: event.clientY, file: null });
+  }
+
+  async function handleDeletePath(file: ResourceFile) {
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    if (!confirm(`确定删除「${file.name}」吗？`)) return;
+    setStatusMessage(`正在删除：${file.name}...`);
+    try {
+      await deletePath(file.path, local ? null : tab?.terminalId ?? null);
+      setStatusMessage(`已删除：${file.name}`);
+      addLogEntry('info', `已删除：${file.name}`);
+      await loadResourceDirectory(currentPathRef.current || null, false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`删除失败：${message}`);
+      addLogEntry('error', `删除失败：${file.name} - ${message}`);
+    }
+  }
+
+  function handleCopyFile(file: ResourceFile) {
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    setClipboard({ path: file.path, operation: 'copy', terminalId: local ? null : tab?.terminalId ?? null });
+    setStatusMessage(`已复制：${file.name}`);
+  }
+
+  function handleCutFile(file: ResourceFile) {
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    setClipboard({ path: file.path, operation: 'cut', terminalId: local ? null : tab?.terminalId ?? null });
+    setStatusMessage(`已剪切：${file.name}`);
+  }
+
+  async function handlePasteFile() {
+    if (!clipboard) return;
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    const destDir = currentPathRef.current || (local ? '.' : '~');
+    const parts = clipboard.path.split('/');
+    const fileName = parts[parts.length - 1] ?? clipboard.path;
+    setStatusMessage(`正在粘贴：${fileName}...`);
+    try {
+      if (clipboard.operation === 'copy') {
+        await copyPath(clipboard.path, destDir, clipboard.terminalId);
+        setStatusMessage(`已复制到：${destDir}`);
+        addLogEntry('info', `已复制：${fileName} → ${destDir}`);
+      } else {
+        await movePath(clipboard.path, destDir, clipboard.terminalId);
+        setStatusMessage(`已移动到：${destDir}`);
+        addLogEntry('info', `已移动：${fileName} → ${destDir}`);
+        setClipboard(null);
+      }
+      await loadResourceDirectory(currentPathRef.current || null, false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`粘贴失败：${message}`);
+      addLogEntry('error', `粘贴失败：${message}`);
+    }
+  }
+
+  function openNewItemDialog(type: 'file' | 'directory') {
+    setNewItemName('');
+    setNewItemDialog({ type });
+  }
+
+  async function handleCreateNewItem() {
+    if (!newItemDialog || !newItemName.trim()) return;
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    const baseDir = currentPathRef.current || (local ? '.' : '~');
+    const sep = baseDir.endsWith('/') ? '' : '/';
+    const fullPath = `${baseDir}${sep}${newItemName.trim()}`;
+    setStatusMessage(`正在创建：${newItemName.trim()}...`);
+    try {
+      if (newItemDialog.type === 'file') {
+        await createFile(fullPath, local ? null : tab?.terminalId ?? null);
+      } else {
+        await createDirectory(fullPath, local ? null : tab?.terminalId ?? null);
+      }
+      setStatusMessage(`已创建：${newItemName.trim()}`);
+      addLogEntry('info', `已创建${newItemDialog.type === 'file' ? '文件' : '文件夹'}：${newItemName.trim()}`);
+      setNewItemDialog(null);
+      await loadResourceDirectory(currentPathRef.current || null, false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`创建失败：${message}`);
+      addLogEntry('error', `创建失败：${message}`);
+    }
+  }
+
+  function openRenameDialog(file: ResourceFile) {
+    setRenameValue(file.name);
+    setRenameDialog(file.path);
+  }
+
+  async function handleRename() {
+    if (!renameDialog || !renameValue.trim()) return;
+    const newName = renameValue.trim();
+    const currentName = renameDialog.split('/').pop() ?? renameDialog;
+    if (newName === currentName) {
+      setRenameDialog(null);
+      return;
+    }
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    const parent = renameDialog.substring(0, renameDialog.lastIndexOf('/'));
+    setStatusMessage(`正在重命名：${newName}...`);
+    try {
+      await movePath(renameDialog, parent, local ? null : tab?.terminalId ?? null);
+      setStatusMessage(`已重命名为：${newName}`);
+      addLogEntry('info', `已重命名：${newName}`);
+      setRenameDialog(null);
+      await loadResourceDirectory(currentPathRef.current || null, false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`重命名失败：${message}`);
+      addLogEntry('error', `重命名失败：${message}`);
+    }
+  }
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener('click', close);
+    window.addEventListener('contextmenu', close);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('contextmenu', close);
+    };
+  }, [contextMenu]);
 
   function toggleResourcePanel() {
     setResourceCollapsed((current) => !current);
@@ -1654,10 +2420,25 @@ export function App() {
     }
 
     for (const [paneId, paneEl] of terminalPaneRefs.current) {
-      if (paneId === tabId) continue; // never drop onto the dragged tab's own entry
       const rect = paneEl.getBoundingClientRect();
       if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) continue;
       const side = getDropSideFromRect(rect, clientX, clientY);
+      // Self-pane: only allow split (not replace)
+      if (paneId === tabId) {
+        if (!side) continue;
+        applyTerminalDragState({
+          tabId,
+          operation: 'split',
+          isOverWorkspace: true,
+          targetPaneId: paneId,
+          targetTabId: null,
+          side,
+          reorderPlacement: null,
+          ghostX: clientX,
+          ghostY: clientY,
+        });
+        return;
+      }
       applyTerminalDragState({
         tabId,
         operation: side ? 'split' : 'replace',
@@ -1750,13 +2531,42 @@ export function App() {
   }
 
   function moveTabIntoPane(draggingTabId: string, targetPaneId: string, side: TerminalDropSide) {
-    if (draggingTabId === targetPaneId) return;
-
     const sourceTab = tabsRef.current.find((tab) => tab.id === draggingTabId && tab.kind === 'terminal');
     const targetOwner = findTerminalWorkspaceOwner(tabsRef.current, targetPaneId);
     const sourceOwner = findTerminalWorkspaceOwner(tabsRef.current, draggingTabId);
     if (!sourceTab || !targetOwner || !sourceOwner) return;
     if (draggingTabId === targetOwner.id) return;
+
+    // Self-split: dragging a tab onto its own pane edge
+    if (draggingTabId === targetPaneId) {
+      // If the pane has multiple tabs, perform a real split (move this tab out)
+      const ownerLayout = sourceOwner.layout ?? createDefaultTerminalLayout(sourceOwner.id);
+      const selfEl = terminalPaneRefs.current.get(draggingTabId);
+      const samePaneTabIds = collectTerminalLayoutTabIds(ownerLayout).filter((id) =>
+        terminalPaneRefs.current.get(id) === selfEl
+      );
+
+      if (samePaneTabIds.length > 1) {
+        // Find a sibling tab in the same pane to use as the split anchor
+        const anchorTabId = samePaneTabIds.find((id) => id !== draggingTabId) ?? samePaneTabIds[0];
+        const nextLayout = insertTerminalPane(ownerLayout, anchorTabId, draggingTabId, side);
+        setTabs((current) => current.map((item) => {
+          if (item.id === sourceOwner.id) {
+            return { ...item, layout: nextLayout, activePaneId: draggingTabId };
+          }
+          if (item.id === draggingTabId) {
+            return { ...item, parentTabId: sourceOwner.id, layout: createDefaultTerminalLayout(draggingTabId), activePaneId: draggingTabId };
+          }
+          return item;
+        }));
+        setStatusMessage(`已将 ${sourceTab.title || sourceTab.session.name} 拆分到新面板`);
+        scheduleTerminalSettledFit(draggingTabId);
+        focusTerminal(draggingTabId);
+      } else {
+        // Only one tab in pane: self-split is not meaningful, ignore
+      }
+      return;
+    }
 
     const sourceLayout = sourceOwner.layout ?? createDefaultTerminalLayout(sourceOwner.id);
     const nextSourceLayout = removeTerminalPane(sourceLayout, draggingTabId);
@@ -1977,6 +2787,7 @@ export function App() {
     if (event.button !== 0) return;
     if ((event.target as HTMLElement).closest('button')) return;
 
+    paneTabPointerDownTs.current = Date.now();
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture?.(event.pointerId);
@@ -1998,7 +2809,11 @@ export function App() {
         const paneRect = paneEl.getBoundingClientRect();
         const outside = moveEvent.clientX < paneRect.left || moveEvent.clientX > paneRect.right
           || moveEvent.clientY < paneRect.top || moveEvent.clientY > paneRect.bottom;
-        if (outside) {
+
+        // Check if pointer is in the edge zone of the current pane (for same-pane split)
+        const inSplitEdge = !outside && getDropSideFromRect(paneRect, moveEvent.clientX, moveEvent.clientY) !== null;
+
+        if (outside || inSplitEdge) {
           cleanup();
           terminalPointerDragRef.current = {
             tabId,
@@ -2128,7 +2943,10 @@ export function App() {
         }}
       >
         {getPaneDropPreview(node.tabId)}
-        <div className="terminal-pane-tabbar">
+        <div className="terminal-pane-tabbar" onDoubleClick={(event) => {
+          if ((event.target as HTMLElement).closest('.terminal-pane-tab, .terminal-pane-tab-add')) return;
+          openConnectionManagerForPane(node.tabId);
+        }}>
           <div className="terminal-pane-tabs">
             {paneTabs.map((tab) => (
               <div
@@ -2149,6 +2967,12 @@ export function App() {
                 onClick={(event) => {
                   event.stopPropagation();
                   focusTerminalPane(tab.id);
+                }}
+                onDoubleClick={(event) => {
+                  event.stopPropagation();
+                  // Suppress dblclick if it was triggered by drag attempts (pointerdown within 400ms)
+                  if (Date.now() - paneTabPointerDownTs.current < 400) return;
+                  void addTerminalTabToCurrentPane(tab.session);
                 }}
               >
                 <TerminalSquare size={13} />
@@ -2207,7 +3031,7 @@ export function App() {
   }
 
   return (
-    <main className="ssh-workbench">
+    <main className="ssh-workbench" onDragOver={handleGlobalDragOver} onDrop={handleGlobalDrop}>
       <header className="top-strip">
         <div className="connection-tools">
           <button className="tool-button" onClick={() => { setPendingPaneTabId(null); setConnectionPanelMode('create'); }}>
@@ -2233,7 +3057,7 @@ export function App() {
         </div>
 
         <div className="top-status">
-          {activeSession ? `${activeSession.name} · ${activeSession.username}@${activeSession.host}` : '本地系统'}
+          {activeSession ? `${activeSession.name} · ${activeSession.username}@${activeSession.host}` : ''}
         </div>
       </header>
 
@@ -2247,16 +3071,19 @@ export function App() {
           </div>
         )}
         <aside
-          className={resourceCollapsed ? 'file-panel collapsed' : 'file-panel'}
+          className={`${resourceCollapsed ? 'file-panel collapsed' : 'file-panel'}${isDragOver ? ' is-drag-over' : ''}`}
           style={{ width: resourceCollapsed ? undefined : `${resourcePanelWidth}%` }}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={(e) => void handleDrop(e)}
         >
           <div className="file-toolbar">
             {!resourceCollapsed && (
               <>
-                <button className="icon-button" title="后退" disabled>
+                <button className="icon-button" title="后退" onClick={navigateBack} disabled={!canNavigateBack || isLoadingFiles}>
                   <ArrowLeft size={17} />
                 </button>
-                <button className="icon-button" title="前进" disabled>
+                <button className="icon-button" title="前进" onClick={navigateForward} disabled={!canNavigateForward || isLoadingFiles}>
                   <ArrowRight size={17} />
                 </button>
                 <button className="icon-button" title="上一级" onClick={navigateUp} disabled={!parentPath || isLoadingFiles}>
@@ -2277,10 +3104,10 @@ export function App() {
                     <ChevronDown size={15} />
                   </button>
                 </div>
-                <button className="icon-button" title="上传" onClick={() => setStatusMessage('上传入口待接入')}>
+                <button className="icon-button" title="上传文件到当前目录" onClick={triggerFileUpload} disabled={isUploading || isLoadingFiles}>
                   <Upload size={17} />
                 </button>
-                <button className="icon-button" title="刷新" onClick={() => loadLocalDirectory(currentPath || null)} disabled={isLoadingFiles}>
+                <button className="icon-button" title="刷新" onClick={() => loadResourceDirectory(currentPath || null)} disabled={isLoadingFiles}>
                   <RefreshCw size={17} />
                 </button>
               </>
@@ -2293,6 +3120,14 @@ export function App() {
               {resourceCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
             </button>
           </div>
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            style={{ display: 'none' }}
+            onChange={(e) => void handleFileUpload(e)}
+          />
 
           {!resourceCollapsed && (
             <>
@@ -2346,13 +3181,14 @@ export function App() {
                     修改时间 {sortKey === 'modifiedTime' ? (sortDirection === 'asc' ? '↑' : '↓') : '↕'}
                   </button>
                 </div>
-                <div className="file-list-body">
+                <div className="file-list-body" onContextMenu={handleBlankContextMenu}>
                   {!isLoadingFiles && !fileListError && visibleFiles.map((file) => (
                     <button
                       key={file.name}
                       className={selectedFile === file.name ? 'file-item selected' : 'file-item'}
                       onClick={() => setSelectedFile(file.name)}
                       onDoubleClick={() => openSelectedFile(file)}
+                      onContextMenu={(e) => handleFileContextMenu(e, file)}
                     >
                       <span className="file-name">
                         {file.type === 'directory' ? <FolderOpen size={18} className="folder-icon" /> : <File size={18} className="file-icon" />}
@@ -2398,13 +3234,87 @@ export function App() {
                   </button>
                 </div>
                 {resourceBottomTab === 'transfer' ? (
-                  <div className="resource-bottom-content">
-                    <div className="resource-bottom-empty">暂无传输任务</div>
+                  <div className="resource-bottom-content transfer-table-wrap">
+                    {transferRecords.length === 0 ? (
+                      <div className="resource-bottom-empty">暂无传输任务</div>
+                    ) : (
+                      <table className="transfer-table">
+                        <thead>
+                          <tr>
+                            <th className="transfer-th-index">序号</th>
+                            <th className="transfer-th-name">文件名称</th>
+                            <th className="transfer-th-size">文件大小</th>
+                            <th className="transfer-th-speed">速度</th>
+                            <th className="transfer-th-time">{transferRecords.some(r => r.direction === 'download') ? '传输时间' : '上传时间'}</th>
+                            <th className="transfer-th-action">操作</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {transferRecords.map((record, idx) => (
+                              <tr key={record.id} className={`transfer-row ${record.status}`}>
+                                <td className="transfer-td-index">{idx + 1}</td>
+                                <td className="transfer-td-name">
+                                  <div className="transfer-name-cell">
+                                    <span className="transfer-filename" title={record.fileName}>
+                                      {record.direction === 'download' ? <Download size={12} className="transfer-dir-icon" /> : <Upload size={12} className="transfer-dir-icon" />}
+                                      {record.fileName}
+                                    </span>
+                                    {record.status === 'uploading' && (
+                                      <>
+                                        <div className="transfer-progress-bar">
+                                          <div className="transfer-progress-fill" style={{ width: `${record.progress}%` }} />
+                                        </div>
+                                        <span className="transfer-status-msg">{record.message}</span>
+                                      </>
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="transfer-td-size">
+                                  {record.status === 'uploading' ? (
+                                    <span className="transfer-size-progress">
+                                      {formatFileSize(record.transferred)} / {formatFileSize(record.size)}
+                                    </span>
+                                  ) : (
+                                    formatFileSize(record.size)
+                                  )}
+                                </td>
+                                <td className="transfer-td-speed">
+                                  {record.status === 'uploading' ? (
+                                    <span className="transfer-speed-active">{formatSpeed(record.speed)}</span>
+                                  ) : record.status === 'success' && record.speed > 0 ? (
+                                    <span className="transfer-speed-avg">{formatSpeed(record.speed)}</span>
+                                  ) : (
+                                    <span className="transfer-speed-none">-</span>
+                                  )}
+                                </td>
+                                <td className="transfer-td-time">{record.time}</td>
+                                <td className="transfer-td-action">
+                                  {record.status === 'uploading' && (
+                                    <button className="transfer-btn transfer-btn-cancel" onClick={() => cancelUpload(record.id)} title="取消上传">
+                                      取消上传
+                                    </button>
+                                  )}
+                                  {(record.status === 'success' || record.status === 'failed' || record.status === 'cancelled') && (
+                                        <button className={`transfer-btn ${record.status === 'success' ? 'transfer-btn-success' : record.status === 'cancelled' ? 'transfer-btn-cancelled' : 'transfer-btn-delete'}`} onClick={() => deleteTransferRecord(record.id)} title="删除记录">
+                                          删除
+                                        </button>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                        </tbody>
+                      </table>
+                    )}
                   </div>
                 ) : (
                   <div className="resource-bottom-content resource-log-view">
-                    {resourceLogs.map((line) => (
-                      <div key={line} className="resource-log-line">{line}</div>
+                    {logEntries.length === 0 ? (
+                      <div className="resource-bottom-empty">暂无日志</div>
+                    ) : logEntries.map((entry) => (
+                      <div key={entry.id} className={`resource-log-line ${entry.level}`}>
+                        <span className="resource-log-time">{entry.time}</span>
+                        <span className="resource-log-text">{entry.text}</span>
+                      </div>
                     ))}
                   </div>
                 )}
@@ -2423,7 +3333,10 @@ export function App() {
 
         <section className={activeTab?.kind === 'terminal' ? 'terminal-panel terminal-panel-terminal-only' : 'terminal-panel'}>
           {activeTab?.kind !== 'terminal' && (
-            <div className="workspace-tabs" ref={workspaceTabsRef}>
+            <div className="workspace-tabs" ref={workspaceTabsRef} onDoubleClick={(event) => {
+              if ((event.target as HTMLElement).closest('.workspace-tab, .workspace-tab-add')) return;
+              openNewConnectionTab();
+            }}>
               {tabs.filter((tab) => !tab.parentTabId).map((tab) => (
                 <div
                   key={tab.id}
@@ -2464,7 +3377,33 @@ export function App() {
           )}
 
           <div className="workspace-body">
-            {!activeTab ? (
+            {activeTab?.kind === 'terminal' && (showEditor || editorTabs.length > 0) && (
+              <div className="workspace-view-toggle">
+                <button
+                  className={!showEditor ? 'active' : ''}
+                  onClick={() => setShowEditor(false)}
+                >
+                  <TerminalSquare size={14} /> 终端
+                </button>
+                <button
+                  className={showEditor ? 'active' : ''}
+                  onClick={() => setShowEditor(true)}
+                >
+                  <FileText size={14} /> 编辑器
+                  {editorTabs.length > 0 && <span className="view-toggle-badge">{editorTabs.length}</span>}
+                </button>
+              </div>
+            )}
+            {showEditor && editorTabs.length > 0 ? (
+              <EditorPanel
+                tabs={editorTabs}
+                activeTabId={activeEditorTabId}
+                onSelectTab={setActiveEditorTabId}
+                onCloseTab={closeEditorTab}
+                onSave={saveEditorFile}
+                onContentChange={updateEditorContent}
+              />
+            ) : !activeTab ? (
               <div className="empty-workspace">
                 <div className="empty-icon"><TerminalSquare size={32} /></div>
                 <h2>没有活动标签页</h2>
@@ -2486,30 +3425,39 @@ export function App() {
               </div>
             ) : (
               <div className="resource-focus-card">
-                {isLoadingPreview ? (
+                {isLoadingMedia ? (
                   <div className="resource-preview-empty">
                     <Home size={30} />
-                    <h2>正在读取文件...</h2>
-                    <p>{selectedFile || '本地文件'}</p>
+                    <h2>正在加载媒体...</h2>
+                    <p>{selectedFile || ''}</p>
                   </div>
-                ) : filePreview ? (
-                  <div className="resource-preview-shell">
-                    <div className="resource-preview-header">
-                      <div>
-                        <div className="resource-preview-title">{filePreview.name}</div>
-                        <div className="resource-preview-path">{filePreview.path}</div>
-                      </div>
-                      <div className="resource-preview-meta">
-                        {formatFileSize(filePreview.size)}{filePreview.truncated ? ' · 已截断' : ''}
-                      </div>
-                    </div>
-                    <pre className="resource-preview-content terminal-scrollbar">{filePreview.content}</pre>
-                  </div>
-                ) : filePreviewError ? (
+                ) : mediaError ? (
                   <div className="resource-preview-empty is-error">
                     <File size={30} />
-                    <h2>文件无法预览</h2>
-                    <p>{filePreviewError}</p>
+                    <h2>无法查看媒体</h2>
+                    <p>{mediaError}</p>
+                  </div>
+                ) : mediaViewer ? (
+                  <div className="media-viewer">
+                    <div className="media-viewer-header">
+                      <span className="media-viewer-name">{mediaViewer.name}</span>
+                      <button className="media-viewer-close" title="关闭" onClick={() => setMediaViewer(null)}>
+                        <X size={16} />
+                      </button>
+                    </div>
+                    <div className="media-viewer-body">
+                      {mediaViewer.kind === 'image' && (
+                        <img src={mediaViewer.url} alt={mediaViewer.name} className="media-viewer-img" />
+                      )}
+                      {mediaViewer.kind === 'video' && (
+                        <video src={mediaViewer.url} controls autoPlay className="media-viewer-video" />
+                      )}
+                      {mediaViewer.kind === 'audio' && (
+                        <div className="media-viewer-audio-wrap">
+                          <audio src={mediaViewer.url} controls autoPlay />
+                        </div>
+                      )}
+                    </div>
                   </div>
                 ) : (
                   <div className="resource-preview-empty">
@@ -2517,8 +3465,8 @@ export function App() {
                     <h2>{activeTab.session.name} 资源视图</h2>
                     <p>
                       {activeTab.session.id === localSession.id
-                        ? '左侧双击文本文件可在这里预览真实内容。'
-                        : '文件浏览已放入左侧资源面板，后续接入 SFTP 后端后替换当前 mock 列表。'}
+                        ? '双击文件用内置编辑器打开，双击图片/视频可直接查看。'
+                        : '双击远程文件用内置编辑器打开，双击图片/视频可直接查看，双击目录可进入。'}
                     </p>
                   </div>
                 )}
@@ -2527,7 +3475,7 @@ export function App() {
           </div>
 
           <footer className="status-bar">
-            <span>{statusMessage}</span>
+            <span title={statusMessage}>{truncateStatus(statusMessage)}</span>
             <span>{tabs.length} 个标签页</span>
           </footer>
         </section>
@@ -2561,12 +3509,15 @@ export function App() {
                   )}
                 </div>
                 <div className="connection-list terminal-scrollbar">
-                  <div className="connection-card connection-card-local">
+                  <div className="connection-card connection-card-local"
+                    title="双击快速打开"
+                    onDoubleClick={() => void openLocalTerminalFromPanel()}
+                  >
                     <div className="connection-card-main">
                       <div className="connection-card-title">本地直连</div>
                       <div className="connection-card-target">{localTerminalProfile.shell_name} · {localTerminalProfile.cwd}</div>
                     </div>
-                    <div className="connection-card-buttons">
+                    <div className="connection-card-buttons" onDoubleClick={(e) => e.stopPropagation()}>
                       <button className="connection-card-action" onClick={() => void openLocalTerminalFromPanel()}>
                         打开
                       </button>
@@ -2575,14 +3526,17 @@ export function App() {
                   {filteredSessions.length > 0 ? (
                     filteredSessions.map((session) => {
                       return (
-                        <div key={session.id} className="connection-card">
+                        <div key={session.id} className="connection-card"
+                          title="双击快速连接"
+                          onDoubleClick={() => void openConnectionPanelSession(session)}
+                        >
                           <div className="connection-card-main">
                             <div className="connection-card-title">{session.name}</div>
                             <div className="connection-card-target">
                               {session.username}@{session.host}:{session.port}
                             </div>
                           </div>
-                          <div className="connection-card-buttons">
+                          <div className="connection-card-buttons" onDoubleClick={(e) => e.stopPropagation()}>
                             <button className="connection-card-action" onClick={() => void openConnectionPanelSession(session)}>
                               连接
                             </button>
@@ -2745,6 +3699,199 @@ export function App() {
               </div>
             )}
           </section>
+        </div>
+      )}
+
+      {contextMenu && (
+        <div
+          className="file-context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+        >
+          {contextMenu.file ? (
+            <>
+              {contextMenu.file.type === 'directory' ? (
+                <button
+                  className="file-context-item"
+                  onClick={() => {
+                    void loadResourceDirectory(contextMenu.file!.path);
+                    setContextMenu(null);
+                  }}
+                >
+                  <FolderOpen size={15} /> 进入目录
+                </button>
+              ) : (
+                <>
+                  <button
+                    className="file-context-item"
+                    onClick={() => {
+                      void openFileInEditor(contextMenu.file!);
+                      setContextMenu(null);
+                    }}
+                  >
+                    <FileText size={15} /> 内置编辑器打开
+                  </button>
+                  {getMediaKind(contextMenu.file.name) && (
+                    <button
+                      className="file-context-item"
+                      onClick={() => {
+                        const kind = getMediaKind(contextMenu.file!.name);
+                        if (kind) void openMediaViewer(contextMenu.file!, kind);
+                        setContextMenu(null);
+                      }}
+                    >
+                      <File size={15} /> 查看
+                    </button>
+                  )}
+                </>
+              )}
+              {contextMenu.file.type === 'file' && isArchive(contextMenu.file.name) && (
+                <button
+                  className="file-context-item"
+                  onClick={() => {
+                    void handleExtractArchive(contextMenu.file!);
+                    setContextMenu(null);
+                  }}
+                >
+                  <Archive size={15} /> 解压到当前目录
+                </button>
+              )}
+              <button
+                className="file-context-item"
+                onClick={() => {
+                  void handleCreateArchive(contextMenu.file!);
+                  setContextMenu(null);
+                }}
+              >
+                <FileArchive size={15} /> 压缩为 ZIP
+              </button>
+              {contextMenu.file.type === 'file' && !isLocalResourceTab(activePaneTabRef.current) && (
+                <button
+                  className="file-context-item"
+                  onClick={() => {
+                    void downloadFileToLocal(contextMenu.file!);
+                    setContextMenu(null);
+                  }}
+                >
+                  <Download size={15} /> 下载到本地
+                </button>
+              )}
+              <div className="file-context-divider" />
+              <button
+                className="file-context-item"
+                onClick={() => {
+                  handleCopyFile(contextMenu.file!);
+                  setContextMenu(null);
+                }}
+              >
+                <Clipboard size={15} /> 复制
+              </button>
+              <button
+                className="file-context-item"
+                onClick={() => {
+                  handleCutFile(contextMenu.file!);
+                  setContextMenu(null);
+                }}
+              >
+                <Scissors size={15} /> 剪切
+              </button>
+              <button
+                className="file-context-item"
+                onClick={() => {
+                  void openRenameDialog(contextMenu.file!);
+                  setContextMenu(null);
+                }}
+              >
+                <FileText size={15} /> 重命名
+              </button>
+              <button
+                className="file-context-item danger"
+                onClick={() => {
+                  void handleDeletePath(contextMenu.file!);
+                  setContextMenu(null);
+                }}
+              >
+                <Trash2 size={15} /> 删除
+              </button>
+            </>
+          ) : (
+            <>
+              {clipboard && (
+                <button
+                  className="file-context-item"
+                  onClick={() => {
+                    void handlePasteFile();
+                    setContextMenu(null);
+                  }}
+                >
+                  <ClipboardPaste size={15} /> 粘贴
+                </button>
+              )}
+              <button
+                className="file-context-item"
+                onClick={() => {
+                  openNewItemDialog('file');
+                  setContextMenu(null);
+                }}
+              >
+                <FilePlus size={15} /> 新建文件
+              </button>
+              <button
+                className="file-context-item"
+                onClick={() => {
+                  openNewItemDialog('directory');
+                  setContextMenu(null);
+                }}
+              >
+                <FolderPlus size={15} /> 新建文件夹
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {newItemDialog && (
+        <div className="dialog-backdrop" onMouseDown={() => setNewItemDialog(null)}>
+          <div className="dialog-card" onMouseDown={(e) => e.stopPropagation()}>
+            <h3>{newItemDialog.type === 'file' ? '新建文件' : '新建文件夹'}</h3>
+            <input
+              autoFocus
+              className="dialog-input"
+              value={newItemName}
+              placeholder={newItemDialog.type === 'file' ? '输入文件名' : '输入文件夹名'}
+              onChange={(e) => setNewItemName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void handleCreateNewItem();
+                if (e.key === 'Escape') setNewItemDialog(null);
+              }}
+            />
+            <div className="dialog-actions">
+              <button className="dialog-btn" onClick={() => setNewItemDialog(null)}>取消</button>
+              <button className="dialog-btn primary" onClick={() => void handleCreateNewItem()}>确定</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {renameDialog && (
+        <div className="dialog-backdrop" onMouseDown={() => setRenameDialog(null)}>
+          <div className="dialog-card" onMouseDown={(e) => e.stopPropagation()}>
+            <h3>重命名</h3>
+            <input
+              autoFocus
+              className="dialog-input"
+              value={renameValue}
+              placeholder="输入新名称"
+              onChange={(e) => setRenameValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void handleRename();
+                if (e.key === 'Escape') setRenameDialog(null);
+              }}
+            />
+            <div className="dialog-actions">
+              <button className="dialog-btn" onClick={() => setRenameDialog(null)}>取消</button>
+              <button className="dialog-btn primary" onClick={() => void handleRename()}>确定</button>
+            </div>
+          </div>
         </div>
       )}
     </main>

@@ -147,3 +147,106 @@ export async function terminalWrite(terminalId: string, data: string): Promise<T
 export async function resizeTerminal(terminalId: string, cols: number, rows: number): Promise<void> {
   await invoke('terminal_resize', { request: { terminal_id: terminalId, cols, rows } });
 }
+
+export async function listRemoteDirectory(terminalId: string, path?: string | null): Promise<LocalDirectoryListing> {
+  return await invoke<LocalDirectoryListing>('list_remote_directory', { terminalId, path: path ?? null });
+}
+
+export async function readRemoteFilePreview(terminalId: string, path: string): Promise<LocalFilePreview> {
+  return await invoke<LocalFilePreview>('read_remote_file_preview', { terminalId, path });
+}
+
+export async function readLocalFileFull(path: string): Promise<LocalFilePreview> {
+  return await invoke<LocalFilePreview>('read_local_file_full', { path });
+}
+
+export async function readRemoteFileFull(terminalId: string, path: string): Promise<LocalFilePreview> {
+  return await invoke<LocalFilePreview>('read_remote_file_full', { terminalId, path });
+}
+
+export async function writeLocalFile(path: string, content: string): Promise<void> {
+  await invoke('write_local_file', { path, content });
+}
+
+export async function writeRemoteFile(terminalId: string, path: string, content: string): Promise<void> {
+  await invoke('write_remote_file', { terminalId, path, content });
+}
+
+export async function uploadFile(fileName: string, content: Uint8Array, destDir: string, transferId: string, terminalId?: string | null): Promise<string> {
+  // Encode as base64 to avoid Tauri IPC corruption with large binary arrays.
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < content.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, Array.from(content.subarray(i, i + chunkSize)));
+  }
+  const contentBase64 = btoa(binary);
+  return await invoke<string>('upload_file', {
+    terminalId: terminalId ?? null,
+    fileName,
+    contentBase64,
+    destDir,
+    transferId,
+  });
+}
+
+/// Stream-upload a local file to a remote directory. The Rust backend reads
+/// the file in chunks and pipes it through SSH, so we avoid base64-encoding
+/// large files on the JS side (which blocks the UI and freezes progress).
+/// Only works for remote uploads (requires a connected terminalId).
+export async function uploadLocalFile(localPath: string, destDir: string, transferId: string, terminalId: string): Promise<string> {
+  return await invoke<string>('upload_local_file', {
+    terminalId,
+    localPath,
+    destDir,
+    transferId,
+  });
+}
+
+export async function readFileAsDataUrl(path: string, terminalId?: string | null): Promise<string> {
+  return await invoke<string>('read_file_as_data_url', {
+    terminalId: terminalId ?? null,
+    path,
+  });
+}
+
+export async function downloadRemoteFile(terminalId: string, remotePath: string, localDir: string): Promise<string> {
+  return await invoke<string>('download_remote_file', { terminalId, remotePath, localDir });
+}
+
+export async function extractArchive(archivePath: string, terminalId?: string | null): Promise<string> {
+  return await invoke<string>('extract_archive', {
+    terminalId: terminalId ?? null,
+    archivePath,
+  });
+}
+
+export async function createArchive(sourcePath: string, terminalId?: string | null): Promise<string> {
+  return await invoke<string>('create_archive', {
+    terminalId: terminalId ?? null,
+    sourcePath,
+  });
+}
+
+export async function deletePath(path: string, terminalId?: string | null): Promise<void> {
+  await invoke('delete_path', { terminalId: terminalId ?? null, path });
+}
+
+export async function createFile(path: string, terminalId?: string | null): Promise<void> {
+  await invoke('create_file', { terminalId: terminalId ?? null, path });
+}
+
+export async function createDirectory(path: string, terminalId?: string | null): Promise<void> {
+  await invoke('create_directory', { terminalId: terminalId ?? null, path });
+}
+
+export async function copyPath(source: string, destDir: string, terminalId?: string | null): Promise<string> {
+  return await invoke<string>('copy_path', { terminalId: terminalId ?? null, source, destDir });
+}
+
+export async function movePath(source: string, destDir: string, terminalId?: string | null): Promise<string> {
+  return await invoke<string>('move_path', { terminalId: terminalId ?? null, source, destDir });
+}
+
+export async function getLocalIpv4(): Promise<string> {
+  return await invoke<string>('get_local_ipv4');
+}
