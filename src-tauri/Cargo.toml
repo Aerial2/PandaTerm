@@ -21,3 +21,4 @@ chrono.workspace = true
 encoding_rs = "0.8.35"
 portable-pty = "0.9.0"
 russh = "0.51"
+sysinfo = "0.33"

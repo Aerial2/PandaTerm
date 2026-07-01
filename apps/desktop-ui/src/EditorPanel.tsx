@@ -117,6 +117,22 @@ export function EditorPanel({ tabs, activeTabId, onSelectTab, onCloseTab, onSave
 
   if (tabs.length === 0) return null;
 
+  // Compute display labels — when multiple tabs share the same filename
+  // (e.g. nginx.conf on different servers) we show a short path suffix to
+  // distinguish them, similar to VS Code.
+  const nameCounts = new Map<string, number>();
+  for (const t of tabs) nameCounts.set(t.name, (nameCounts.get(t.name) ?? 0) + 1);
+
+  function tabLabel(tab: EditorTab): string {
+    if ((nameCounts.get(tab.name) ?? 0) > 1) {
+      // Show parent directory name as a hint, e.g. "nginx.conf (sites-enabled)"
+      const parts = tab.path.split('/');
+      const parent = parts.length >= 2 ? parts[parts.length - 2] : '';
+      return parent ? `${tab.name} (${parent})` : tab.name;
+    }
+    return tab.name;
+  }
+
   return (
     <div className="editor-panel">
       <div className="editor-tabs-bar">
@@ -126,9 +142,10 @@ export function EditorPanel({ tabs, activeTabId, onSelectTab, onCloseTab, onSave
               key={tab.id}
               className={tab.id === activeTabId ? 'editor-tab active' : 'editor-tab'}
               onClick={() => onSelectTab(tab.id)}
+              title={tab.path}
             >
               <FileText size={13} />
-              <span className="editor-tab-name">{tab.name}</span>
+              <span className="editor-tab-name">{tabLabel(tab)}</span>
               {tab.content !== tab.originalContent && (
                 <Circle size={8} className="editor-tab-dirty" fill="currentColor" />
               )}

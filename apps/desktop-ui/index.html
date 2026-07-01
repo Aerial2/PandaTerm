@@ -5,6 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/favicon.png" />
     <title>PandaTerm</title>
+    <script>
+      // Prevent white flash: set dark background immediately for all windows
+      const params = new URLSearchParams(window.location.search);
+      const mode = params.get('mode');
+      document.documentElement.style.background = '#2e323a';
+      document.body.style.background = '#2e323a';
+      if (mode === 'connection') {
+        document.body.style.overflow = 'hidden';
+        document.body.style.minWidth = 'unset';
+        document.body.style.minHeight = 'unset';
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

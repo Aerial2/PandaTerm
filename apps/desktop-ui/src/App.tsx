@@ -5,6 +5,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
 import { EditorPanel, detectLanguage, type EditorTab } from './EditorPanel';
+import { VscodeFileIcon } from './FileIcon';
 import {
   ArrowLeft,
   ArrowRight,
@@ -15,8 +16,6 @@ import {
   FileText,
   FolderOpen,
   Home,
-  PanelLeftClose,
-  PanelLeftOpen,
   Plus,
   RefreshCw,
   Search,
@@ -34,14 +33,21 @@ import {
   ClipboardPaste,
   FilePlus,
   FolderPlus,
+  ListChecks,
+  Activity,
+  Cpu,
+  HardDrive,
+  MemoryStick,
 } from 'lucide-react';
 import {
   connectSession,
   disconnectSession,
   getLocalTerminalProfile,
+  getSystemMonitor,
+  getProcessList,
+  type ProcessInfo,
   listLocalDirectory,
   listRemoteDirectory,
-  deleteSession,
   listSessions,
   readLocalFileFull,
   readRemoteFileFull,
@@ -65,9 +71,9 @@ import {
   startLocalTerminal,
   stopLocalTerminal,
   terminalWrite,
-  saveSession,
+  openConnectionWindow,
 } from './api';
-import type { LocalDirectoryEntry, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent } from './api';
+import type { LocalDirectoryEntry, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, SystemMonitorData } from './api';
 
 type TabKind = 'terminal' | 'sftp';
 
@@ -182,7 +188,7 @@ type ResourceBottomTab = 'transfer' | 'log';
 type TransferRecord = {
   id: string;
   fileName: string;
-  direction: 'upload' | 'download';
+  direction: 'upload' | 'download' | 'open';
   target: string;
   size: number;
   status: 'pending' | 'uploading' | 'success' | 'failed' | 'cancelled';
@@ -199,32 +205,6 @@ type LogEntry = {
   time: string;
   level: 'info' | 'warn' | 'error';
   text: string;
-};
-type ConnectionPanelMode = 'create' | 'manage' | null;
-type ConnectionAuthMethod = 'password' | 'public_key' | 'keyboard_interactive' | 'gssapi';
-
-type ConnectionFormState = {
-  name: string;
-  host: string;
-  username: string;
-  port: string;
-  password: string;
-  privateKeyPath: string;
-  privateKeyPassphrase: string;
-  keyboardInteractiveResponse: string;
-  gssapiPrincipal: string;
-};
-
-const initialConnectionForm: ConnectionFormState = {
-  name: '',
-  host: '',
-  username: '',
-  port: '22',
-  password: '',
-  privateKeyPath: '',
-  privateKeyPassphrase: '',
-  keyboardInteractiveResponse: '',
-  gssapiPrincipal: '',
 };
 
 const oneDarkProTerminalTheme: ITheme = {
@@ -331,11 +311,15 @@ function buildPathBreadcrumbs(path: string) {
   const normalized = path.trim();
   if (!normalized) return [];
 
+  // Special "此电脑" root — just one crumb
+  if (normalized === '此电脑') return [{ label: '此电脑', path: '此电脑' }];
+
   const windowsDriveMatch = normalized.match(/^([A-Za-z]:\\)(.*)$/);
   if (windowsDriveMatch) {
     const root = windowsDriveMatch[1];
     const segments = windowsDriveMatch[2].split('\\').filter(Boolean);
-    const crumbs = [{ label: root, path: root }];
+    // Start with "此电脑" as the virtual root, then the drive, then sub-folders
+    const crumbs = [{ label: '此电脑', path: '此电脑' }, { label: root, path: root }];
     let current = root;
 
     segments.forEach((segment) => {
@@ -394,7 +378,14 @@ function isRemoteSessionFailureOutput(payload: string) {
     || normalized.includes('ssh tcp 连接失败')
     || normalized.includes('ssh 握手失败')
     || normalized.includes('ssh 认证失败')
-    || normalized.includes('ssh shell 启动失败');
+    || normalized.includes('ssh shell 启动失败')
+    || normalized.includes('ssh 通道创建失败');
+}
+
+function isRemoteSessionDisconnectedOutput(payload: string) {
+  const normalized = payload.toLowerCase();
+  return normalized.includes('连接已关闭')
+    || normalized.includes('disconnected');
 }
 
 function createDefaultTerminalLayout(tabId: string): TerminalLayoutNode {
@@ -558,34 +549,59 @@ export function App() {
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
-  const [resourceCollapsed, setResourceCollapsed] = useState(false);
-  const [resourcePanelWidth, setResourcePanelWidth] = useState(30);
+  const [resourcePanelWidth, setResourcePanelWidth] = useState(40);
   const [isResourceResizing, setIsResourceResizing] = useState(false);
+  // Left-side activity bar state — which panel is open
+  const [leftActivity, setLeftActivity] = useState<'files' | 'monitor' | 'processes' | null>('files');
+
+  const [monitorData, setMonitorData] = useState<SystemMonitorData | null>(null);
+  const [isLoadingMonitor, setIsLoadingMonitor] = useState(false);
+  const [processList, setProcessList] = useState<ProcessInfo[]>([]);
+  const [isLoadingProcesses, setIsLoadingProcesses] = useState(false);
+  const [processSortKey, setProcessSortKey] = useState<'cpu' | 'memory' | 'name'>('cpu');
+  const [processSearch, setProcessSearch] = useState('');
   const [currentPath, setCurrentPath] = useState('');
   const [parentPath, setParentPath] = useState<string | null>(null);
   const [resourceFiles, setResourceFiles] = useState<ResourceFile[]>([]);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [fileListError, setFileListError] = useState('');
   const [pathInput, setPathInput] = useState('');
+  const [isEditingPath, setIsEditingPath] = useState(false);
   const [canNavigateBack, setCanNavigateBack] = useState(false);
   const [canNavigateForward, setCanNavigateForward] = useState(false);
   const [fileSearchQuery, setFileSearchQuery] = useState('');
-  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
+  const [lastClickedIndex, setLastClickedIndex] = useState<number>(-1);
   const [mediaViewer, setMediaViewer] = useState<{ url: string; name: string; kind: 'image' | 'video' | 'audio' } | null>(null);
   const [isLoadingMedia, setIsLoadingMedia] = useState(false);
   const [mediaError, setMediaError] = useState('');
   const [sortKey, setSortKey] = useState<ResourceSortKey>('name');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
   const [resourceBottomTab, setResourceBottomTab] = useState<ResourceBottomTab>('transfer');
+  const [resourceBottomPanelHeight, setResourceBottomPanelHeight] = useState(148);
+  const resourceBottomPanelRef = useRef<HTMLDivElement | null>(null);
+  const resourceBottomDragRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const [transferRecords, setTransferRecords] = useState<TransferRecord[]>([]);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
-  const [clipboard, setClipboard] = useState<{ path: string; operation: 'copy' | 'cut'; terminalId: string | null } | null>(null);
+  const [clipboard, setClipboard] = useState<{ paths: string[]; operation: 'copy' | 'cut'; terminalId: string | null } | null>(null);
   const [newItemDialog, setNewItemDialog] = useState<{ type: 'file' | 'directory' } | null>(null);
   const [newItemName, setNewItemName] = useState('');
   const [renameDialog, setRenameDialog] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
-  const [connectionPanelMode, setConnectionPanelMode] = useState<ConnectionPanelMode>(null);
+  const [activeMenu, setActiveMenu] = useState<string | null>(null);
+
+  // Close menubar dropdown when clicking outside
+  useEffect(() => {
+    if (!activeMenu) return;
+    const close = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement).closest('.menubar-item')) setActiveMenu(null);
+    };
+    window.addEventListener('mousedown', close);
+    return () => window.removeEventListener('mousedown', close);
+  }, [activeMenu]);
   const [pendingPaneTabId, setPendingPaneTabId] = useState<string | null>(null);
+  const pendingPaneTabIdRef = useRef(pendingPaneTabId);
+  pendingPaneTabIdRef.current = pendingPaneTabId;
   const [editorTabs, setEditorTabs] = useState<EditorTab[]>([]);
   const [activeEditorTabId, setActiveEditorTabId] = useState<string | null>(null);
   const [showEditor, setShowEditor] = useState(false);
@@ -593,14 +609,10 @@ export function App() {
   const [isUploading, setIsUploading] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const pathEditInputRef = useRef<HTMLInputElement | null>(null);
   const uploadAbortRefs = useRef<Map<string, AbortController>>(new Map());
   const localIpCacheRef = useRef<string | null>(null);
-  const [connectionAuthMethod, setConnectionAuthMethod] = useState<ConnectionAuthMethod>('password');
-  const [connectionForm, setConnectionForm] = useState<ConnectionFormState>(initialConnectionForm);
-  const [isSavingConnection, setIsSavingConnection] = useState(false);
   const [openingConnection, setOpeningConnection] = useState<{ session: Session; startedAt: number; seconds: number } | null>(null);
-  const [connectionFormError, setConnectionFormError] = useState('');
-  const [connectionSearchQuery, setConnectionSearchQuery] = useState('');
   const [statusMessage, setStatusMessage] = useState('当前上下文：本地系统');
   const [localTerminalProfile, setLocalTerminalProfile] = useState<LocalTerminalProfile>(fallbackLocalTerminalProfile);
   const [terminalDragState, setTerminalDragState] = useState<TerminalDragState | null>(null);
@@ -837,6 +849,7 @@ export function App() {
       terminalIdToTabIdRef.current.delete(tab.terminalId);
       pendingOutputRef.current.delete(tab.terminalId);
     }
+    startedTerminalsRef.current.delete(tab.id);
   }
 
   function createTerminalTab(session: Session, statusMessage: string, parentTabId?: string): WorkspaceTab {
@@ -882,7 +895,8 @@ export function App() {
       setResourceFiles(nextFiles);
       currentPathRef.current = listing.path;
       resourceFilesRef.current = nextFiles;
-      setSelectedFile(null);
+      setSelectedFiles(new Set());
+      setLastClickedIndex(-1);
       setMediaViewer(null);
       setMediaError('');
       if (!localIpCacheRef.current) {
@@ -938,7 +952,8 @@ export function App() {
       setResourceFiles(nextFiles);
       currentPathRef.current = listing.path;
       resourceFilesRef.current = nextFiles;
-      setSelectedFile(null);
+      setSelectedFiles(new Set());
+      setLastClickedIndex(-1);
       setMediaViewer(null);
       setMediaError('');
       if (local) {
@@ -1150,7 +1165,7 @@ export function App() {
   useEffect(() => {
     if (activeTab?.kind !== 'terminal') return;
     scheduleVisibleTerminalFits({ force: true });
-  }, [resourceCollapsed, resourcePanelWidth, visibleTerminalPaneIds.join('|')]);
+  }, [leftActivity, resourcePanelWidth, visibleTerminalPaneIds.join('|')]);
 
   useEffect(() => {
     const handleWindowResize = () => {
@@ -1161,16 +1176,6 @@ export function App() {
     window.addEventListener('resize', handleWindowResize);
     return () => window.removeEventListener('resize', handleWindowResize);
   }, []);
-
-  const filteredSessions = useMemo(() => {
-    const q = connectionSearchQuery.trim().toLowerCase();
-    if (!q) return sessions;
-    return sessions.filter((session) =>
-      session.name.toLowerCase().includes(q)
-      || session.host.toLowerCase().includes(q)
-      || session.username.toLowerCase().includes(q),
-    );
-  }, [sessions, connectionSearchQuery]);
 
   const pathBreadcrumbs = useMemo(() => buildPathBreadcrumbs(currentPath), [currentPath]);
 
@@ -1210,27 +1215,16 @@ export function App() {
     focusTerminal(tabId);
   }
 
-  async function refreshSessionsForConnectionPanel() {
-    try {
-      setSessions(await listSessions());
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setStatusMessage(`刷新连接列表失败：${message}`);
-    }
-  }
-
   function openConnectionManagerForPane(paneTabId: string) {
     setPendingPaneTabId(paneTabId);
-    setConnectionPanelMode('manage');
     setStatusMessage('请选择要添加到当前 pane 的连接');
-    void refreshSessionsForConnectionPanel();
+    void openConnectionWindow('manage');
   }
 
   async function addTerminalTabToCurrentPane(session: Session) {
     const targetPaneId = pendingPaneTabId ?? activePaneIdRef.current;
     const ownerTab = targetPaneId ? findTerminalWorkspaceOwner(tabsRef.current, targetPaneId) : null;
     if (!targetPaneId || !ownerTab) {
-      setConnectionPanelMode(null);
       setPendingPaneTabId(null);
       if (session.id === localSession.id) {
         const nextTab = createTerminalTab(localSession, '正在启动本地终端...');
@@ -1250,7 +1244,6 @@ export function App() {
     );
     const nextLayout = addTerminalTabToPane(ownerTab.layout ?? createDefaultTerminalLayout(ownerTab.id), targetPaneId, nextTab.id);
 
-    setConnectionPanelMode(null);
     setPendingPaneTabId(null);
     setTabs((current) => [
       ...current.map((item) => item.id === ownerTab.id ? { ...item, layout: nextLayout, activePaneId: nextTab.id } : item),
@@ -1398,7 +1391,6 @@ export function App() {
       return;
     }
 
-    setConnectionPanelMode(null);
     await openRemoteTerminal(session);
   }
 
@@ -1409,128 +1401,33 @@ export function App() {
       return;
     }
 
-    setConnectionPanelMode(null);
     const nextTab = createTerminalTab(localSession, '正在启动本地终端...');
     setTabs((current) => [...current, nextTab]);
     setActiveTabId(nextTab.id);
     setStatusMessage('已新建本地终端');
   }
 
-  async function deleteConnectionSession(session: Session) {
-    try {
-      // Disconnect all tabs for this session
-      const sessionTabs = tabs.filter((item) => item.session.id === session.id);
-      const nextSessions = await deleteSession(session.id);
-      setSessions(nextSessions);
-      // Remove any open tabs and dispose terminals for this session
-      for (const tab of sessionTabs) {
-        disposeTerminalRuntime({ ...tab, closedByUser: true, status: 'closed' });
-      }
-      setTabs((current) => current.filter((item) => item.session.id !== session.id));
-      setStatusMessage(`已删除连接：${session.name}`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setConnectionFormError(message);
-      setStatusMessage(`删除连接失败：${message}`);
-    }
-  }
-
-  function updateConnectionForm(field: keyof ConnectionFormState, value: string) {
-    setConnectionForm((current) => ({ ...current, [field]: value }));
-    if (connectionFormError) setConnectionFormError('');
-  }
-
-  function buildConnectionAuth() {
-    if (connectionAuthMethod === 'password') {
-      return { type: 'password' as const, secret_id: connectionForm.password.trim() };
-    }
-
-    if (connectionAuthMethod === 'public_key') {
-      return {
-        type: 'private_key' as const,
-        key_id: connectionForm.privateKeyPath.trim(),
-        passphrase_secret_id: connectionForm.privateKeyPassphrase.trim() || null,
-      };
-    }
-
-    if (connectionAuthMethod === 'keyboard_interactive') {
-      return { type: 'keyboard_interactive' as const, response_secret_id: connectionForm.keyboardInteractiveResponse.trim() };
-    }
-
-    return { type: 'gssapi' as const, principal: connectionForm.gssapiPrincipal.trim() || null };
-  }
-
-  function validateConnectionForm() {
-    const name = connectionForm.name.trim();
-    const host = connectionForm.host.trim();
-    const username = connectionForm.username.trim();
-    const port = Number(connectionForm.port.trim() || '22');
-
-    if (!name) return '连接名称不能为空';
-    if (!host) return '主机地址不能为空';
-    if (!username) return '用户名不能为空';
-    if (!Number.isInteger(port) || port <= 0 || port > 65535) return '端口必须是 1-65535 之间的整数';
-    if (connectionAuthMethod === 'password' && !connectionForm.password.trim()) return '密码不能为空';
-    if (connectionAuthMethod === 'public_key' && !connectionForm.privateKeyPath.trim()) return '私钥路径不能为空';
-    if (connectionAuthMethod === 'keyboard_interactive' && !connectionForm.keyboardInteractiveResponse.trim()) {
-      return '交互提示响应不能为空';
-    }
-
-    return '';
-  }
-
-  async function saveAndConnectConnection() {
-    const error = validateConnectionForm();
-    if (error) {
-      setConnectionFormError(error);
-      setStatusMessage(`保存连接失败：${error}`);
-      return;
-    }
-
-    const session: Session = {
-      id: crypto.randomUUID(),
-      name: connectionForm.name.trim(),
-      group: 'Custom',
-      host: connectionForm.host.trim(),
-      port: Number(connectionForm.port.trim() || '22'),
-      username: connectionForm.username.trim(),
-      auth: buildConnectionAuth(),
-      tags: ['custom', connectionAuthMethod],
-      last_connected_at: null,
-      reconnect: { enabled: true, max_attempts: 3, delay_ms: 1500 },
-    };
-
-    setIsSavingConnection(true);
-    setConnectionFormError('');
-    setStatusMessage(`正在保存连接：${session.name}`);
-
-    try {
-      const nextSessions = await saveSession(session);
-      setSessions(nextSessions);
-      setConnectionForm(initialConnectionForm);
-      setConnectionAuthMethod('password');
-      setConnectionPanelMode(null);
-      if (pendingPaneTabId) {
-        await addTerminalTabToCurrentPane(session);
-      } else {
-        await openRemoteTerminal(session);
-      }
-    } catch (saveError) {
-      const message = saveError instanceof Error ? saveError.message : String(saveError);
-      setConnectionFormError(message);
-      setStatusMessage(`保存连接失败：${message}`);
-    } finally {
-      setIsSavingConnection(false);
-    }
-  }
-
   function openNewConnectionTab() {
-    setPendingPaneTabId(null);
-    setConnectionPanelMode('manage');
-    void refreshSessionsForConnectionPanel();
+    void openConnectionWindow('manage');
   }
 
   // Global terminal-output listener — registered once, routes by terminal_id
+  useEffect(() => {
+    // Listen for session connection events from the connection window
+    let connUnlisten: (() => void) | null = null;
+    void listen<Session>('connection-window-connect-session', (event) => {
+      const session = event.payload;
+      if (pendingPaneTabIdRef.current) {
+        void addTerminalTabToCurrentPane(session);
+      } else if (session.id === localSession.id) {
+        void openLocalTerminalFromPanel();
+      } else {
+        void openRemoteTerminal(session);
+      }
+    }).then(fn => { connUnlisten = fn; });
+    return () => { connUnlisten?.(); };
+  }, []);
+
   useEffect(() => {
     let unlistenFn: (() => void) | null = null;
     let isActive = true;
@@ -1570,14 +1467,18 @@ export function App() {
           if (!isMatch) return item;
           const itemNextStatus = isRemoteSessionFailureOutput(rawPayload)
             ? 'failed'
-            : item.status === 'connecting' && isRemoteSessionReadyOutput(rawPayload)
-              ? 'connected'
-              : item.status;
+            : isRemoteSessionDisconnectedOutput(rawPayload) && item.status === 'connected'
+              ? 'disconnected'
+              : item.status === 'connecting' && isRemoteSessionReadyOutput(rawPayload)
+                ? 'connected'
+                : item.status;
           const nextStatusMessage = itemNextStatus === 'connected'
             ? '已连接'
             : itemNextStatus === 'failed'
               ? '连接失败'
-              : item.statusMessage;
+              : itemNextStatus === 'disconnected'
+                ? '已断开'
+                : item.statusMessage;
           const nextActivity = itemNextStatus !== item.status
             ? [
                 ...item.activityLog,
@@ -1602,14 +1503,16 @@ export function App() {
       }
 
       // Handle status transitions
-      if (isRemoteSessionReadyOutput(rawPayload) || isRemoteSessionFailureOutput(rawPayload)) {
+      if (isRemoteSessionReadyOutput(rawPayload) || isRemoteSessionFailureOutput(rawPayload) || isRemoteSessionDisconnectedOutput(rawPayload)) {
         setOpeningConnection((current) =>
           current && targetTab ? null : current,
         );
         if (targetTab) {
           setStatusMessage(isRemoteSessionFailureOutput(rawPayload)
             ? `连接失败：${targetTab.session.name}`
-            : `已连接：${targetTab.session.name}`);
+            : isRemoteSessionDisconnectedOutput(rawPayload)
+              ? `已断开：${targetTab.session.name}`
+              : `已连接：${targetTab.session.name}`);
         }
       }
     }).then((unlisten) => {
@@ -1706,8 +1609,8 @@ export function App() {
       resizeObserver.observe(hostEl);
       terminalResizeObserversRef.current.set(tabId, resizeObserver);
 
-      if (terminalTab.session.id === localSession.id && !startedTerminalsRef.current.has(terminalTab.terminalId)) {
-        startedTerminalsRef.current.add(terminalTab.terminalId);
+      if (terminalTab.session.id === localSession.id && !startedTerminalsRef.current.has(terminalTab.id)) {
+        startedTerminalsRef.current.add(terminalTab.id);
         requestAnimationFrame(() => {
           syncSize();
           if (tabId === activePaneIdRef.current) terminal.focus();
@@ -1793,7 +1696,7 @@ export function App() {
   }
 
   async function openSelectedFile(file: ResourceFile) {
-    setSelectedFile(file.name);
+    setSelectedFiles(new Set([file.name]));
     if (file.type === 'directory') {
       void loadResourceDirectory(file.path);
       return;
@@ -1830,17 +1733,22 @@ export function App() {
   }
 
   async function openFileInEditor(file: ResourceFile) {
-    // If already open, just focus it.
-    const existing = editorTabs.find((t) => t.path === file.path);
+    // If already open, just focus it.  Must match both path AND the
+    // originating session (terminalId) so that the same filename on
+    // different servers is treated as separate editor tabs.
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    const terminalId = local ? undefined : tab?.terminalId;
+    const existing = editorTabs.find((t) =>
+      t.path === file.path && t.terminalId === terminalId && t.isRemote === !local
+    );
     if (existing) {
       setActiveEditorTabId(existing.id);
       setShowEditor(true);
       return;
     }
 
-    const tab = activePaneTabRef.current;
-    const local = isLocalResourceTab(tab);
-    const tabId = `${file.path}::${Date.now()}`;
+    const tabId = `${file.path}::${terminalId ?? 'local'}::${Date.now()}`;
     const newTab: EditorTab = {
       id: tabId,
       path: file.path,
@@ -1849,7 +1757,7 @@ export function App() {
       content: '',
       originalContent: '',
       isRemote: !local,
-      terminalId: local ? undefined : tab?.terminalId,
+      terminalId,
       loading: true,
       error: '',
     };
@@ -1857,14 +1765,42 @@ export function App() {
     setActiveEditorTabId(tabId);
     setShowEditor(true);
 
+    // For remote files, add a transfer record so the user can see loading status
+    let transferId: string | null = null;
+    let progressTimer: ReturnType<typeof setInterval> | null = null;
+    const openStartTime = Date.now();
+    if (!local && terminalId) {
+      transferId = addTransferRecord({
+        fileName: file.name,
+        direction: 'open',
+        target: '编辑器',
+        size: file.sizeBytes,
+        status: 'uploading',
+        message: '正在读取...',
+      });
+      progressTimer = setInterval(() => {
+        if (!transferId) return;
+        updateTransferRecord(transferId, (prev) => {
+          const elapsedSec = Math.floor((Date.now() - openStartTime) / 1000);
+          return { progress: -1, transferred: 0, speed: 0, message: `正在读取... (${elapsedSec}s)` };
+        });
+      }, 1000);
+    }
+
     try {
       const full = local
         ? await readLocalFileFull(file.path)
-        : tab?.terminalId
-          ? await readRemoteFileFull(tab.terminalId, file.path)
+        : terminalId
+          ? await readRemoteFileFull(terminalId, file.path)
           : null;
+      if (progressTimer) clearInterval(progressTimer);
       if (!full) {
         throw new Error('远程终端尚未连接，无法读取文件');
+      }
+      if (transferId) {
+        const elapsed = (Date.now() - openStartTime) / 1000;
+        const avgSpeed = elapsed > 0 ? file.sizeBytes / elapsed : 0;
+        updateTransferRecord(transferId, { status: 'success', progress: 100, transferred: file.sizeBytes, speed: avgSpeed, message: '已打开' });
       }
       setEditorTabs((current) => current.map((t) =>
         t.id === tabId
@@ -1873,7 +1809,11 @@ export function App() {
       ));
       setStatusMessage(`已打开文件：${file.path}`);
     } catch (error) {
+      if (progressTimer) clearInterval(progressTimer);
       const message = error instanceof Error ? error.message : String(error);
+      if (transferId) {
+        updateTransferRecord(transferId, { status: 'failed', message });
+      }
       setEditorTabs((current) => current.map((t) =>
         t.id === tabId ? { ...t, loading: false, error: message } : t,
       ));
@@ -2023,7 +1963,7 @@ export function App() {
   }
 
   function handleDragOver(event: React.DragEvent) {
-    if (resourceCollapsed || isUploading) return;
+    if (leftActivity !== 'files' || isUploading) return;
     // Must preventDefault on dragover to allow drop and clear the forbidden cursor.
     event.preventDefault();
     event.dataTransfer.dropEffect = 'copy';
@@ -2058,7 +1998,7 @@ export function App() {
     // Suppress browser default (open file in window) for drops outside the
     // file panel. Drops inside the file panel are already handled by
     // handleDrop which also calls preventDefault().
-    if (!(event.target as HTMLElement).closest('.file-panel:not(.collapsed)')) {
+    if (!(event.target as HTMLElement).closest('.file-panel')) {
       event.preventDefault();
     }
   }
@@ -2146,9 +2086,88 @@ export function App() {
     }
   }
 
+  // ── Multi-selection helpers ──────────────────────────────
+  function handleFileClick(event: React.MouseEvent, file: ResourceFile, index: number) {
+    const ctrl = event.ctrlKey || event.metaKey; // metaKey for macOS
+    const shift = event.shiftKey;
+
+    if (ctrl) {
+      // Toggle individual item
+      setSelectedFiles((prev) => {
+        const next = new Set(prev);
+        if (next.has(file.name)) next.delete(file.name);
+        else next.add(file.name);
+        return next;
+      });
+      setLastClickedIndex(index);
+    } else if (shift && lastClickedIndex >= 0) {
+      // Range select from last clicked to current
+      const start = Math.min(lastClickedIndex, index);
+      const end = Math.max(lastClickedIndex, index);
+      const names = visibleFiles.slice(start, end + 1).map((f) => f.name);
+      setSelectedFiles(new Set(names));
+    } else {
+      // Single select
+      setSelectedFiles(new Set([file.name]));
+      setLastClickedIndex(index);
+    }
+  }
+
+  function getSelectedResourceFiles(): ResourceFile[] {
+    return visibleFiles.filter((f) => selectedFiles.has(f.name));
+  }
+
+  function handleSelectAll() {
+    setSelectedFiles(new Set(visibleFiles.map((f) => f.name)));
+  }
+
+  function handleResourceKeyDown(event: React.KeyboardEvent) {
+    const ctrl = event.ctrlKey || event.metaKey;
+    const selectedItems = getSelectedResourceFiles();
+
+    // Delete key — delete selected files
+    if (event.key === 'Delete' && selectedItems.length > 0) {
+      void handleDeletePaths(selectedItems);
+      return;
+    }
+
+    if (!ctrl) return;
+
+    switch (event.key.toLowerCase()) {
+      case 'a':
+        event.preventDefault();
+        handleSelectAll();
+        break;
+      case 'c':
+        if (selectedItems.length > 0) {
+          event.preventDefault();
+          handleCopyFiles(selectedItems);
+        }
+        break;
+      case 'x':
+        if (selectedItems.length > 0) {
+          event.preventDefault();
+          handleCutFiles(selectedItems);
+        }
+        break;
+      case 'v':
+        if (clipboard) {
+          event.preventDefault();
+          void handlePasteFile();
+        }
+        break;
+    }
+  }
+
   function handleFileContextMenu(event: React.MouseEvent, file: ResourceFile) {
     event.preventDefault();
     event.stopPropagation();
+    // If the right-clicked file is not in the current selection,
+    // switch to single-select it so context-menu actions are intuitive.
+    if (!selectedFiles.has(file.name)) {
+      setSelectedFiles(new Set([file.name]));
+      setLastClickedIndex(visibleFiles.findIndex((f) => f.name === file.name));
+    }
     setContextMenu({ x: event.clientX, y: event.clientY, file });
   }
 
@@ -2158,54 +2177,110 @@ export function App() {
     setContextMenu({ x: event.clientX, y: event.clientY, file: null });
   }
 
-  async function handleDeletePath(file: ResourceFile) {
+  async function handleDeletePaths(files: ResourceFile[]) {
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
-    if (!confirm(`确定删除「${file.name}」吗？`)) return;
-    setStatusMessage(`正在删除：${file.name}...`);
-    try {
-      await deletePath(file.path, local ? null : tab?.terminalId ?? null);
-      setStatusMessage(`已删除：${file.name}`);
-      addLogEntry('info', `已删除：${file.name}`);
-      await loadResourceDirectory(currentPathRef.current || null, false);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setStatusMessage(`删除失败：${message}`);
-      addLogEntry('error', `删除失败：${file.name} - ${message}`);
+    const count = files.length;
+    const label = count === 1 ? files[0].name : `${count} 个项目`;
+    if (!confirm(`确定删除「${label}」吗？此操作不可恢复。`)) return;
+    setStatusMessage(`正在删除 ${label}...`);
+    let successCount = 0;
+    for (const file of files) {
+      try {
+        await deletePath(file.path, local ? null : tab?.terminalId ?? null);
+        successCount++;
+        addLogEntry('info', `已删除：${file.name}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        addLogEntry('error', `删除失败：${file.name} - ${message}`);
+      }
     }
+    if (successCount === count) {
+      setStatusMessage(`已删除 ${label}`);
+    } else {
+      setStatusMessage(`已删除 ${successCount}/${count} 个项目`);
+    }
+    setSelectedFiles(new Set());
+    setLastClickedIndex(-1);
+    await loadResourceDirectory(currentPathRef.current || null, false);
   }
 
-  function handleCopyFile(file: ResourceFile) {
+  function handleCopyFiles(files: ResourceFile[]) {
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
-    setClipboard({ path: file.path, operation: 'copy', terminalId: local ? null : tab?.terminalId ?? null });
-    setStatusMessage(`已复制：${file.name}`);
+    const paths = files.map((f) => f.path);
+    setClipboard({ paths, operation: 'copy', terminalId: local ? null : tab?.terminalId ?? null });
+    setStatusMessage(`已复制 ${files.length} 个项目`);
   }
 
-  function handleCutFile(file: ResourceFile) {
+  function handleCutFiles(files: ResourceFile[]) {
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
-    setClipboard({ path: file.path, operation: 'cut', terminalId: local ? null : tab?.terminalId ?? null });
-    setStatusMessage(`已剪切：${file.name}`);
+    const paths = files.map((f) => f.path);
+    setClipboard({ paths, operation: 'cut', terminalId: local ? null : tab?.terminalId ?? null });
+    setStatusMessage(`已剪切 ${files.length} 个项目`);
+  }
+
+  /** Generate a non-conflicting destination name.
+   *  If `baseName` already exists in `existingNames`, try baseName (1), baseName (2), …
+   *  For files with extensions, the suffix goes before the extension:
+   *    file.txt → file (1).txt, file (2).txt …
+   *  For directories or files without extensions, the suffix goes at the end:
+   *    folder → folder (1), folder (2) …
+   */
+  function generateUniqueName(baseName: string, existingNames: Set<string>): string {
+    if (!existingNames.has(baseName)) return baseName;
+    // Split into stem + extension (only treat the last dot as extension if there is one)
+    const lastDot = baseName.lastIndexOf('.');
+    let stem: string;
+    let ext: string;
+    if (lastDot > 0) {
+      stem = baseName.substring(0, lastDot);
+      ext = baseName.substring(lastDot); // includes the dot
+    } else {
+      stem = baseName;
+      ext = '';
+    }
+    let counter = 1;
+    while (existingNames.has(`${stem} (${counter})${ext}`)) {
+      counter++;
+    }
+    return `${stem} (${counter})${ext}`;
   }
 
   async function handlePasteFile() {
-    if (!clipboard) return;
+    if (!clipboard || clipboard.paths.length === 0) return;
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
     const destDir = currentPathRef.current || (local ? '.' : '~');
-    const parts = clipboard.path.split('/');
-    const fileName = parts[parts.length - 1] ?? clipboard.path;
-    setStatusMessage(`正在粘贴：${fileName}...`);
+    // Build a set of existing file names in the destination directory.
+    const existingNames = new Set(resourceFilesRef.current.map((f) => f.name));
+    setStatusMessage(`正在粘贴 ${clipboard.paths.length} 个项目...`);
     try {
+      for (const srcPath of clipboard.paths) {
+        const srcName = srcPath.substring(srcPath.lastIndexOf('/') + 1);
+        // When cutting within the same directory (source parent == destDir),
+        // this is a no-op — skip it.
+        const srcParent = srcPath.substring(0, srcPath.lastIndexOf('/'));
+        if (clipboard.operation === 'cut' && srcParent === destDir) {
+          addLogEntry('info', `剪切跳过：${srcName} 已在目标目录中`);
+          continue;
+        }
+        const destName = generateUniqueName(srcName, existingNames);
+        if (clipboard.operation === 'copy') {
+          await copyPath(srcPath, destDir, clipboard.terminalId, destName === srcName ? undefined : destName);
+          addLogEntry('info', `已复制：${srcPath} → ${destDir}/${destName}`);
+        } else {
+          await movePath(srcPath, destDir, clipboard.terminalId, destName === srcName ? undefined : destName);
+          addLogEntry('info', `已移动：${srcPath} → ${destDir}/${destName}`);
+        }
+        // Register the new name so subsequent items in the same batch also avoid it.
+        existingNames.add(destName);
+      }
       if (clipboard.operation === 'copy') {
-        await copyPath(clipboard.path, destDir, clipboard.terminalId);
-        setStatusMessage(`已复制到：${destDir}`);
-        addLogEntry('info', `已复制：${fileName} → ${destDir}`);
+        setStatusMessage(`已复制 ${clipboard.paths.length} 个项目到：${destDir}`);
       } else {
-        await movePath(clipboard.path, destDir, clipboard.terminalId);
-        setStatusMessage(`已移动到：${destDir}`);
-        addLogEntry('info', `已移动：${fileName} → ${destDir}`);
+        setStatusMessage(`已移动 ${clipboard.paths.length} 个项目到：${destDir}`);
         setClipboard(null);
       }
       await loadResourceDirectory(currentPathRef.current || null, false);
@@ -2287,12 +2362,80 @@ export function App() {
     };
   }, [contextMenu]);
 
-  function toggleResourcePanel() {
-    setResourceCollapsed((current) => !current);
+  // Auto-refresh system monitor data every 5 seconds when panel is open
+  useEffect(() => {
+    if (leftActivity !== 'monitor') return;
+    const interval = window.setInterval(() => void refreshMonitorData(), 1000);
+    return () => window.clearInterval(interval);
+  }, [leftActivity]);
+
+  // Auto-refresh process list every 3 seconds when panel is open
+  useEffect(() => {
+    if (leftActivity !== 'processes') return;
+    const interval = window.setInterval(() => void refreshProcessList(), 3000);
+    return () => window.clearInterval(interval);
+  }, [leftActivity]);
+
+  function toggleLeftActivity(panel: 'files' | 'monitor' | 'processes') {
+    setLeftActivity(panel);
+    if (panel === 'monitor') {
+      void refreshMonitorData();
+    } else if (panel === 'processes') {
+      void refreshProcessList();
+    }
+  }
+
+  async function refreshMonitorData() {
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    const terminalId = local ? null : tab?.terminalId ?? null;
+    setIsLoadingMonitor(true);
+    try {
+      const data = await getSystemMonitor(terminalId);
+      setMonitorData(data);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`获取系统监控数据失败：${message}`);
+    } finally {
+      setIsLoadingMonitor(false);
+    }
+  }
+
+  async function refreshProcessList() {
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    const terminalId = local ? null : tab?.terminalId ?? null;
+    setIsLoadingProcesses(true);
+    try {
+      const data = await getProcessList(terminalId);
+      setProcessList(data);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`获取进程列表失败：${message}`);
+    } finally {
+      setIsLoadingProcesses(false);
+    }
+  }
+
+  function formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const value = bytes / Math.pow(1024, i);
+    return `${value.toFixed(i > 1 ? 1 : 0)} ${units[i]}`;
+  }
+
+  function formatUptime(seconds: number): string {
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (days > 0) return `${days}天 ${hours}小时`;
+    if (hours > 0) return `${hours}小时 ${minutes}分钟`;
+    return `${minutes}分钟`;
   }
 
   function startResourceResize(event: PointerEvent<HTMLDivElement>) {
-    if (resourceCollapsed) return;
+    if (!leftActivity) return;
 
     const container = event.currentTarget.parentElement;
     if (!container) return;
@@ -3033,28 +3176,56 @@ export function App() {
   return (
     <main className="ssh-workbench" onDragOver={handleGlobalDragOver} onDrop={handleGlobalDrop}>
       <header className="top-strip">
-        <div className="connection-tools">
-          <button className="tool-button" onClick={() => { setPendingPaneTabId(null); setConnectionPanelMode('create'); }}>
-            <Plus size={17} />
-            <span>新建连接</span>
-          </button>
-          <button className="tool-button" onClick={() => { setPendingPaneTabId(null); setConnectionPanelMode('manage'); void refreshSessionsForConnectionPanel(); }}>
-            <Server size={17} />
-            <span>连接管理</span>
-          </button>
-          <button className="tool-button" onClick={() => setStatusMessage('终端设置入口待接入')}> 
-            <Settings size={16} />
-            <span>终端设置</span>
-          </button>
-          <button className="tool-button" onClick={() => setStatusMessage('MCP 设置入口待接入')}> 
-            <Settings size={16} />
-            <span>MCP 设置</span>
-          </button>
-          <button className="tool-button" onClick={() => setStatusMessage('安全中心入口待接入')}> 
-            <Shield size={16} />
-            <span>安全</span>
-          </button>
-        </div>
+        <nav className="menubar" role="menubar">
+          <div className="menubar-item" role="menuitem" tabIndex={0}
+            onMouseEnter={() => { if (activeMenu) setActiveMenu('连接'); }}
+            onClick={() => setActiveMenu(activeMenu === '连接' ? null : '连接')}
+          >
+            <span className="menubar-label">连接<span className="menubar-accent">(F)</span></span>
+            {activeMenu === '连接' && (
+              <div className="menubar-dropdown" role="menu">
+                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); void openConnectionWindow('create'); }}>
+                  <Plus size={14} /><span>新建连接</span>
+                </button>
+                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); void openConnectionWindow('manage'); }}>
+                  <Server size={14} /><span>连接管理</span>
+                </button>
+              </div>
+            )}
+          </div>
+          <div className="menubar-item" role="menuitem" tabIndex={0}
+            onMouseEnter={() => { if (activeMenu) setActiveMenu('编辑'); }}
+            onClick={() => setActiveMenu(activeMenu === '编辑' ? null : '编辑')}
+          >
+            <span className="menubar-label">编辑<span className="menubar-accent">(E)</span></span>
+            {activeMenu === '编辑' && (
+              <div className="menubar-dropdown" role="menu">
+                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); /* TODO: settings */ }}>
+                  <Settings size={14} /><span>终端设置</span>
+                </button>
+              </div>
+            )}
+          </div>
+          <div className="menubar-item" role="menuitem" tabIndex={0}
+            onMouseEnter={() => { if (activeMenu) setActiveMenu('查看'); }}
+            onClick={() => setActiveMenu(activeMenu === '查看' ? null : '查看')}
+          >
+            <span className="menubar-label">查看<span className="menubar-accent">(V)</span></span>
+            {activeMenu === '查看' && (
+              <div className="menubar-dropdown" role="menu">
+                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); setLeftActivity('files'); }}>
+                  <FolderOpen size={14} /><span>文件资源管理器</span>
+                </button>
+                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); setLeftActivity('monitor'); }}>
+                  <Cpu size={14} /><span>系统监控</span>
+                </button>
+                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); setLeftActivity('processes'); }}>
+                  <Activity size={14} /><span>进程列表</span>
+                </button>
+              </div>
+            )}
+          </div>
+        </nav>
 
         <div className="top-status">
           {activeSession ? `${activeSession.name} · ${activeSession.username}@${activeSession.host}` : ''}
@@ -3070,16 +3241,42 @@ export function App() {
             </span>
           </div>
         )}
+        {leftActivity && (
+        <div className="left-sidebar" style={{ width: `${resourcePanelWidth}%` }}>
+          <div className="activity-bar">
+            <button
+              className={`activity-bar-icon${leftActivity === 'files' ? ' active' : ''}`}
+              onClick={() => toggleLeftActivity('files')}
+              title="文件浏览器"
+            >
+              <FolderOpen size={20} />
+            </button>
+            <button
+              className={`activity-bar-icon${leftActivity === 'monitor' ? ' active' : ''}`}
+              onClick={() => toggleLeftActivity('monitor')}
+              title="资源监控"
+            >
+              <Activity size={20} />
+            </button>
+            <button
+              className={`activity-bar-icon${leftActivity === 'processes' ? ' active' : ''}`}
+              onClick={() => toggleLeftActivity('processes')}
+              title="进程管理"
+            >
+              <ListChecks size={20} />
+            </button>
+          </div>
+          {leftActivity === 'files' && (
         <aside
-          className={`${resourceCollapsed ? 'file-panel collapsed' : 'file-panel'}${isDragOver ? ' is-drag-over' : ''}`}
-          style={{ width: resourceCollapsed ? undefined : `${resourcePanelWidth}%` }}
+          className={`file-panel${isDragOver ? ' is-drag-over' : ''}`}
+          style={{ gridTemplateRows: `42px auto minmax(0, 1fr) ${resourceBottomPanelHeight}px` }}
+          tabIndex={0}
+          onKeyDown={handleResourceKeyDown}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={(e) => void handleDrop(e)}
         >
           <div className="file-toolbar">
-            {!resourceCollapsed && (
-              <>
                 <button className="icon-button" title="后退" onClick={navigateBack} disabled={!canNavigateBack || isLoadingFiles}>
                   <ArrowLeft size={17} />
                 </button>
@@ -3089,62 +3286,6 @@ export function App() {
                 <button className="icon-button" title="上一级" onClick={navigateUp} disabled={!parentPath || isLoadingFiles}>
                   <span className="path-up-glyph">..</span>
                 </button>
-                <div className="path-control">
-                  <input
-                    value={pathInput}
-                    spellCheck={false}
-                    onChange={(event) => setPathInput(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') submitPathInput();
-                    }}
-                    onBlur={() => setPathInput(currentPath)}
-                    disabled={isLoadingFiles}
-                  />
-                  <button type="button" title="目录历史">
-                    <ChevronDown size={15} />
-                  </button>
-                </div>
-                <button className="icon-button" title="上传文件到当前目录" onClick={triggerFileUpload} disabled={isUploading || isLoadingFiles}>
-                  <Upload size={17} />
-                </button>
-                <button className="icon-button" title="刷新" onClick={() => loadResourceDirectory(currentPath || null)} disabled={isLoadingFiles}>
-                  <RefreshCw size={17} />
-                </button>
-              </>
-            )}
-            <button
-              className="icon-button"
-              title={resourceCollapsed ? '展开资源视图' : '收起资源视图'}
-              onClick={toggleResourcePanel}
-            >
-              {resourceCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
-            </button>
-          </div>
-
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            style={{ display: 'none' }}
-            onChange={(e) => void handleFileUpload(e)}
-          />
-
-          {!resourceCollapsed && (
-            <>
-              <div className="path-breadcrumbs">
-                <div className="path-breadcrumbs-track">
-                  {pathBreadcrumbs.map((crumb, index) => (
-                    <button
-                      key={crumb.path}
-                      className={index === pathBreadcrumbs.length - 1 ? 'path-breadcrumb active' : 'path-breadcrumb'}
-                      disabled={index === pathBreadcrumbs.length - 1}
-                      onClick={() => navigateToPath(crumb.path)}
-                    >
-                      <span>{crumb.label}</span>
-                      {index < pathBreadcrumbs.length - 1 && <ChevronRight size={13} />}
-                    </button>
-                  ))}
-                </div>
                 <div className="search-box file-search-box">
                   <Search size={16} />
                   <input
@@ -3163,6 +3304,93 @@ export function App() {
                     </button>
                   )}
                 </div>
+                <button className="icon-button" title="上传文件到当前目录" onClick={triggerFileUpload} disabled={isUploading || isLoadingFiles}>
+                  <Upload size={17} />
+                </button>
+                <button className="icon-button" title="刷新" onClick={() => loadResourceDirectory(currentPath || null)} disabled={isLoadingFiles}>
+                  <RefreshCw size={17} />
+                </button>
+                <button className="icon-button" title="全选 (Ctrl+A)" onClick={handleSelectAll} disabled={isLoadingFiles || visibleFiles.length === 0}>
+                  <ListChecks size={17} />
+                </button>
+          </div>
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            style={{ display: 'none' }}
+            onChange={(e) => void handleFileUpload(e)}
+          />
+
+              <div className="path-breadcrumbs">
+                {isEditingPath ? (
+                  <div className="path-edit-input-wrap">
+                    <input
+                      ref={pathEditInputRef}
+                      className="path-edit-input"
+                      value={pathInput}
+                      spellCheck={false}
+                      autoFocus
+                      onChange={(event) => setPathInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          setIsEditingPath(false);
+                          submitPathInput();
+                        }
+                        if (event.key === 'Escape') {
+                          setPathInput(currentPath);
+                          setIsEditingPath(false);
+                        }
+                      }}
+                      onBlur={() => {
+                        setIsEditingPath(false);
+                        setPathInput(currentPath);
+                      }}
+                      disabled={isLoadingFiles}
+                    />
+                  </div>
+                ) : (
+                  <div
+                    className="path-breadcrumb-bar"
+                    onClick={(e) => {
+                      // Only switch to edit mode when clicking the bar background
+                      // (not when clicking a breadcrumb button)
+                      if (e.target === e.currentTarget) {
+                        setPathInput(currentPath);
+                        setIsEditingPath(true);
+                      }
+                    }}
+                  >
+                    {pathBreadcrumbs.length > 4 && (
+                      <button
+                        className="path-breadcrumb-ellipsis-btn"
+                        title={currentPath}
+                        onClick={() => navigateToPath(pathBreadcrumbs[0].path)}
+                      >
+                        …
+                      </button>
+                    )}
+                    {pathBreadcrumbs.slice(pathBreadcrumbs.length > 4 ? -4 : 0).map((crumb, index) => {
+                      const globalIndex = pathBreadcrumbs.length > 4
+                        ? pathBreadcrumbs.length - 4 + index
+                        : index;
+                      const isLast = globalIndex === pathBreadcrumbs.length - 1;
+                      return (
+                        <button
+                          key={crumb.path}
+                          className={isLast ? 'path-breadcrumb active' : 'path-breadcrumb'}
+                          disabled={isLast}
+                          onClick={() => navigateToPath(crumb.path)}
+                          title={crumb.path}
+                        >
+                          <span>{crumb.label}</span>
+                          {!isLast && <ChevronRight size={13} />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
               <div className="file-list">
@@ -3181,17 +3409,17 @@ export function App() {
                     修改时间 {sortKey === 'modifiedTime' ? (sortDirection === 'asc' ? '↑' : '↓') : '↕'}
                   </button>
                 </div>
-                <div className="file-list-body" onContextMenu={handleBlankContextMenu}>
-                  {!isLoadingFiles && !fileListError && visibleFiles.map((file) => (
+                <div className="file-list-body" onContextMenu={handleBlankContextMenu} onClick={(e) => { if (e.target === e.currentTarget) { setSelectedFiles(new Set()); setLastClickedIndex(-1); } }}>
+                  {!isLoadingFiles && !fileListError && visibleFiles.map((file, index) => (
                     <button
                       key={file.name}
-                      className={selectedFile === file.name ? 'file-item selected' : 'file-item'}
-                      onClick={() => setSelectedFile(file.name)}
+                      className={`${selectedFiles.has(file.name) ? 'file-item selected' : 'file-item'}${clipboard?.operation === 'cut' && clipboard.paths.includes(file.path) ? ' is-cut' : ''}`}
+                      onClick={(e) => handleFileClick(e, file, index)}
                       onDoubleClick={() => openSelectedFile(file)}
                       onContextMenu={(e) => handleFileContextMenu(e, file)}
                     >
                       <span className="file-name">
-                        {file.type === 'directory' ? <FolderOpen size={18} className="folder-icon" /> : <File size={18} className="file-icon" />}
+                        <VscodeFileIcon filename={file.name} isDirectory={file.type === 'directory'} />
                         <span className="file-name-text">{file.name}</span>
                       </span>
                       <span>{file.size}</span>
@@ -3218,7 +3446,29 @@ export function App() {
                 </div>
               </div>
 
-              <div className="resource-bottom-panel">
+              <div
+                className="resource-bottom-panel"
+                ref={resourceBottomPanelRef}
+                style={{ height: resourceBottomPanelHeight }}
+              >
+                <div
+                  className="resource-bottom-resizer"
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+                    resourceBottomDragRef.current = { startY: e.clientY, startHeight: resourceBottomPanelHeight };
+                  }}
+                  onPointerMove={(e) => {
+                    const drag = resourceBottomDragRef.current;
+                    if (!drag) return;
+                    const delta = drag.startY - e.clientY; // 向上拖 = 增大高度
+                    const newHeight = Math.max(80, Math.min(drag.startHeight + delta, 500));
+                    setResourceBottomPanelHeight(newHeight);
+                  }}
+                  onPointerUp={() => {
+                    resourceBottomDragRef.current = null;
+                  }}
+                />
                 <div className="resource-bottom-tabs">
                   <button
                     className={resourceBottomTab === 'transfer' ? 'resource-bottom-tab active' : 'resource-bottom-tab'}
@@ -3245,7 +3495,7 @@ export function App() {
                             <th className="transfer-th-name">文件名称</th>
                             <th className="transfer-th-size">文件大小</th>
                             <th className="transfer-th-speed">速度</th>
-                            <th className="transfer-th-time">{transferRecords.some(r => r.direction === 'download') ? '传输时间' : '上传时间'}</th>
+                            <th className="transfer-th-time">{transferRecords.some(r => r.direction === 'download' || r.direction === 'open') ? '传输时间' : '上传时间'}</th>
                             <th className="transfer-th-action">操作</th>
                           </tr>
                         </thead>
@@ -3256,21 +3506,23 @@ export function App() {
                                 <td className="transfer-td-name">
                                   <div className="transfer-name-cell">
                                     <span className="transfer-filename" title={record.fileName}>
-                                      {record.direction === 'download' ? <Download size={12} className="transfer-dir-icon" /> : <Upload size={12} className="transfer-dir-icon" />}
+                                      {record.direction === 'download' ? <Download size={12} className="transfer-dir-icon" /> : record.direction === 'open' ? <FileText size={12} className="transfer-dir-icon" /> : <Upload size={12} className="transfer-dir-icon" />}
                                       {record.fileName}
                                     </span>
                                     {record.status === 'uploading' && (
                                       <>
-                                        <div className="transfer-progress-bar">
-                                          <div className="transfer-progress-fill" style={{ width: `${record.progress}%` }} />
-                                        </div>
+                                        {record.progress >= 0 && (
+                                          <div className="transfer-progress-bar">
+                                            <div className="transfer-progress-fill" style={{ width: `${record.progress}%` }} />
+                                          </div>
+                                        )}
                                         <span className="transfer-status-msg">{record.message}</span>
                                       </>
                                     )}
                                   </div>
                                 </td>
                                 <td className="transfer-td-size">
-                                  {record.status === 'uploading' ? (
+                                  {record.status === 'uploading' && record.progress >= 0 ? (
                                     <span className="transfer-size-progress">
                                       {formatFileSize(record.transferred)} / {formatFileSize(record.size)}
                                     </span>
@@ -3279,8 +3531,10 @@ export function App() {
                                   )}
                                 </td>
                                 <td className="transfer-td-speed">
-                                  {record.status === 'uploading' ? (
+                                  {record.status === 'uploading' && record.progress >= 0 ? (
                                     <span className="transfer-speed-active">{formatSpeed(record.speed)}</span>
+                                  ) : record.status === 'uploading' ? (
+                                    <span className="transfer-speed-none">-</span>
                                   ) : record.status === 'success' && record.speed > 0 ? (
                                     <span className="transfer-speed-avg">{formatSpeed(record.speed)}</span>
                                   ) : (
@@ -3319,20 +3573,206 @@ export function App() {
                   </div>
                 )}
               </div>
-            </>
-          )}
         </aside>
+        )}
+        {leftActivity === 'monitor' && (
+          <div className="side-panel">
+            <div className="side-panel-header">
+              <span>资源监控</span>
+            </div>
+            {isLoadingMonitor && !monitorData ? (
+              <div className="side-panel-loading">
+                <RefreshCw size={20} className="spin" />
+                <span>正在获取系统信息...</span>
+              </div>
+            ) : monitorData ? (
+              <div className="side-panel-content">
+                <div className="monitor-section">
+                  <div className="monitor-section-header">
+                    <Cpu size={14} />
+                    <span>CPU</span>
+                    <span className="monitor-value">{Math.max(0, Math.min(100, monitorData.cpu_usage_percent)).toFixed(1)}%</span>
+                  </div>
+                  <div className="monitor-bar-container">
+                    <div className="monitor-bar" style={{ width: `${Math.max(0, Math.min(monitorData.cpu_usage_percent, 100))}%`, background: monitorData.cpu_usage_percent > 80 ? '#e06c75' : monitorData.cpu_usage_percent > 60 ? '#d19a66' : '#98c379' }} />
+                  </div>
+                  <div className="monitor-detail">{monitorData.cpu_model}</div>
+                  <div className="monitor-detail">{monitorData.cpu_count} 核心 · 负载 {monitorData.load_avg_1min.toFixed(2)} / {monitorData.load_avg_5min.toFixed(2)} / {monitorData.load_avg_15min.toFixed(2)}</div>
+                </div>
+
+                <div className="monitor-section">
+                  <div className="monitor-section-header">
+                    <MemoryStick size={14} />
+                    <span>内存</span>
+                    <span className="monitor-value">{((monitorData.memory_used_bytes / monitorData.memory_total_bytes) * 100).toFixed(1)}%</span>
+                  </div>
+                  <div className="monitor-bar-container">
+                    <div className="monitor-bar" style={{ width: `${Math.min((monitorData.memory_used_bytes / monitorData.memory_total_bytes) * 100, 100)}%`, background: (monitorData.memory_used_bytes / monitorData.memory_total_bytes) * 100 > 80 ? '#e06c75' : (monitorData.memory_used_bytes / monitorData.memory_total_bytes) * 100 > 60 ? '#d19a66' : '#98c379' }} />
+                  </div>
+                  <div className="monitor-detail">{formatBytes(monitorData.memory_used_bytes)} / {formatBytes(monitorData.memory_total_bytes)}</div>
+                  <div className="monitor-detail">可用 {formatBytes(monitorData.memory_available_bytes)}</div>
+                </div>
+
+                <div className="monitor-section">
+                  <div className="monitor-section-header">
+                    <HardDrive size={14} />
+                    <span>磁盘</span>
+                    <span className="monitor-value">{((monitorData.disk_used_bytes / monitorData.disk_total_bytes) * 100).toFixed(1)}%</span>
+                  </div>
+                  <div className="monitor-bar-container">
+                    <div className="monitor-bar" style={{ width: `${Math.min((monitorData.disk_used_bytes / monitorData.disk_total_bytes) * 100, 100)}%`, background: (monitorData.disk_used_bytes / monitorData.disk_total_bytes) * 100 > 80 ? '#e06c75' : (monitorData.disk_used_bytes / monitorData.disk_total_bytes) * 100 > 60 ? '#d19a66' : '#98c379' }} />
+                  </div>
+                  <div className="monitor-detail">{formatBytes(monitorData.disk_used_bytes)} / {formatBytes(monitorData.disk_total_bytes)}</div>
+                  <div className="monitor-detail">可用 {formatBytes(monitorData.disk_available_bytes)}</div>
+                </div>
+
+                <div className="monitor-section">
+                  <div className="monitor-section-header">
+                    <span>交换空间</span>
+                    {monitorData.swap_total_bytes > 0 && <span className="monitor-value">{((monitorData.swap_used_bytes / monitorData.swap_total_bytes) * 100).toFixed(1)}%</span>}
+                  </div>
+                  {monitorData.swap_total_bytes > 0 ? (
+                    <>
+                      <div className="monitor-bar-container">
+                        <div className="monitor-bar" style={{ width: `${Math.min((monitorData.swap_used_bytes / monitorData.swap_total_bytes) * 100, 100)}%`, background: (monitorData.swap_used_bytes / monitorData.swap_total_bytes) * 100 > 80 ? '#e06c75' : (monitorData.swap_used_bytes / monitorData.swap_total_bytes) * 100 > 60 ? '#d19a66' : '#98c379' }} />
+                      </div>
+                      <div className="monitor-detail">{formatBytes(monitorData.swap_used_bytes)} / {formatBytes(monitorData.swap_total_bytes)}</div>
+                    </>
+                  ) : (
+                    <div className="monitor-detail">未启用交换空间</div>
+                  )}
+                </div>
+
+                <div className="monitor-info-grid">
+                  <div className="monitor-info-item">
+                    <span className="monitor-info-label">主机名</span>
+                    <span className="monitor-info-value">{monitorData.hostname}</span>
+                  </div>
+                  <div className="monitor-info-item">
+                    <span className="monitor-info-label">操作系统</span>
+                    <span className="monitor-info-value">{monitorData.os_name} {monitorData.os_version}</span>
+                  </div>
+                  <div className="monitor-info-item">
+                    <span className="monitor-info-label">内核版本</span>
+                    <span className="monitor-info-value">{monitorData.kernel_version}</span>
+                  </div>
+                  <div className="monitor-info-item">
+                    <span className="monitor-info-label">运行时间</span>
+                    <span className="monitor-info-value">{formatUptime(monitorData.uptime_seconds)}</span>
+                  </div>
+                  <div className="monitor-info-item">
+                    <span className="monitor-info-label">进程数</span>
+                    <span className="monitor-info-value">{monitorData.processes}</span>
+                  </div>
+                </div>
+
+
+              </div>
+            ) : (
+              <div className="side-panel-empty">
+                <Activity size={30} />
+                <p>请先连接终端以查看资源监控数据</p>
+              </div>
+            )}
+          </div>
+        )}
+        {leftActivity === 'processes' && (
+          <div className="side-panel">
+            <div className="side-panel-header">
+              <span>进程管理</span>
+              <div className="process-search-box">
+                <Search size={14} />
+                <input
+                  type="text"
+                  placeholder="搜索进程..."
+                  value={processSearch}
+                  onChange={(e) => setProcessSearch(e.target.value)}
+                />
+              </div>
+            </div>
+            {isLoadingProcesses && processList.length === 0 ? (
+              <div className="side-panel-loading">
+                <RefreshCw size={20} className="spin" />
+                <span>正在获取进程列表...</span>
+              </div>
+            ) : processList.length > 0 ? (
+              <div className="side-panel-content process-panel-content">
+                <div className="process-table">
+                  <div className="process-table-header">
+                    <div
+                      className={`process-col process-col-name${processSortKey === 'name' ? ' sorted' : ''}`}
+                      onClick={() => setProcessSortKey('name')}
+                    >
+                      名称 {processSortKey === 'name' && <ChevronDown size={12} />}
+                    </div>
+                    <div className="process-col process-col-status">状态</div>
+                    <div
+                      className={`process-col process-col-cpu${processSortKey === 'cpu' ? ' sorted' : ''}`}
+                      onClick={() => setProcessSortKey('cpu')}
+                    >
+                      CPU {processSortKey === 'cpu' && <ChevronDown size={12} />}
+                    </div>
+                    <div
+                      className={`process-col process-col-mem${processSortKey === 'memory' ? ' sorted' : ''}`}
+                      onClick={() => setProcessSortKey('memory')}
+                    >
+                      内存 {processSortKey === 'memory' && <ChevronDown size={12} />}
+                    </div>
+                  </div>
+                  {(() => {
+                    const filtered = processList.filter((p) =>
+                      !processSearch || p.name.toLowerCase().includes(processSearch.toLowerCase())
+                    );
+                    const sorted = [...filtered].sort((a, b) => {
+                      if (processSortKey === 'cpu') return b.cpu_usage_percent - a.cpu_usage_percent;
+                      if (processSortKey === 'memory') return b.memory_bytes - a.memory_bytes;
+                      return a.name.localeCompare(b.name);
+                    });
+                    return sorted.map((p) => (
+                      <div className="process-row" key={p.pid}>
+                        <div className="process-col process-col-name" title={p.name}>
+                          <span className="process-name">{p.name}</span>
+                          <span className="process-pid">({p.pid})</span>
+                        </div>
+                        <div className="process-col process-col-status">
+                          <span className={`process-status-badge status-${p.status.toLowerCase()}`}>
+                            {p.status === 'Running' ? '运行' : p.status === 'Sleeping' ? '睡眠' : p.status === 'Idle' ? '空闲' : p.status === 'Zombie' ? '僵尸' : p.status === 'Stopped' ? '停止' : p.status}
+                          </span>
+                        </div>
+                        <div className="process-col process-col-cpu">
+                          <span style={{ color: p.cpu_usage_percent > 80 ? '#e06c75' : p.cpu_usage_percent > 60 ? '#d19a66' : '#98c379' }}>
+                            {p.cpu_usage_percent.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="process-col process-col-mem">
+                          {formatBytes(p.memory_bytes)}
+                        </div>
+                      </div>
+                    ));
+                  })()}
+                </div>
+              </div>
+            ) : (
+              <div className="side-panel-empty">
+                <Cpu size={30} />
+                <p>请先连接终端以查看进程信息</p>
+              </div>
+            )}
+          </div>
+        )}
+        </div>
+        )}
 
         <div
-          className={resourceCollapsed ? 'resource-resizer disabled' : 'resource-resizer'}
+          className={leftActivity ? 'resource-resizer' : 'resource-resizer disabled'}
           role="separator"
           aria-orientation="vertical"
-          aria-label="调整资源面板宽度"
+          aria-label="调整面板宽度"
           onPointerDown={startResourceResize}
         />
 
-        <section className={activeTab?.kind === 'terminal' ? 'terminal-panel terminal-panel-terminal-only' : 'terminal-panel'}>
-          {activeTab?.kind !== 'terminal' && (
+        <section className={`terminal-panel${activeTab?.kind === 'terminal' ? ' terminal-panel-terminal-only' : ''}${activeTab?.kind !== 'terminal' && tabs.filter((tab) => !tab.parentTabId).length === 0 ? ' terminal-panel-no-tabs' : ''}`}>
+          {activeTab?.kind !== 'terminal' && tabs.filter((tab) => !tab.parentTabId).length > 0 && (
             <div className="workspace-tabs" ref={workspaceTabsRef} onDoubleClick={(event) => {
               if ((event.target as HTMLElement).closest('.workspace-tab, .workspace-tab-add')) return;
               openNewConnectionTab();
@@ -3405,9 +3845,8 @@ export function App() {
               />
             ) : !activeTab ? (
               <div className="empty-workspace">
-                <div className="empty-icon"><TerminalSquare size={32} /></div>
                 <h2>没有活动标签页</h2>
-                <p>点击下方按钮或标签栏的 + 新建连接。</p>
+                <p>点击下方按钮新建连接。</p>
                 <button className="empty-primary-action" onClick={openNewConnectionTab}>
                   <Plus size={17} />
                   <span>新建连接</span>
@@ -3429,7 +3868,7 @@ export function App() {
                   <div className="resource-preview-empty">
                     <Home size={30} />
                     <h2>正在加载媒体...</h2>
-                    <p>{selectedFile || ''}</p>
+                    <p>{selectedFiles.size > 0 ? [...selectedFiles].join(', ') : ''}</p>
                   </div>
                 ) : mediaError ? (
                   <div className="resource-preview-empty is-error">
@@ -3481,226 +3920,7 @@ export function App() {
         </section>
       </section>
 
-      {connectionPanelMode && (
-        <div className="connection-panel-backdrop" onMouseDown={() => { setConnectionPanelMode(null); setPendingPaneTabId(null); }}>
-          <section className="connection-panel" onMouseDown={(event) => event.stopPropagation()}>
-            <header className="connection-panel-header">
-              <div>
-                <h2>{connectionPanelMode === 'create' ? '新建连接' : '连接管理'}</h2>
-              </div>
-              <button className="connection-panel-close" title="关闭" onClick={() => { setConnectionPanelMode(null); setPendingPaneTabId(null); }}>
-                <X size={18} />
-              </button>
-            </header>
-
-            {connectionPanelMode === 'manage' ? (
-              <div className="connection-panel-body">
-                <div className="connection-search-bar">
-                  <Search size={15} />
-                  <input
-                    value={connectionSearchQuery}
-                    placeholder="搜索名称、主机或用户名..."
-                    onChange={(event) => setConnectionSearchQuery(event.target.value)}
-                  />
-                  {connectionSearchQuery && (
-                    <button className="connection-search-clear" onClick={() => setConnectionSearchQuery('')}>
-                      <X size={14} />
-                    </button>
-                  )}
-                </div>
-                <div className="connection-list terminal-scrollbar">
-                  <div className="connection-card connection-card-local"
-                    title="双击快速打开"
-                    onDoubleClick={() => void openLocalTerminalFromPanel()}
-                  >
-                    <div className="connection-card-main">
-                      <div className="connection-card-title">本地直连</div>
-                      <div className="connection-card-target">{localTerminalProfile.shell_name} · {localTerminalProfile.cwd}</div>
-                    </div>
-                    <div className="connection-card-buttons" onDoubleClick={(e) => e.stopPropagation()}>
-                      <button className="connection-card-action" onClick={() => void openLocalTerminalFromPanel()}>
-                        打开
-                      </button>
-                    </div>
-                  </div>
-                  {filteredSessions.length > 0 ? (
-                    filteredSessions.map((session) => {
-                      return (
-                        <div key={session.id} className="connection-card"
-                          title="双击快速连接"
-                          onDoubleClick={() => void openConnectionPanelSession(session)}
-                        >
-                          <div className="connection-card-main">
-                            <div className="connection-card-title">{session.name}</div>
-                            <div className="connection-card-target">
-                              {session.username}@{session.host}:{session.port}
-                            </div>
-                          </div>
-                          <div className="connection-card-buttons" onDoubleClick={(e) => e.stopPropagation()}>
-                            <button className="connection-card-action" onClick={() => void openConnectionPanelSession(session)}>
-                              连接
-                            </button>
-                            <button
-                              className="connection-card-delete"
-                              title="删除连接"
-                              onClick={() => void deleteConnectionSession(session)}
-                            >
-                              <Trash2 size={15} />
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })
-                  ) : sessions.length > 0 ? (
-                    <div className="connection-empty-state">
-                      <Search size={28} />
-                      <strong>没有匹配的连接</strong>
-                      <span>尝试更换搜索关键词。</span>
-                    </div>
-                  ) : (
-                    <div className="connection-empty-state">
-                      <Server size={28} />
-                      <strong>暂无已保存连接</strong>
-                      <span>点击下方按钮新建一个连接。</span>
-                    </div>
-                  )}
-                </div>
-                <footer className="connection-panel-actions">
-                  <button className="connection-primary-action" onClick={() => setConnectionPanelMode('create')}>
-                    <Plus size={16} />
-                    <span>新建连接</span>
-                  </button>
-                </footer>
-              </div>
-            ) : (
-              <div className="connection-panel-body">
-                <div className="connection-panel-description">
-                  这里会把表单写入连接配置，并立即打开对应终端。
-                </div>
-                {connectionFormError && <div className="connection-form-error">{connectionFormError}</div>}
-                <div className="connection-form-grid">
-                  <label>
-                    <span>连接名称</span>
-                    <input
-                      value={connectionForm.name}
-                      placeholder="例如：测试服务器"
-                      onChange={(event) => updateConnectionForm('name', event.target.value)}
-                    />
-                  </label>
-                  <label>
-                    <span>主机地址</span>
-                    <input
-                      value={connectionForm.host}
-                      placeholder="192.168.1.10 或 example.com"
-                      onChange={(event) => updateConnectionForm('host', event.target.value)}
-                    />
-                  </label>
-                  <label>
-                    <span>用户名</span>
-                    <input
-                      value={connectionForm.username}
-                      placeholder="root"
-                      onChange={(event) => updateConnectionForm('username', event.target.value)}
-                    />
-                  </label>
-                  <label>
-                    <span>端口</span>
-                    <input
-                      value={connectionForm.port}
-                      placeholder="22"
-                      inputMode="numeric"
-                      onChange={(event) => updateConnectionForm('port', event.target.value)}
-                    />
-                  </label>
-                  <label className="connection-form-wide">
-                    <span>认证方式</span>
-                    <select
-                      value={connectionAuthMethod}
-                      onChange={(event) => {
-                        setConnectionAuthMethod(event.target.value as ConnectionAuthMethod);
-                        setConnectionFormError('');
-                      }}
-                    >
-                      <option value="password">Password</option>
-                      <option value="public_key">Public Key</option>
-                      <option value="keyboard_interactive">Keyboard Interactive</option>
-                      <option value="gssapi">GSSAPI</option>
-                    </select>
-                  </label>
-
-                  {connectionAuthMethod === 'password' && (
-                    <div className="connection-form-wide connection-auth-fields">
-                      <label>
-                        <span>密码</span>
-                        <input
-                          type="password"
-                          value={connectionForm.password}
-                          placeholder="输入 SSH 登录密码"
-                          onChange={(event) => updateConnectionForm('password', event.target.value)}
-                        />
-                      </label>
-                    </div>
-                  )}
-
-                  {connectionAuthMethod === 'public_key' && (
-                    <div className="connection-form-wide connection-auth-fields">
-                      <label>
-                        <span>私钥路径</span>
-                        <input
-                          value={connectionForm.privateKeyPath}
-                          placeholder="例如：C:\\Users\\you\\.ssh\\id_rsa"
-                          onChange={(event) => updateConnectionForm('privateKeyPath', event.target.value)}
-                        />
-                      </label>
-                      <label>
-                        <span>私钥口令</span>
-                        <input
-                          type="password"
-                          value={connectionForm.privateKeyPassphrase}
-                          placeholder="没有口令可留空"
-                          onChange={(event) => updateConnectionForm('privateKeyPassphrase', event.target.value)}
-                        />
-                      </label>
-                    </div>
-                  )}
-
-                  {connectionAuthMethod === 'keyboard_interactive' && (
-                    <div className="connection-form-wide connection-auth-fields">
-                      <label>
-                        <span>交互提示响应</span>
-                        <input
-                          type="password"
-                          value={connectionForm.keyboardInteractiveResponse}
-                          placeholder="用于 Keyboard Interactive 的默认响应"
-                          onChange={(event) => updateConnectionForm('keyboardInteractiveResponse', event.target.value)}
-                        />
-                      </label>
-                    </div>
-                  )}
-
-                  {connectionAuthMethod === 'gssapi' && (
-                    <div className="connection-form-wide connection-auth-fields">
-                      <label>
-                        <span>GSSAPI Principal</span>
-                        <input
-                          value={connectionForm.gssapiPrincipal}
-                          placeholder="例如：user@REALM.COM，可留空使用当前身份"
-                          onChange={(event) => updateConnectionForm('gssapiPrincipal', event.target.value)}
-                        />
-                      </label>
-                    </div>
-                  )}
-                </div>
-                <footer className="connection-panel-actions">
-                  <button className="connection-primary-action" onClick={() => void saveAndConnectConnection()} disabled={isSavingConnection}>
-                    {isSavingConnection ? '保存中...' : '保存并连接'}
-                  </button>
-                </footer>
-              </div>
-            )}
-          </section>
-        </div>
-      )}
+      {/* Connection panel now opens as a separate Tauri window */}
 
       {contextMenu && (
         <div
@@ -3779,20 +3999,26 @@ export function App() {
               <button
                 className="file-context-item"
                 onClick={() => {
-                  handleCopyFile(contextMenu.file!);
+                  // Copy all selected items if the right-clicked file is part
+                  // of the selection; otherwise copy just the clicked file.
+                  const selected = getSelectedResourceFiles();
+                  const isMulti = selected.length > 1 && selectedFiles.has(contextMenu.file!.name);
+                  handleCopyFiles(isMulti ? selected : [contextMenu.file!]);
                   setContextMenu(null);
                 }}
               >
-                <Clipboard size={15} /> 复制
+                <Clipboard size={15} /> 复制{selectedFiles.size > 1 && selectedFiles.has(contextMenu.file!.name) ? ` (${selectedFiles.size} 个)` : ''}
               </button>
               <button
                 className="file-context-item"
                 onClick={() => {
-                  handleCutFile(contextMenu.file!);
+                  const selected = getSelectedResourceFiles();
+                  const isMulti = selected.length > 1 && selectedFiles.has(contextMenu.file!.name);
+                  handleCutFiles(isMulti ? selected : [contextMenu.file!]);
                   setContextMenu(null);
                 }}
               >
-                <Scissors size={15} /> 剪切
+                <Scissors size={15} /> 剪切{selectedFiles.size > 1 && selectedFiles.has(contextMenu.file!.name) ? ` (${selectedFiles.size} 个)` : ''}
               </button>
               <button
                 className="file-context-item"
@@ -3806,11 +4032,13 @@ export function App() {
               <button
                 className="file-context-item danger"
                 onClick={() => {
-                  void handleDeletePath(contextMenu.file!);
+                  const selected = getSelectedResourceFiles();
+                  const isMulti = selected.length > 1 && selectedFiles.has(contextMenu.file!.name);
+                  void handleDeletePaths(isMulti ? selected : [contextMenu.file!]);
                   setContextMenu(null);
                 }}
               >
-                <Trash2 size={15} /> 删除
+                <Trash2 size={15} /> 删除{selectedFiles.size > 1 && selectedFiles.has(contextMenu.file!.name) ? ` (${selectedFiles.size} 个)` : ''}
               </button>
             </>
           ) : (
@@ -3823,7 +4051,7 @@ export function App() {
                     setContextMenu(null);
                   }}
                 >
-                  <ClipboardPaste size={15} /> 粘贴
+                  <ClipboardPaste size={15} /> 粘贴{clipboard.paths.length > 1 ? ` (${clipboard.paths.length} 个)` : ''}
                 </button>
               )}
               <button

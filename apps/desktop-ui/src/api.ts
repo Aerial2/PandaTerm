@@ -1,5 +1,50 @@
 import { invoke } from '@tauri-apps/api/core';
 
+export async function openConnectionWindow(mode: 'manage' | 'create') {
+  const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+  const label = mode === 'create' ? 'connection-create' : 'connection-panel';
+
+  // If the window already exists, focus it and send mode event
+  const existing = await WebviewWindow.getByLabel(label);
+  if (existing) {
+    await existing.emit('connection-window-set-mode', mode);
+    await existing.setFocus();
+    return;
+  }
+
+  // Create new window
+  const devUrl = import.meta.env.DEV
+    ? `http://localhost:1420?mode=connection`
+    : undefined;
+  const entry = import.meta.env.DEV
+    ? undefined
+    : `index.html?mode=connection`;
+
+  const windowOpts = mode === 'create'
+    ? { width: 640, height: 520, minWidth: 520, minHeight: 420 }
+    : { width: 880, height: 560, minWidth: 720, minHeight: 480 };
+
+  const webviewWindow = new WebviewWindow(label, {
+    url: devUrl ?? entry!,
+    title: mode === 'create' ? '新建连接 — PandaTerm' : '连接管理 — PandaTerm',
+    ...windowOpts,
+    center: true,
+    resizable: true,
+    decorations: false,
+    transparent: false,
+    visible: false,
+  });
+
+  // Wait for window to be created then send mode
+  await webviewWindow.once('tauri://created', async () => {
+    await webviewWindow.emit('connection-window-set-mode', mode);
+  });
+
+  webviewWindow.once('tauri://error', (e) => {
+    console.error('Connection window error:', e);
+  });
+}
+
 export type AuthType =
   | { type: 'password'; secret_id: string }
   | { type: 'private_key'; key_id: string; passphrase_secret_id?: string | null }
@@ -239,14 +284,57 @@ export async function createDirectory(path: string, terminalId?: string | null):
   await invoke('create_directory', { terminalId: terminalId ?? null, path });
 }
 
-export async function copyPath(source: string, destDir: string, terminalId?: string | null): Promise<string> {
-  return await invoke<string>('copy_path', { terminalId: terminalId ?? null, source, destDir });
+export async function copyPath(source: string, destDir: string, terminalId?: string | null, destName?: string): Promise<string> {
+  return await invoke<string>('copy_path', { terminalId: terminalId ?? null, source, destDir, destName: destName ?? null });
 }
 
-export async function movePath(source: string, destDir: string, terminalId?: string | null): Promise<string> {
-  return await invoke<string>('move_path', { terminalId: terminalId ?? null, source, destDir });
+export async function movePath(source: string, destDir: string, terminalId?: string | null, destName?: string): Promise<string> {
+  return await invoke<string>('move_path', { terminalId: terminalId ?? null, source, destDir, destName: destName ?? null });
 }
 
 export async function getLocalIpv4(): Promise<string> {
   return await invoke<string>('get_local_ipv4');
+}
+
+export interface SystemMonitorData {
+  hostname: string;
+  os_name: string;
+  os_version: string;
+  kernel_version: string;
+  uptime_seconds: number;
+  cpu_count: number;
+  cpu_usage_percent: number;
+  memory_total_bytes: number;
+  memory_used_bytes: number;
+  memory_available_bytes: number;
+  swap_total_bytes: number;
+  swap_used_bytes: number;
+  disk_total_bytes: number;
+  disk_used_bytes: number;
+  disk_available_bytes: number;
+  load_avg_1min: number;
+  load_avg_5min: number;
+  load_avg_15min: number;
+  cpu_model: string;
+  network_rx_bytes: number;
+  network_tx_bytes: number;
+  processes: number;
+}
+
+export async function getSystemMonitor(terminalId?: string | null): Promise<SystemMonitorData> {
+  return await invoke<SystemMonitorData>('get_system_monitor', { terminalId: terminalId ?? null });
+}
+
+export interface ProcessInfo {
+  pid: number;
+  name: string;
+  status: string;
+  cpu_usage_percent: number;
+  memory_bytes: number;
+  disk_bytes_per_sec: number;
+  network_bytes_per_sec: number;
+}
+
+export async function getProcessList(terminalId?: string | null): Promise<ProcessInfo[]> {
+  return await invoke<ProcessInfo[]>('get_process_list', { terminalId: terminalId ?? null });
 }

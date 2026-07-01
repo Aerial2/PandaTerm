@@ -33,6 +33,10 @@ struct AppState {
     sessions: Mutex<SessionCatalog>,
     local_terminals: Mutex<HashMap<Uuid, LocalTerminalSession>>,
     remote_terminals: Mutex<HashMap<Uuid, RemoteTerminalSession>>,
+    /// Cached sysinfo::System for local CPU usage monitoring.
+    /// Keeps CPU time counters alive so that `refresh_cpu_usage()` computes
+    /// correct deltas between successive calls instead of starting from scratch.
+    local_sys_monitor: std::sync::Mutex<Option<sysinfo::System>>,
 }
 
 type SharedWriter = Arc<std::sync::Mutex<Box<dyn Write + Send>>>;
@@ -535,7 +539,11 @@ async fn connect_russh_session(
         format!("Connecting to {}:{}...", session.host, session.port),
     );
 
-    let config = Arc::new(russh::client::Config::default());
+    let config = Arc::new(russh::client::Config {
+        keepalive_interval: Some(Duration::from_secs(15)),
+        keepalive_max: 3,
+        ..russh::client::Config::default()
+    });
     let handler = SshHandler;
 
     let mut handle = tokio::time::timeout(
@@ -900,11 +908,6 @@ fn default_local_path() -> Result<PathBuf, String> {
     .filter(|path| path.is_dir())
     .ok_or_else(|| "无法定位用户目录".to_string())?;
 
-    let desktop = home.join("Desktop");
-    if desktop.is_dir() {
-        return Ok(desktop);
-    }
-
     Ok(home)
 }
 
@@ -933,6 +936,20 @@ fn format_path(path: PathBuf) -> String {
 
 #[tauri::command]
 async fn list_local_directory(path: Option<String>) -> Result<LocalDirectoryListing, String> {
+    // On Windows, a special "root" path lists available drive letters
+    // so users can navigate between drives like in File Explorer.
+    if cfg!(target_os = "windows") {
+        let resolved = resolve_local_path(path.clone())?;
+        // If the user navigated to the virtual root (e.g. by going "up" from C:\),
+        // list all available drive letters.
+        if resolved.to_string_lossy().trim_end_matches('\\').is_empty()
+            || resolved.to_string_lossy() == "This PC"
+            || resolved.to_string_lossy() == "此电脑"
+        {
+            return list_windows_drives();
+        }
+    }
+
     let directory = resolve_local_path(path)?;
     let canonical_directory = directory
         .canonicalize()
@@ -969,11 +986,50 @@ async fn list_local_directory(path: Option<String>) -> Result<LocalDirectoryList
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
 
+    // On Windows, when the current directory is a drive root (e.g. C:\),
+    // set parent to a virtual "This PC" so users can navigate to other drives.
+    let parent_path = if cfg!(target_os = "windows") {
+        let canonical_str = canonical_directory.to_string_lossy();
+        // e.g. canonical is "\\?\C:\" — parent would be "\\?\C" which is invalid
+        // Instead, set parent to the virtual root
+        if canonical_str.ends_with(":\\") || canonical_str.ends_with(":\\\\") {
+            Some("此电脑".to_string())
+        } else {
+            canonical_directory
+                .parent()
+                .map(|parent| format_path(parent.to_path_buf()))
+        }
+    } else {
+        canonical_directory
+            .parent()
+            .map(|parent| format_path(parent.to_path_buf()))
+    };
+
     Ok(LocalDirectoryListing {
         path: format_path(canonical_directory.clone()),
-        parent: canonical_directory
-            .parent()
-            .map(|parent| format_path(parent.to_path_buf())),
+        parent: parent_path,
+        entries,
+    })
+}
+
+/// List available Windows drive letters as directory entries.
+fn list_windows_drives() -> Result<LocalDirectoryListing, String> {
+    let mut entries = Vec::new();
+    for letter in 'A'..'Z' {
+        let drive = format!("{letter}:\\");
+        if PathBuf::from(&drive).is_dir() {
+            entries.push(LocalDirectoryEntry {
+                name: format!("本地磁盘 ({letter}:)"),
+                path: drive.clone(),
+                entry_type: "directory".to_string(),
+                size: 0,
+                modified_ms: None,
+            });
+        }
+    }
+    Ok(LocalDirectoryListing {
+        path: "此电脑".to_string(),
+        parent: None,
         entries,
     })
 }
@@ -1519,19 +1575,26 @@ async fn create_directory(
 }
 
 /// Copy a file or directory into a destination directory.
+/// If `dest_name` is provided, it overrides the source file name in the destination path.
 #[tauri::command]
 async fn copy_path(
     terminal_id: Option<Uuid>,
     source: String,
     dest_dir: String,
+    dest_name: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let file_name = source.rsplit('/').next().unwrap_or(&source);
+    let file_name = dest_name.unwrap_or_else(|| source.rsplit('/').next().unwrap_or(&source).to_string());
     let dest = if dest_dir.ends_with('/') {
         format!("{dest_dir}{file_name}")
     } else {
         format!("{dest_dir}/{file_name}")
     };
+
+    // Nothing to do if source and destination are identical.
+    if source == dest {
+        return Ok(dest);
+    }
 
     if let Some(tid) = terminal_id {
         let handle = {
@@ -1560,14 +1623,16 @@ async fn copy_path(
 }
 
 /// Move/rename a file or directory into a destination directory.
+/// If `dest_name` is provided, it overrides the source file name in the destination path.
 #[tauri::command]
 async fn move_path(
     terminal_id: Option<Uuid>,
     source: String,
     dest_dir: String,
+    dest_name: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let file_name = source.rsplit('/').next().unwrap_or(&source);
+    let file_name = dest_name.unwrap_or_else(|| source.rsplit('/').next().unwrap_or(&source).to_string());
     let dest = if dest_dir.ends_with('/') {
         format!("{dest_dir}{file_name}")
     } else {
@@ -1733,11 +1798,12 @@ async fn read_file_as_data_url(
         exec_remote_command(&handle, &format!("cat {quoted} 2>/dev/null")).await?
     } else {
         let p = PathBuf::from(&path);
-        let meta = fs::metadata(&p).map_err(|e| e.to_string())?;
+        let canonical = p.canonicalize().map_err(|e| format!("无法访问文件 {path}: {e}"))?;
+        let meta = fs::metadata(&canonical).map_err(|e| format!("无法读取文件信息 {path}: {e}"))?;
         if meta.len() > DATA_URL_LIMIT {
             return Err(format!("文件过大（{} 字节），媒体查看上限 {} 字节", meta.len(), DATA_URL_LIMIT));
         }
-        fs::read(&p).map_err(|e| e.to_string())?
+        fs::read(&canonical).map_err(|e| format!("无法读取文件 {path}: {e}"))?
     };
 
     let encoded = base64_encode(&bytes);
@@ -2051,6 +2117,387 @@ async fn create_archive(
             return Err(format!("压缩失败（{program}）: {detail}"));
         }
         Ok(archive_path.to_string_lossy().to_string())
+    }
+}
+
+/// System monitor data structure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SystemMonitorData {
+    hostname: String,
+    os_name: String,
+    os_version: String,
+    kernel_version: String,
+    uptime_seconds: u64,
+    cpu_count: u32,
+    cpu_usage_percent: f64,
+    memory_total_bytes: u64,
+    memory_used_bytes: u64,
+    memory_available_bytes: u64,
+    swap_total_bytes: u64,
+    swap_used_bytes: u64,
+    disk_total_bytes: u64,
+    disk_used_bytes: u64,
+    disk_available_bytes: u64,
+    load_avg_1min: f64,
+    load_avg_5min: f64,
+    load_avg_15min: f64,
+    cpu_model: String,
+    network_rx_bytes: u64,
+    network_tx_bytes: u64,
+    processes: u32,
+}
+
+/// Single process info for the process-list panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProcessInfo {
+    pid: u32,
+    name: String,
+    status: String,
+    cpu_usage_percent: f64,
+    memory_bytes: u64,
+    disk_bytes_per_sec: f64,
+    network_bytes_per_sec: f64,
+}
+
+/// Get the list of running processes sorted by CPU usage (descending).
+/// Works for both local and remote (via SSH).
+#[tauri::command]
+async fn get_process_list(
+    terminal_id: Option<Uuid>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<ProcessInfo>, String> {
+    if let Some(tid) = terminal_id {
+        // Remote: execute via SSH
+        let handle = {
+            let terminals = state.remote_terminals.lock().await;
+            terminals
+                .get(&tid)
+                .map(|session| Arc::clone(&session.handle))
+                .ok_or_else(|| format!("terminal is not connected: {tid}"))?
+        };
+
+        // Use ps to gather process info, sorted by CPU usage.
+        // Note: The command is sent via SSH exec which may wrap it in single quotes on
+        // the remote side (bash -c '<command>'), so we must avoid ANY single quotes.
+        //
+        // Strategy: compute nproc and total memory first, then pass them into awk via -v
+        // so the awk script itself only uses awk field variables ($2, $3…) which need
+        // \-escaping inside bash double-quotes.  Using a Rust raw string (r#"…"#) avoids
+        // all Rust-level escaping — the string content is exactly what the remote shell
+        // receives.
+        //
+        // ps aux %CPU is per-single-core; dividing by nproc gives % of total CPU.
+        // ps aux %MEM * total_mem / 100 gives actual bytes.  We use printf %d for memory
+        // to avoid scientific notation (e.g. 3.7e+07) that u64::parse cannot handle.
+        //
+        // Output format: P \t pid \t name \t stat \t cpu_total% \t mem_bytes \t 0 \t 0
+        let cmd = r#"nproc=$(nproc 2>/dev/null||echo 1);mem_total=$(awk "/^MemTotal/{print \$2*1024}" /proc/meminfo 2>/dev/null||echo 0);ps aux --sort=-%cpu 2>/dev/null | head -50 | awk -v nc="$nproc" -v mt="$mem_total" "BEGIN{OFS=\"\t\"}NR>1{pid=\$2;cpu=\$3;mem=\$4;stat=substr(\$8,1,1);cmd=\$11;for(i=12;i<=NF;i++)cmd=cmd FS \$i;if(length(cmd)>30)cmd=substr(cmd,1,30);printf \"P\t%d\t%s\t%s\t%.1f\t%d\t0\t0\n\",pid,cmd,stat,cpu/nc,int(mem*mt/100)}" && echo END_PROCESS_LIST"#;
+        let (stdout, stderr, code) = exec_remote_command_full(&handle, cmd).await?;
+        if code != 0 {
+            return Err(format!("获取进程列表失败: {}", String::from_utf8_lossy(&stderr)));
+        }
+
+        let output = String::from_utf8_lossy(&stdout);
+        let mut processes = Vec::new();
+        for line in output.lines() {
+            if line == "END_PROCESS_LIST" { break; }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 7 || parts[0] != "P" { continue; }
+            let pid = parts[1].parse::<u32>().ok().unwrap_or(0);
+            let name = parts[2].to_string();
+            let status = parts[3].to_string();
+            let cpu = parts[4].parse::<f64>().ok().unwrap_or(0.0);
+            let mem_bytes = parts[5].parse::<u64>().ok().unwrap_or(0);
+
+            processes.push(ProcessInfo {
+                pid,
+                name,
+                status,
+                cpu_usage_percent: cpu.clamp(0.0, 100.0),
+                memory_bytes: mem_bytes,
+                disk_bytes_per_sec: 0.0,
+                network_bytes_per_sec: 0.0,
+            });
+        }
+        Ok(processes)
+    } else {
+        // Local: use sysinfo crate
+        use sysinfo::{ProcessesToUpdate, ProcessRefreshKind};
+
+        let mut guard = state.local_sys_monitor.lock().unwrap();
+        let sys = match guard.as_mut() {
+            Some(s) => s,
+            None => {
+                // First call: initialise the System instance (same as get_system_monitor).
+                use sysinfo::{System, CpuRefreshKind, RefreshKind};
+                let mut s = System::new_with_specifics(
+                    RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
+                );
+                s.refresh_cpu_usage();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                s.refresh_cpu_usage();
+                *guard = Some(s);
+                guard.as_mut().unwrap()
+            }
+        };
+
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+
+        // sysinfo::Process::cpu_usage() returns % of a *single core* (0-100 per core),
+        // so on a multi-core machine values can exceed 100 and sum to >100 across all
+        // processes.  Divide by CPU count to get % of *total* CPU, matching what users
+        // expect from Task Manager / top.
+        let cpu_count = sys.cpus().len() as f64;
+
+        let processes: Vec<ProcessInfo> = sys.processes()
+            .values()
+            .filter(|p| p.cpu_usage() > 0.01 || p.memory() > 1024 * 1024)
+            .map(|p| ProcessInfo {
+                pid: p.pid().as_u32(),
+                name: p.name().to_string_lossy().to_string(),
+                status: {
+                    let s = p.status();
+                    match s {
+                        sysinfo::ProcessStatus::Run => "Running".to_string(),
+                        sysinfo::ProcessStatus::Sleep => "Sleeping".to_string(),
+                        sysinfo::ProcessStatus::Idle => "Idle".to_string(),
+                        sysinfo::ProcessStatus::Zombie => "Zombie".to_string(),
+                        sysinfo::ProcessStatus::Stop => "Stopped".to_string(),
+                        _ => "Unknown".to_string(),
+                    }
+                },
+                cpu_usage_percent: (p.cpu_usage() as f64 / cpu_count).clamp(0.0, 100.0),
+                memory_bytes: p.memory(),
+                disk_bytes_per_sec: 0.0,
+                network_bytes_per_sec: 0.0,
+            })
+            .collect();
+
+        // Sort by CPU usage descending, then memory descending
+        let mut sorted = processes;
+        sorted.sort_by(|a, b| {
+            b.cpu_usage_percent
+                .partial_cmp(&a.cpu_usage_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.memory_bytes.cmp(&a.memory_bytes))
+        });
+        // Keep top 50
+        sorted.truncate(50);
+        Ok(sorted)
+    }
+}
+
+/// Get system resource monitoring data (CPU, memory, disk, etc.).
+/// Works for both local and remote (via SSH).
+#[tauri::command]
+async fn get_system_monitor(
+    terminal_id: Option<Uuid>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<SystemMonitorData, String> {
+    if let Some(tid) = terminal_id {
+        // Remote: execute monitoring commands via SSH
+        let handle = {
+            let terminals = state.remote_terminals.lock().await;
+            terminals
+                .get(&tid)
+                .map(|session| Arc::clone(&session.handle))
+                .ok_or_else(|| format!("terminal is not connected: {tid}"))?
+        };
+
+        // Collect all info in one composite command to minimize SSH round-trips.
+        let cmd = r#"
+HOSTNAME=$(hostname 2>/dev/null || echo unknown)
+OS_NAME=$(cat /etc/os-release 2>/dev/null | grep '^NAME=' | head -1 | sed 's/NAME="//;s/"$//' || echo Linux)
+OS_VER=$(cat /etc/os-release 2>/dev/null | grep '^VERSION=' | head -1 | sed 's/VERSION="//;s/"$//' || echo unknown)
+KERNEL=$(uname -r 2>/dev/null || echo unknown)
+UPTIME=$(cat /proc/uptime 2>/dev/null | awk '{print int($1)}' || echo 0)
+CPU_COUNT=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+CPU_MODEL=$(grep '^model name' /proc/cpuinfo 2>/dev/null | head -1 | sed 's/model name.*: //' || echo unknown)
+
+# CPU usage: sample over 1 second
+# Use a single awk read per sample point to avoid inconsistent timestamps.
+# idle = $5 (idle) + $6 (iowait); total = sum of all numeric columns.
+CPU_SAMPLE1=$(awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; print idle" "total}' /proc/stat)
+sleep 1
+CPU_SAMPLE2=$(awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; print idle" "total}' /proc/stat)
+CPU_IDLE1=$(echo "$CPU_SAMPLE1" | awk '{print $1}')
+CPU_TOTAL1=$(echo "$CPU_SAMPLE1" | awk '{print $2}')
+CPU_IDLE2=$(echo "$CPU_SAMPLE2" | awk '{print $1}')
+CPU_TOTAL2=$(echo "$CPU_SAMPLE2" | awk '{print $2}')
+DIFF_TOTAL=$((CPU_TOTAL2 - CPU_TOTAL1))
+DIFF_IDLE=$((CPU_IDLE2 - CPU_IDLE1))
+if [ "$DIFF_TOTAL" -gt 0 ]; then
+  CPU_USAGE=$(awk "BEGIN {printf \"%.1f\", (1 - $DIFF_IDLE/$DIFF_TOTAL)*100}")
+else
+  CPU_USAGE="0.0"
+fi
+
+# Memory
+MEM_TOTAL=$(awk '/^MemTotal/{print $2*1024}' /proc/meminfo 2>/dev/null || echo 0)
+MEM_AVAILABLE=$(awk '/^MemAvailable/{print $2*1024}' /proc/meminfo 2>/dev/null || echo 0)
+MEM_USED=$((MEM_TOTAL - MEM_AVAILABLE))
+
+# Swap
+SWAP_TOTAL=$(awk '/^SwapTotal/{print $2*1024}' /proc/meminfo 2>/dev/null || echo 0)
+SWAP_FREE=$(awk '/^SwapFree/{print $2*1024}' /proc/meminfo 2>/dev/null || echo 0)
+SWAP_USED=$((SWAP_TOTAL - SWAP_FREE))
+
+# Disk (root partition)
+DISK_TOTAL=$(df --output=size -B1 / 2>/dev/null | tail -1 | tr -d ' ' || echo 0)
+DISK_USED=$(df --output=used -B1 / 2>/dev/null | tail -1 | tr -d ' ' || echo 0)
+DISK_AVAIL=$(df --output=avail -B1 / 2>/dev/null | tail -1 | tr -d ' ' || echo 0)
+
+# Load average
+LOAD=$(cat /proc/loadavg 2>/dev/null || echo "0 0 0")
+LOAD1=$(echo "$LOAD" | awk '{print $1}')
+LOAD5=$(echo "$LOAD" | awk '{print $2}')
+LOAD15=$(echo "$LOAD" | awk '{print $3}')
+
+# Network (first non-lo interface)
+NET_IF=$(ls /sys/class/net/ 2>/dev/null | grep -v lo | head -1 || echo eth0)
+NET_RX=$(cat /sys/class/net/$NET_IF/statistics/rx_bytes 2>/dev/null || echo 0)
+NET_TX=$(cat /sys/class/net/$NET_IF/statistics/tx_bytes 2>/dev/null || echo 0)
+
+# Process count
+PROCS=$(ps aux 2>/dev/null | wc -l || echo 0)
+
+echo "MONITOR_RESULT"
+echo "hostname=$HOSTNAME"
+echo "os_name=$OS_NAME"
+echo "os_version=$OS_VER"
+echo "kernel=$KERNEL"
+echo "uptime=$UPTIME"
+echo "cpu_count=$CPU_COUNT"
+echo "cpu_usage=$CPU_USAGE"
+echo "cpu_model=$CPU_MODEL"
+echo "mem_total=$MEM_TOTAL"
+echo "mem_available=$MEM_AVAILABLE"
+echo "mem_used=$MEM_USED"
+echo "swap_total=$SWAP_TOTAL"
+echo "swap_used=$SWAP_USED"
+echo "disk_total=$DISK_TOTAL"
+echo "disk_used=$DISK_USED"
+echo "disk_avail=$DISK_AVAIL"
+echo "load1=$LOAD1"
+echo "load5=$LOAD5"
+echo "load15=$LOAD15"
+echo "net_rx=$NET_RX"
+echo "net_tx=$NET_TX"
+echo "procs=$PROCS"
+"#;
+
+        let (stdout, stderr, code) = exec_remote_command_full(&handle, cmd).await?;
+        if code != 0 {
+            return Err(format!("获取系统监控数据失败: {}", String::from_utf8_lossy(&stderr)));
+        }
+
+        let output = String::from_utf8_lossy(&stdout);
+        let mut lines = output.lines().peekable();
+
+        // Find the MONITOR_RESULT marker
+        while let Some(line) = lines.next() {
+            if line.trim() == "MONITOR_RESULT" { break; }
+        }
+
+        let mut values: HashMap<String, String> = HashMap::new();
+        for line in lines {
+            if let Some((key, val)) = line.split_once('=') {
+                values.insert(key.trim().to_string(), val.trim().to_string());
+            }
+        }
+
+        Ok(SystemMonitorData {
+            hostname: values.get("hostname").cloned().unwrap_or_default(),
+            os_name: values.get("os_name").cloned().unwrap_or_default(),
+            os_version: values.get("os_version").cloned().unwrap_or_default(),
+            kernel_version: values.get("kernel").cloned().unwrap_or_default(),
+            uptime_seconds: values.get("uptime").and_then(|v| v.parse().ok()).unwrap_or(0),
+            cpu_count: values.get("cpu_count").and_then(|v| v.parse().ok()).unwrap_or(1),
+            cpu_usage_percent: values.get("cpu_usage").and_then(|v| v.parse::<f64>().ok()).map(|v| v.clamp(0.0, 100.0)).unwrap_or(0.0),
+            memory_total_bytes: values.get("mem_total").and_then(|v| v.parse().ok()).unwrap_or(0),
+            memory_used_bytes: values.get("mem_used").and_then(|v| v.parse().ok()).unwrap_or(0),
+            memory_available_bytes: values.get("mem_available").and_then(|v| v.parse().ok()).unwrap_or(0),
+            swap_total_bytes: values.get("swap_total").and_then(|v| v.parse().ok()).unwrap_or(0),
+            swap_used_bytes: values.get("swap_used").and_then(|v| v.parse().ok()).unwrap_or(0),
+            disk_total_bytes: values.get("disk_total").and_then(|v| v.parse().ok()).unwrap_or(0),
+            disk_used_bytes: values.get("disk_used").and_then(|v| v.parse().ok()).unwrap_or(0),
+            disk_available_bytes: values.get("disk_avail").and_then(|v| v.parse().ok()).unwrap_or(0),
+            load_avg_1min: values.get("load1").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            load_avg_5min: values.get("load5").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            load_avg_15min: values.get("load15").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            cpu_model: values.get("cpu_model").cloned().unwrap_or_default(),
+            network_rx_bytes: values.get("net_rx").and_then(|v| v.parse().ok()).unwrap_or(0),
+            network_tx_bytes: values.get("net_tx").and_then(|v| v.parse().ok()).unwrap_or(0),
+            processes: values.get("procs").and_then(|v| v.parse().ok()).unwrap_or(0),
+        })
+    } else {
+        // Local: use sysinfo crate with cached System instance.
+        // Keeping the System object alive preserves CPU time counters so that
+        // each refresh_cpu_usage() computes a correct delta from the last call.
+        use sysinfo::{System, Networks, Disks, CpuRefreshKind, RefreshKind};
+
+        let mut guard = state.local_sys_monitor.lock().unwrap();
+        let sys = match guard.as_mut() {
+            Some(s) => {
+                // Subsequent call: just refresh CPU usage (single delta step).
+                s.refresh_cpu_usage();
+                s.refresh_memory();
+                s
+            }
+            None => {
+                // First call: need two samples to establish a baseline.
+                let mut s = System::new_with_specifics(
+                    RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
+                );
+                s.refresh_cpu_usage();
+                thread::sleep(Duration::from_millis(500));
+                s.refresh_cpu_usage();
+                *guard = Some(s);
+                guard.as_mut().unwrap()
+            }
+        };
+
+        let networks = Networks::new_with_refreshed_list();
+        let (net_rx, net_tx) = networks.iter().fold((0u64, 0u64), |(rx, tx), (_, data)| {
+            (rx + data.received(), tx + data.transmitted())
+        });
+
+        let disks = Disks::new_with_refreshed_list();
+        let (disk_total, disk_used, disk_avail) = disks.iter().fold((0u64, 0u64, 0u64), |(t, u, a), disk| {
+            let total = disk.total_space();
+            let avail = disk.available_space();
+            let used = total - avail;
+            (t + total, u + used, a + avail)
+        });
+
+        Ok(SystemMonitorData {
+            hostname: System::host_name().unwrap_or_default(),
+            os_name: System::name().unwrap_or_default(),
+            os_version: System::os_version().unwrap_or_default(),
+            kernel_version: System::kernel_version().unwrap_or_default(),
+            uptime_seconds: System::uptime(),
+            cpu_count: sys.cpus().len() as u32,
+            cpu_usage_percent: sys.global_cpu_usage().clamp(0.0_f32, 100.0_f32) as f64,
+            memory_total_bytes: sys.total_memory(),
+            memory_used_bytes: sys.used_memory(),
+            memory_available_bytes: sys.available_memory(),
+            swap_total_bytes: sys.total_swap(),
+            swap_used_bytes: sys.used_swap(),
+            disk_total_bytes: disk_total,
+            disk_used_bytes: disk_used,
+            disk_available_bytes: disk_avail,
+            load_avg_1min: 0.0, // sysinfo doesn't provide load avg on Windows
+            load_avg_5min: 0.0,
+            load_avg_15min: 0.0,
+            cpu_model: sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_default(),
+            network_rx_bytes: net_rx,
+            network_tx_bytes: net_tx,
+            processes: sys.processes().len() as u32,
+        })
     }
 }
 
@@ -2379,11 +2826,38 @@ async fn terminal_resize(
     Ok(())
 }
 
+/// Apply Windows dark mode DWM attributes to a dynamically-created window.
+/// Called from the frontend when the connection-panel window is created.
+#[tauri::command]
+fn apply_window_dark_mode(window_label: String, app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use tauri::Manager;
+        const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+
+        if let Some(window) = app.get_webview_window(&window_label) {
+            let hwnd = window.hwnd().map_err(|e| format!("获取窗口句柄失败: {e}"))?.0;
+            let dark_mode: i32 = 1;
+            unsafe {
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    &dark_mode as *const _ as *const _,
+                    4,
+                );
+            }
+        }
+    }
+    let _ = window_label; // suppress unused warning on non-Windows
+    Ok(())
+}
+
 fn main() {
     let state = Arc::new(AppState {
         sessions: Mutex::new(SessionCatalog::new(load_initial_sessions())),
         local_terminals: Mutex::new(HashMap::new()),
         remote_terminals: Mutex::new(HashMap::new()),
+        local_sys_monitor: std::sync::Mutex::new(None),
     });
 
     tauri::Builder::default()
@@ -2397,6 +2871,7 @@ fn main() {
                 const DWMWA_CAPTION_COLOR: u32 = 35;
                 const DWMWA_TEXT_COLOR: u32 = 36;
 
+                // Apply dark mode DWM attributes to the main window (has native titlebar)
                 if let Some(window) = app.get_webview_window("main") {
                     let hwnd = window.hwnd().unwrap().0;
                     let dark_mode: i32 = 1;
@@ -2460,6 +2935,9 @@ fn main() {
             copy_path,
             move_path,
             get_local_ipv4,
+            get_system_monitor,
+            get_process_list,
+            apply_window_dark_mode,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run PandaTerm");
