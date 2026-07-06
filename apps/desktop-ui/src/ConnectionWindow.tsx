@@ -85,7 +85,7 @@ export function ConnectionWindow() {
 
     // Listen for mode change events — only accept events intended for THIS window.
     // Each event payload should specify a target label so windows don't interfere.
-    const unlisten = listen<{ mode: ConnectionWindowMode; target: string }>('connection-window-set-mode', (event) => {
+    const unlistenMode = listen<{ mode: ConnectionWindowMode; target: string }>('connection-window-set-mode', (event) => {
       // Only react if the event is targeted at this window's label
       if (event.payload.target !== windowLabelRef.current) return;
       // connection-create window only shows create mode — ignore manage requests
@@ -94,6 +94,12 @@ export function ConnectionWindow() {
       if (event.payload.mode === 'manage') {
         void refreshSessions();
       }
+    });
+
+    // Keep the list in sync when sessions change in another connection window
+    // (e.g. a connection created/deleted in the separate "新建连接" window).
+    const unlistenChanges = listen('sessions-changed', () => {
+      void refreshSessions();
     });
 
     // Detect window label, apply dark mode, and show window
@@ -123,7 +129,8 @@ export function ConnectionWindow() {
 
     return () => {
       document.body.classList.remove('has-connection-window');
-      unlisten.then(fn => fn());
+      unlistenMode.then(fn => fn());
+      unlistenChanges.then(fn => fn());
     };
   }, []);
 
@@ -251,6 +258,12 @@ export function ConnectionWindow() {
       setConnectionAuthMethod('password');
       setMode('manage');
 
+      // Notify other open connection windows (e.g. the manager) to refresh
+      try {
+        const { emit } = await import('@tauri-apps/api/event');
+        await emit('sessions-changed');
+      } catch (e) { /* non-critical */ }
+
       // Emit event to main window to connect this session
       await emitConnectSession(session);
     } catch (saveError) {
@@ -267,6 +280,11 @@ export function ConnectionWindow() {
       setSessions(nextSessions);
       setSelectedSessionId(null);
       setContextMenu(null);
+      // Notify other open connection windows to refresh their lists
+      try {
+        const { emit } = await import('@tauri-apps/api/event');
+        await emit('sessions-changed');
+      } catch (e) { /* non-critical */ }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setConnectionFormError(message);
