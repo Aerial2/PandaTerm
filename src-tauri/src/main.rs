@@ -297,12 +297,9 @@ fn load_initial_sessions() -> Vec<Session> {
         sessions.push(xshell_session);
     }
 
-    sessions.sort_by(|left, right| {
-        left.group
-            .to_lowercase()
-            .cmp(&right.group.to_lowercase())
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-    });
+    // Preserve the persisted order so a user's custom drag-and-drop ordering
+    // survives restarts. Newly imported Xshell sessions are already sorted by
+    // name inside load_xshell_sessions and simply appended above.
     sessions
 }
 
@@ -2899,6 +2896,19 @@ async fn delete_session(
 }
 
 #[tauri::command]
+async fn reorder_sessions(
+    ordered_ids: Vec<Uuid>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<Session>, String> {
+    let mut sessions = state.sessions.lock().await;
+    sessions
+        .reorder(&ordered_ids)
+        .map_err(|error| error.to_string())?;
+    save_persistent_sessions(sessions.all())?;
+    Ok(sessions.all().to_vec())
+}
+
+#[tauri::command]
 async fn connect_session(
     session_id: Uuid,
     app: AppHandle,
@@ -3096,6 +3106,7 @@ fn main() {
             list_sessions,
             save_session,
             delete_session,
+            reorder_sessions,
             connect_session,
             disconnect_session,
             terminal_write,

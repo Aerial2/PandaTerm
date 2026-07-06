@@ -1082,7 +1082,6 @@ button:disabled {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 12px;
 }
 
 .resource-bottom-empty {
@@ -2562,13 +2561,22 @@ html.connection-window-html {
   color: var(--text-primary);
 }
 
-.conn-th-name { width: 25%; }
-.conn-th-host { width: 18%; }
-.conn-th-user { width: 12%; }
-.conn-th-protocol { width: 8%; }
-.conn-th-port { width: 6%; }
-.conn-th-desc { width: 14%; }
-.conn-th-time { width: 14%; }
+.connection-row.dragging {
+  opacity: 0.4;
+}
+
+.conn-th-index { width: 5%; text-align: center; }
+.conn-th-name { width: 27%; }
+.conn-th-host { width: 20%; }
+.conn-th-user { width: 16%; }
+.conn-th-protocol { width: 10%; }
+.conn-th-port { width: 8%; }
+
+.conn-td-index {
+  text-align: center;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
 
 .conn-td-name {
   color: var(--text-primary);
@@ -2592,11 +2600,6 @@ html.connection-window-html {
 
 .conn-td-port {
   font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.conn-td-time {
   font-size: 11px;
   color: var(--text-muted);
 }

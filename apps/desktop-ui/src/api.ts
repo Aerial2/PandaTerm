@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 
 export async function openConnectionWindow(mode: 'manage' | 'create') {
-  const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+  const { WebviewWindow, getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
   const label = mode === 'create' ? 'connection-create' : 'connection-panel';
   const payload = { mode, target: label };
 
@@ -13,6 +13,31 @@ export async function openConnectionWindow(mode: 'manage' | 'create') {
     return;
   }
 
+  const windowOpts = mode === 'create'
+    ? { width: 640, height: 520, minWidth: 520, minHeight: 420 }
+    : { width: 880, height: 560, minWidth: 720, minHeight: 480 };
+
+  // Position the new window centered over the window that opened it, so it
+  // shows up on the same monitor (and in the middle of that window) instead of
+  // snapping back to the primary display.
+  let windowPosition: { x: number; y: number } | { center: true };
+  try {
+    const parent = getCurrentWebviewWindow();
+    const scale = await parent.scaleFactor();
+    const parentPos = await parent.outerPosition();
+    const parentSize = await parent.outerSize();
+    const logicalX = parentPos.x / scale;
+    const logicalY = parentPos.y / scale;
+    const logicalW = parentSize.width / scale;
+    const logicalH = parentSize.height / scale;
+    windowPosition = {
+      x: Math.round(logicalX + (logicalW - windowOpts.width) / 2),
+      y: Math.round(logicalY + (logicalH - windowOpts.height) / 2),
+    };
+  } catch (e) {
+    windowPosition = { center: true };
+  }
+
   // Create new window
   const devUrl = import.meta.env.DEV
     ? `http://localhost:1420?mode=connection`
@@ -21,15 +46,11 @@ export async function openConnectionWindow(mode: 'manage' | 'create') {
     ? undefined
     : `index.html?mode=connection`;
 
-  const windowOpts = mode === 'create'
-    ? { width: 640, height: 520, minWidth: 520, minHeight: 420 }
-    : { width: 880, height: 560, minWidth: 720, minHeight: 480 };
-
   const webviewWindow = new WebviewWindow(label, {
     url: devUrl ?? entry!,
     title: mode === 'create' ? '新建连接 — PandaTerm' : '连接管理 — PandaTerm',
     ...windowOpts,
-    center: true,
+    ...('x' in windowPosition ? windowPosition : { center: true }),
     resizable: true,
     decorations: false,
     transparent: false,
@@ -174,6 +195,10 @@ export async function saveSession(session: Session): Promise<Session[]> {
 
 export async function deleteSession(sessionId: string): Promise<Session[]> {
   return await invoke<Session[]>('delete_session', { sessionId });
+}
+
+export async function reorderSessions(orderedIds: string[]): Promise<Session[]> {
+  return await invoke<Session[]>('reorder_sessions', { orderedIds });
 }
 
 export async function connectSession(sessionId: string): Promise<TerminalEvent> {

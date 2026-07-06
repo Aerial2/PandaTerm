@@ -14,6 +14,7 @@ import {
   listSessions,
   saveSession,
   deleteSession,
+  reorderSessions,
   openConnectionWindow,
 } from './api';
 import type { Session, AuthType } from './api';
@@ -78,6 +79,8 @@ export function ConnectionWindow() {
   const [connectionFormError, setConnectionFormError] = useState('');
   const [isSavingConnection, setIsSavingConnection] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -112,8 +115,7 @@ export function ConnectionWindow() {
       if (label === 'connection-create') {
         setMode('create');
       }
-      void win.center().then(async () => {
-        await win.show();
+      void win.show().then(async () => {
         try {
           const { invoke } = await import('@tauri-apps/api/core');
           await invoke('apply_window_dark_mode', { windowLabel: win.label });
@@ -168,6 +170,7 @@ export function ConnectionWindow() {
   }, [sessions, connectionSearchQuery]);
 
   function loadSessionToForm(session: Session) {
+    setEditingId(session.id);
     setConnectionForm({
       name: session.name,
       host: session.host,
@@ -235,17 +238,19 @@ export function ConnectionWindow() {
       return;
     }
 
+    const original = editingId ? sessions.find((s) => s.id === editingId) : undefined;
+
     const session: Session = {
-      id: crypto.randomUUID(),
+      id: editingId ?? crypto.randomUUID(),
       name: connectionForm.name.trim(),
-      group: 'Custom',
+      group: original?.group ?? 'Custom',
       host: connectionForm.host.trim(),
       port: Number(connectionForm.port.trim() || '22'),
       username: connectionForm.username.trim(),
       auth: buildConnectionAuth(),
-      tags: ['custom', connectionAuthMethod],
-      last_connected_at: null,
-      reconnect: { enabled: true, max_attempts: 3, delay_ms: 1500 },
+      tags: original?.tags ?? ['custom', connectionAuthMethod],
+      last_connected_at: original?.last_connected_at ?? null,
+      reconnect: original?.reconnect ?? { enabled: true, max_attempts: 3, delay_ms: 1500 },
     };
 
     setIsSavingConnection(true);
@@ -256,6 +261,7 @@ export function ConnectionWindow() {
       setSessions(nextSessions);
       setConnectionForm(initialConnectionForm);
       setConnectionAuthMethod('password');
+      setEditingId(null);
       setMode('manage');
 
       // Notify other open connection windows (e.g. the manager) to refresh
@@ -264,8 +270,10 @@ export function ConnectionWindow() {
         await emit('sessions-changed');
       } catch (e) { /* non-critical */ }
 
-      // Emit event to main window to connect this session
-      await emitConnectSession(session);
+      // Only auto-connect when creating a brand-new connection, not when editing
+      if (!original) {
+        await emitConnectSession(session);
+      }
     } catch (saveError) {
       const message = saveError instanceof Error ? saveError.message : String(saveError);
       setConnectionFormError(message);
@@ -288,6 +296,31 @@ export function ConnectionWindow() {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setConnectionFormError(message);
+    }
+  }
+
+  async function handleReorderSessions(sourceId: string, targetId: string) {
+    if (!sourceId || sourceId === targetId) return;
+    const ids = sessions.map((s) => s.id);
+    const from = ids.indexOf(sourceId);
+    const to = ids.indexOf(targetId);
+    if (from < 0 || to < 0) return;
+
+    // Reorder the full (unfiltered) list, then persist the new order.
+    const nextIds = [...ids];
+    nextIds.splice(to, 0, nextIds.splice(from, 1)[0]);
+    const reordered = sessions
+      .slice()
+      .sort((a, b) => nextIds.indexOf(a.id) - nextIds.indexOf(b.id));
+    setSessions(reordered);
+    setDraggingId(null);
+
+    try {
+      const next = await reorderSessions(nextIds);
+      setSessions(next);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setConnectionFormError(`保存排序失败：${message}`);
     }
   }
 
@@ -387,31 +420,46 @@ export function ConnectionWindow() {
                 <table className="connection-table">
                   <thead>
                     <tr>
+                      <th className="conn-th-index">#</th>
                       <th className="conn-th-name">名称</th>
                       <th className="conn-th-host">主机</th>
                       <th className="conn-th-user">用户名</th>
                       <th className="conn-th-protocol">协议</th>
                       <th className="conn-th-port">端口</th>
-                      <th className="conn-th-desc">说明</th>
-                      <th className="conn-th-time">修改时间</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredSessions.map((session) => (
+                    {filteredSessions.map((session, rowIndex) => (
                       <tr
                         key={session.id}
-                        className={selectedSessionId === session.id ? 'connection-row selected' : 'connection-row'}
+                        className={`connection-row${selectedSessionId === session.id ? ' selected' : ''}${draggingId === session.id ? ' dragging' : ''}`}
+                        draggable={!connectionSearchQuery}
                         onClick={() => setSelectedSessionId(session.id)}
                         onDoubleClick={() => void emitConnectSession(session)}
                         onContextMenu={(e) => handleRowContextMenu(e, session)}
+                        onDragStart={(e) => {
+                          e.dataTransfer.setData('text/plain', session.id);
+                          e.dataTransfer.effectAllowed = 'move';
+                          setDraggingId(session.id);
+                        }}
+                        onDragOver={(e) => {
+                          if (connectionSearchQuery) return;
+                          e.preventDefault();
+                          e.dataTransfer.dropEffect = 'move';
+                        }}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          const sourceId = e.dataTransfer.getData('text/plain');
+                          void handleReorderSessions(sourceId, session.id);
+                        }}
+                        onDragEnd={() => setDraggingId(null)}
                       >
+                        <td className="conn-td-index">{rowIndex + 1}</td>
                         <td className="conn-td-name">{session.name}</td>
                         <td className="conn-td-host">{session.host}</td>
                         <td className="conn-td-user">{session.username}</td>
                         <td className="conn-td-protocol">SSH</td>
                         <td className="conn-td-port">{session.port}</td>
-                        <td className="conn-td-desc">{session.group}</td>
-                        <td className="conn-td-time">{session.last_connected_at ? new Date(session.last_connected_at).toLocaleString('zh-CN') : '-'}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -582,13 +630,14 @@ export function ConnectionWindow() {
                   setConnectionForm(initialConnectionForm);
                   setConnectionAuthMethod('password');
                   setConnectionFormError('');
+                  setEditingId(null);
                   setMode('manage');
                 }
               }}>
                 取消
               </button>
               <button className="connection-primary-action" onClick={() => void saveAndConnectConnection()} disabled={isSavingConnection}>
-                {isSavingConnection ? '保存中...' : '保存并连接'}
+                {isSavingConnection ? '保存中...' : (editingId ? '保存' : '保存并连接')}
               </button>
             </footer>
           </div>

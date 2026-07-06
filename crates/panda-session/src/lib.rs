@@ -124,6 +124,28 @@ impl SessionCatalog {
         }
         Ok(())
     }
+
+    /// Reorder the catalog to match `ordered_ids` (the user's persisted order).
+    /// Sessions absent from `ordered_ids` are appended to the end so a partial
+    /// or out-of-date id list never drops data.
+    pub fn reorder(&mut self, ordered_ids: &[Uuid]) -> SessionResult<()> {
+        use std::collections::HashMap;
+        let by_id: HashMap<Uuid, &Session> =
+            self.sessions.iter().map(|session| (session.id, session)).collect();
+        let mut next = Vec::with_capacity(self.sessions.len());
+        for id in ordered_ids {
+            if let Some(session) = by_id.get(id) {
+                next.push((*session).clone());
+            }
+        }
+        for session in &self.sessions {
+            if !ordered_ids.contains(&session.id) {
+                next.push(session.clone());
+            }
+        }
+        self.sessions = next;
+        Ok(())
+    }
 }
 
 pub fn validate_session(session: &Session) -> SessionResult<()> {
