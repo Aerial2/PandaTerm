@@ -25,6 +25,7 @@ import {
   TerminalSquare,
   Trash2,
   Upload,
+  FolderUp,
   X,
   Archive,
   FileArchive,
@@ -55,6 +56,7 @@ import {
   writeRemoteFile,
   uploadFile,
   uploadLocalFile,
+  uploadDirectory,
   readFileAsDataUrl,
   downloadRemoteFile,
   extractArchive,
@@ -609,6 +611,7 @@ export function App() {
   const [isUploading, setIsUploading] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
   const pathEditInputRef = useRef<HTMLInputElement | null>(null);
   const uploadAbortRefs = useRef<Map<string, AbortController>>(new Map());
   const localIpCacheRef = useRef<string | null>(null);
@@ -1863,7 +1866,11 @@ export function App() {
     fileInputRef.current?.click();
   }
 
-  async function uploadFiles(fileList: File[], localPaths?: string[]) {
+  function triggerFolderUpload() {
+    folderInputRef.current?.click();
+  }
+
+  async function uploadFiles(fileList: File[], localPaths?: string[], relativePaths?: string[]) {
     if (fileList.length === 0) return;
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
@@ -1873,17 +1880,64 @@ export function App() {
     setIsUploading(true);
     let uploaded = 0;
     let failed = '';
-    addLogEntry('info', `开始上传 ${fileList.length} 个文件到 ${targetLabel}：${destDir}`);
+
+    // When relativePaths are provided (directory upload via webkitGetAsEntry),
+    // we need to create the directory structure first, then upload files
+    // into the correct subdirectory.
+    if (relativePaths && relativePaths.length > 0) {
+      addLogEntry('info', `开始上传 ${fileList.length} 个文件（含目录结构）到 ${targetLabel}：${destDir}`);
+      // Collect all unique directory paths from relativePaths and create them
+      const dirsToCreate = new Set<string>();
+      for (const relPath of relativePaths) {
+        const parts = relPath.split('/');
+        // Add all intermediate directory paths
+        for (let j = 1; j < parts.length; j++) {
+          const dirPath = parts.slice(0, j).join('/');
+          dirsToCreate.add(dirPath);
+        }
+      }
+      // Create directories in order (shorter paths first to ensure parent dirs exist)
+      const sortedDirs = Array.from(dirsToCreate).sort((a, b) => a.split('/').length - b.split('/').length);
+      for (const dirRelPath of sortedDirs) {
+        const fullPath = `${destDir}/${dirRelPath}`;
+        try {
+          await createDirectory(fullPath, local ? null : terminalId);
+        } catch (error) {
+          // Directory might already exist, continue
+          const msg = error instanceof Error ? error.message : String(error);
+          addLogEntry('warn', `创建目录 ${dirRelPath}: ${msg}`);
+        }
+      }
+    } else {
+      addLogEntry('info', `开始上传 ${fileList.length} 个文件到 ${targetLabel}：${destDir}`);
+    }
+
     try {
       for (let i = 0; i < fileList.length; i++) {
         const file = fileList[i];
         const localPath = localPaths?.[i];
+        const relPath = relativePaths?.[i];
+        // Determine the actual target directory for this file
+        // relPath format: "hooks/subdir/file.js" or "hooks/file.js" (when basePath includes root dir)
+        // We need destDir + the directory portion of relPath
+        let fileDestDir = destDir;
+        if (relPath) {
+          const lastSlash = relPath.lastIndexOf('/');
+          if (lastSlash > 0) {
+            fileDestDir = `${destDir}/${relPath.substring(0, lastSlash)}`;
+          } else if (lastSlash === 0) {
+            // relPath starts with "/" — shouldn't happen but handle gracefully
+            fileDestDir = destDir;
+          }
+          // If lastSlash === -1, file is at root of the dropped dir → fileDestDir stays destDir
+        }
+        const displayFileName = relPath || file.name;
         // 远程上传且有本地路径时，走流式上传，避免前端 base64 编码阻塞 UI。
         const useStreamUpload = !local && terminalId && localPath;
         const recordId = addTransferRecord({
-          fileName: file.name,
+          fileName: displayFileName,
           direction: 'upload',
-          target: destDir,
+          target: fileDestDir || destDir,
           size: file.size,
           status: 'uploading',
           message: '上传中...',
@@ -1915,12 +1969,12 @@ export function App() {
           if (abortCtrl.signal.aborted) throw new DOMException('已取消', 'AbortError');
           if (useStreamUpload) {
             // 流式上传：Rust 端直接读取本地文件分块上传，前端不接触文件内容。
-            await uploadLocalFile(localPath!, destDir, recordId, terminalId!);
+            await uploadLocalFile(localPath!, fileDestDir || destDir, recordId, terminalId!);
           } else {
             // 降级路径：前端读取文件内容并 base64 编码后上传。
             const buffer = await file.arrayBuffer();
             if (abortCtrl.signal.aborted) throw new DOMException('已取消', 'AbortError');
-            await uploadFile(file.name, new Uint8Array(buffer), destDir, recordId, terminalId);
+            await uploadFile(file.name, new Uint8Array(buffer), fileDestDir || destDir, recordId, terminalId);
           }
           progressUnlisten();
           uploadAbortRefs.current.delete(recordId);
@@ -1928,7 +1982,7 @@ export function App() {
           const elapsed = (Date.now() - startTime) / 1000;
           const avgSpeed = elapsed > 0 ? file.size / elapsed : 0;
           updateTransferRecord(recordId, { status: 'success', progress: 100, transferred: file.size, speed: avgSpeed, message: '已完成' });
-          addLogEntry('info', `上传成功：${file.name} → ${destDir} (${formatFileSize(file.size)})`);
+          addLogEntry('info', `上传成功：${displayFileName} → ${fileDestDir || destDir} (${formatFileSize(file.size)})`);
         } catch (error) {
           progressUnlisten();
           uploadAbortRefs.current.delete(recordId);
@@ -1937,9 +1991,9 @@ export function App() {
             continue;
           }
           const message = error instanceof Error ? error.message : String(error);
-          failed += `${file.name}: ${message}; `;
+          failed += `${displayFileName}: ${message}; `;
           updateTransferRecord(recordId, { status: 'failed', message });
-          addLogEntry('error', `上传失败：${file.name} - ${message}`);
+          addLogEntry('error', `上传失败：${displayFileName} - ${message}`);
         }
       }
       if (uploaded > 0) {
@@ -1962,6 +2016,44 @@ export function App() {
     if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
+  async function handleFolderUpload(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+
+    // When using webkitdirectory, the browser provides File objects with
+    // webkitRelativePath set (e.g. "myFolder/subDir/file.txt").
+    // For remote uploads with Tauri, we can use file.path for the local file path.
+    const fileArray = Array.from(files);
+    const relativePaths = fileArray.map(f => f.webkitRelativePath);
+    const localPaths = fileArray.map(f => f.path || '');
+
+    // For remote: if we have local paths, use the directory-level upload command
+    // which is much more efficient (creates dirs + streams files from Rust side)
+    if (!local && tab?.terminalId && localPaths[0]) {
+      // Derive the root directory from the first file's local path.
+      // webkitRelativePath is "RootFolder/subDir/file.txt" so we need to
+      // remove the relative sub-path from the local path to get the root dir.
+      const relParts = relativePaths[0].split('/');
+      // Remove the last part (filename) from relParts to get the relative directory path
+      const relDirDepth = relParts.length - 1; // number of directory levels below root
+      // Remove relDirDepth parts from the end of the local path, plus the filename
+      const localParts = localPaths[0].split(/[/\\]/);
+      const rootDir = localParts.slice(0, localParts.length - relDirDepth - 1).join('/');
+      if (rootDir) {
+        await handleDirectoryUpload(rootDir, tab.terminalId);
+        if (folderInputRef.current) folderInputRef.current.value = '';
+        return;
+      }
+    }
+
+    // Fallback: upload files individually with relative paths
+    await uploadFiles(fileArray, localPaths.length > 0 && localPaths.every(p => p) ? localPaths : undefined, relativePaths);
+    if (folderInputRef.current) folderInputRef.current.value = '';
+  }
+
   function handleDragOver(event: React.DragEvent) {
     if (leftActivity !== 'files' || isUploading) return;
     // Must preventDefault on dragover to allow drop and clear the forbidden cursor.
@@ -1980,9 +2072,177 @@ export function App() {
   async function handleDrop(event: React.DragEvent) {
     event.preventDefault();
     setIsDragOver(false);
+
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+
+    // Use webkitGetAsEntry to detect directories vs files
+    const items = event.dataTransfer?.items;
+    if (items && items.length > 0) {
+      const entries: FileSystemEntry[] = [];
+      for (let i = 0; i < items.length; i++) {
+        const entry = items[i].webkitGetAsEntry?.();
+        if (entry) entries.push(entry);
+      }
+
+      if (entries.length > 0) {
+        // Separate directories and files
+        const dirEntries = entries.filter(e => e.isDirectory);
+        const fileEntries = entries.filter(e => e.isFile);
+
+        // Handle directory uploads - directories need recursive traversal
+        // since dataTransfer.files only contains leaf files, not directories.
+        for (const dirEntry of dirEntries) {
+          // Include the directory name as the root in the relative paths
+          const collectedFiles = await collectFilesFromDirectoryEntry(
+            dirEntry as FileSystemDirectoryEntry,
+            dirEntry.name  // ← pass the directory name as basePath so paths include it
+          );
+          if (collectedFiles.length > 0) {
+            // For remote uploads, if we can determine the local directory path
+            // (from the first file's .path), use the efficient upload_directory command
+            if (!local && tab?.terminalId) {
+              const firstRelPath = collectedFiles.paths[0];
+              const firstLocalPath = collectedFiles.localPaths[0];
+              if (firstRelPath && firstLocalPath) {
+                // Derive the root directory from the file's local path.
+                // firstRelPath is "dirName/subDir/file.txt" (relative under the dropped dir).
+                // firstLocalPath is "C:\full\path\dirName\subDir\file.txt".
+                // Root dir = localPath minus the relative path parts minus filename.
+                const relParts = firstRelPath.split('/');
+                const relDepth = relParts.length - 1; // directory levels below root
+                const localParts = firstLocalPath.split(/[/\\]/);
+                const rootDir = localParts.slice(0, localParts.length - relDepth - 1).join('/');
+                if (rootDir) {
+                  await handleDirectoryUpload(rootDir, tab.terminalId);
+                  continue;
+                }
+              }
+            }
+            // Fallback: upload files individually with relative paths
+            await uploadFiles(
+              collectedFiles.files,
+              collectedFiles.localPaths.length > 0 && collectedFiles.localPaths.every(p => p) ? collectedFiles.localPaths : undefined,
+              collectedFiles.paths
+            );
+          }
+        }
+
+        // Handle individual file uploads
+        if (fileEntries.length > 0) {
+          // For file entries, we can get the File objects from dataTransfer.files
+          // Note: dataTransfer.files indices correspond to file-type items only
+          const allFiles = event.dataTransfer?.files;
+          if (allFiles && allFiles.length > 0) {
+            const fileObjects: File[] = [];
+            const localPaths: string[] = [];
+            // Map file entries to their corresponding File objects
+            let fileIdx = 0;
+            for (let i = 0; i < entries.length; i++) {
+              if (entries[i].isFile) {
+                if (fileIdx < allFiles.length) {
+                  fileObjects.push(allFiles[fileIdx]);
+                  localPaths.push(allFiles[fileIdx].path || '');
+                  fileIdx++;
+                }
+              }
+            }
+            await uploadFiles(fileObjects, localPaths.length > 0 && localPaths.every(p => p) ? localPaths : undefined);
+          }
+        }
+        return;
+      }
+    }
+
+    // Fallback: no webkitGetAsEntry support, treat all as files
     const files = event.dataTransfer?.files;
     if (!files || files.length === 0) return;
     await uploadFiles(Array.from(files));
+  }
+
+  /// Recursively collect all files from a FileSystemDirectoryEntry,
+  /// preserving relative paths for creating the directory structure.
+  /// Also collects local filesystem paths (Tauri's File.path) for stream uploads.
+  async function collectFilesFromDirectoryEntry(
+    dirEntry: FileSystemDirectoryEntry,
+    basePath: string = ''
+  ): Promise<{ files: File[]; paths: string[]; localPaths: string[]; length: number }> {
+    const files: File[] = [];
+    const paths: string[] = [];
+    const localPaths: string[] = [];
+
+    const reader = dirEntry.createReader();
+    const entries = await readAllDirectoryEntries(reader);
+
+    for (const entry of entries) {
+      const entryPath = basePath ? `${basePath}/${entry.name}` : entry.name;
+      if (entry.isFile) {
+        const file = await getFileFromEntry(entry as FileSystemFileEntry);
+        if (file) {
+          files.push(file);
+          paths.push(entryPath);
+          localPaths.push(file.path || '');
+        }
+      } else if (entry.isDirectory) {
+        const subResult = await collectFilesFromDirectoryEntry(
+          entry as FileSystemDirectoryEntry,
+          entryPath
+        );
+        files.push(...subResult.files);
+        paths.push(...subResult.paths);
+        localPaths.push(...subResult.localPaths);
+      }
+    }
+
+    return { files, paths, localPaths, length: files.length };
+  }
+
+  /// Read all entries from a directory reader (may need multiple reads).
+  async function readAllDirectoryEntries(reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> {
+    const allEntries: FileSystemEntry[] = [];
+    let batch: FileSystemEntry[];
+    do {
+      batch = await new Promise<FileSystemEntry[]>((resolve, reject) => {
+        reader.readEntries(resolve, reject);
+      });
+      allEntries.push(...batch);
+    } while (batch.length > 0);
+    return allEntries;
+  }
+
+  /// Get a File object from a FileSystemFileEntry.
+  async function getFileFromEntry(entry: FileSystemFileEntry): Promise<File | null> {
+    return new Promise<File | null>((resolve) => {
+      entry.file(resolve, () => resolve(null));
+    });
+  }
+
+  /// Upload a local directory to remote via the upload_directory command.
+  async function handleDirectoryUpload(localPath: string, terminalId: string) {
+    const destDir = currentPath || '~';
+    const dirName = localPath.split(/[/\\]/).pop() || '';
+    setIsUploading(true);
+    addLogEntry('info', `开始上传目录 ${dirName} 到远程：${destDir}`);
+    setStatusMessage(`正在上传目录 ${dirName}...`);
+
+    try {
+      const result = await uploadDirectory(localPath, destDir, terminalId);
+      const msg = result.failed_items.length > 0
+        ? `目录上传完成：${result.files_uploaded} 个文件，${result.dirs_created} 个目录${result.failed_items.length > 0 ? `，${result.failed_items.length} 个失败` : ''}`
+        : `目录上传完成：${result.files_uploaded} 个文件，${result.dirs_created} 个目录`;
+      addLogEntry(result.failed_items.length > 0 ? 'warn' : 'info', msg);
+      if (result.failed_items.length > 0) {
+        addLogEntry('error', `失败项：${result.failed_items.join('; ')}`);
+      }
+      setStatusMessage(msg);
+      await loadResourceDirectory(destDir, false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      addLogEntry('error', `目录上传失败：${message}`);
+      setStatusMessage(`目录上传失败：${message}`);
+    } finally {
+      setIsUploading(false);
+    }
   }
 
   // Prevent the browser from showing the "forbidden" cursor when dragging
@@ -3307,6 +3567,9 @@ export function App() {
                 <button className="icon-button" title="上传文件到当前目录" onClick={triggerFileUpload} disabled={isUploading || isLoadingFiles}>
                   <Upload size={17} />
                 </button>
+                <button className="icon-button" title="上传文件夹到当前目录" onClick={triggerFolderUpload} disabled={isUploading || isLoadingFiles}>
+                  <FolderUp size={17} />
+                </button>
                 <button className="icon-button" title="刷新" onClick={() => loadResourceDirectory(currentPath || null)} disabled={isLoadingFiles}>
                   <RefreshCw size={17} />
                 </button>
@@ -3321,6 +3584,16 @@ export function App() {
             multiple
             style={{ display: 'none' }}
             onChange={(e) => void handleFileUpload(e)}
+          />
+          <input
+            ref={folderInputRef}
+            type="file"
+            multiple
+            style={{ display: 'none' }}
+            // @ts-expect-error webkitdirectory is a non-standard attribute
+            webkitdirectory=""
+            directory=""
+            onChange={(e) => void handleFolderUpload(e)}
           />
 
               <div className="path-breadcrumbs">

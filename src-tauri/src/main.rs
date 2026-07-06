@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -1487,6 +1489,186 @@ async fn upload_local_file(
     Ok(dest_path)
 }
 
+/// Recursively upload a local directory to a remote server via SFTP/SSH.
+/// Creates the directory structure on the remote, then uploads each file.
+/// Returns the number of files uploaded and directories created.
+#[tauri::command]
+async fn upload_directory(
+    terminal_id: Uuid,
+    local_dir: String,
+    dest_dir: String,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let handle = {
+        let terminals = state.remote_terminals.lock().await;
+        terminals
+            .get(&terminal_id)
+            .map(|session| Arc::clone(&session.handle))
+            .ok_or_else(|| format!("terminal is not connected: {terminal_id}"))?
+    };
+
+    let local_root = PathBuf::from(&local_dir);
+    let dir_name = local_root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| "无法解析目录名".to_string())?;
+
+    // Remote target: dest_dir/dir_name
+    let remote_root = if dest_dir.ends_with('/') {
+        format!("{dest_dir}{dir_name}")
+    } else {
+        format!("{dest_dir}/{dir_name}")
+    };
+
+    // Create the root directory on remote
+    let quoted_root = shell_quote(&remote_root);
+    let (_, stderr, code) = exec_remote_command_full(&handle, &format!("mkdir -p {quoted_root}")).await?;
+    if code != 0 {
+        return Err(format!("创建远程目录失败: {}", String::from_utf8_lossy(&stderr)));
+    }
+
+    let mut files_uploaded: u64 = 0;
+    let mut dirs_created: u64 = 1; // root dir already created
+    let mut failed_items: Vec<String> = Vec::new();
+    let mut total_bytes: u64 = 0;
+
+    // Walk the local directory tree
+    let mut dir_stack: Vec<(PathBuf, String)> = vec![(local_root.clone(), remote_root.clone())];
+
+    while let Some((local_path, remote_path)) = dir_stack.pop() {
+        let entries = std::fs::read_dir(&local_path)
+            .map_err(|e| format!("读取本地目录失败：{e}"))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("读取条目失败：{e}"))?;
+            let entry_path = entry.path();
+            let entry_name = entry.file_name().to_string_lossy().to_string();
+            let remote_entry_path = format!("{remote_path}/{entry_name}");
+
+            if entry_path.is_dir() {
+                // Create remote subdirectory
+                let quoted = shell_quote(&remote_entry_path);
+                let (_, stderr, code) = exec_remote_command_full(&handle, &format!("mkdir -p {quoted}")).await?;
+                if code != 0 {
+                    failed_items.push(format!("目录 {entry_name}: {}", String::from_utf8_lossy(&stderr)));
+                    continue;
+                }
+                dirs_created += 1;
+                dir_stack.push((entry_path, remote_entry_path));
+            } else {
+                // Upload file using the existing stream upload logic
+                let file_name = entry_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .ok_or_else(|| "无法解析文件名".to_string())?;
+
+                let metadata = tokio::fs::metadata(&entry_path)
+                    .await
+                    .map_err(|e| format!("读取文件信息失败：{e}"))?;
+                let file_size = metadata.len();
+                let transfer_id = Uuid::new_v4().to_string();
+
+                let dest_file_path = if remote_entry_path.ends_with('/') {
+                    format!("{remote_entry_path}{file_name}")
+                } else {
+                    remote_entry_path.clone()
+                };
+
+                // Open SSH channel and pipe file content
+                let mut channel = handle
+                    .channel_open_session()
+                    .await
+                    .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
+
+                let quoted_dest = shell_quote(&dest_file_path);
+                channel
+                    .exec(true, format!("cat > {quoted_dest}"))
+                    .await
+                    .map_err(|error| format!("SSH exec 失败：{error}"))?;
+
+                use tokio::io::AsyncReadExt;
+                let mut file = tokio::fs::File::open(&entry_path)
+                    .await
+                    .map_err(|e| format!("打开本地文件失败：{e}"))?;
+
+                let chunk_size: usize = 32768;
+                let mut buffer = vec![0u8; chunk_size];
+                let mut transferred: usize = 0;
+
+                loop {
+                    let n = file
+                        .read(&mut buffer)
+                        .await
+                        .map_err(|e| format!("读取本地文件失败：{e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    channel
+                        .data(&buffer[..n])
+                        .await
+                        .map_err(|error| format!("SSH 数据写入失败：{error}"))?;
+                    transferred += n;
+                    total_bytes += n as u64;
+
+                    let _ = app.emit(
+                        "upload-progress",
+                        serde_json::json!({
+                            "transfer_id": transfer_id,
+                            "transferred": transferred,
+                            "total": file_size,
+                        }),
+                    );
+                }
+
+                drop(file);
+                channel.eof().await.map_err(|error| format!("SSH eof 失败：{error}"))?;
+
+                let mut exit_code: i32 = 0;
+                loop {
+                    match channel.wait().await {
+                        Some(ChannelMsg::ExitStatus { exit_status }) => {
+                            exit_code = exit_status as i32;
+                        }
+                        Some(ChannelMsg::Eof) => {}
+                        Some(ChannelMsg::Close) | None => break,
+                        _ => {}
+                    }
+                }
+                let _ = channel.close().await;
+
+                if exit_code != 0 {
+                    failed_items.push(format!("文件 {entry_name}: 远程写入失败，退出码 {exit_code}"));
+                    continue;
+                }
+
+                files_uploaded += 1;
+            }
+        }
+    }
+
+    // Emit a final "directory-upload-complete" event
+    let _ = app.emit(
+        "directory-upload-complete",
+        serde_json::json!({
+            "local_dir": local_dir,
+            "dest_dir": remote_root,
+            "files_uploaded": files_uploaded,
+            "dirs_created": dirs_created,
+            "total_bytes": total_bytes,
+            "failed_items": failed_items,
+        }),
+    );
+
+    Ok(serde_json::json!({
+        "remote_path": remote_root,
+        "files_uploaded": files_uploaded,
+        "dirs_created": dirs_created,
+        "total_bytes": total_bytes,
+        "failed_items": failed_items,
+    }))
+}
+
 /// Delete a file or directory (local or remote).
 #[tauri::command]
 async fn delete_path(
@@ -2925,6 +3107,7 @@ fn main() {
             write_remote_file,
             upload_file,
             upload_local_file,
+            upload_directory,
             read_file_as_data_url,
             download_remote_file,
             extract_archive,

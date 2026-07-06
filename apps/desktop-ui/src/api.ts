@@ -3,11 +3,12 @@ import { invoke } from '@tauri-apps/api/core';
 export async function openConnectionWindow(mode: 'manage' | 'create') {
   const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
   const label = mode === 'create' ? 'connection-create' : 'connection-panel';
+  const payload = { mode, target: label };
 
   // If the window already exists, focus it and send mode event
   const existing = await WebviewWindow.getByLabel(label);
   if (existing) {
-    await existing.emit('connection-window-set-mode', mode);
+    await existing.emit('connection-window-set-mode', payload);
     await existing.setFocus();
     return;
   }
@@ -37,7 +38,7 @@ export async function openConnectionWindow(mode: 'manage' | 'create') {
 
   // Wait for window to be created then send mode
   await webviewWindow.once('tauri://created', async () => {
-    await webviewWindow.emit('connection-window-set-mode', mode);
+    await webviewWindow.emit('connection-window-set-mode', payload);
   });
 
   webviewWindow.once('tauri://error', (e) => {
@@ -244,6 +245,24 @@ export async function uploadLocalFile(localPath: string, destDir: string, transf
     localPath,
     destDir,
     transferId,
+  });
+}
+
+export type UploadDirectoryResult = {
+  remote_path: string;
+  files_uploaded: number;
+  dirs_created: number;
+  total_bytes: number;
+  failed_items: string[];
+};
+
+/// Recursively upload a local directory to a remote server.
+/// Creates directory structure on remote and uploads all files.
+export async function uploadDirectory(localDir: string, destDir: string, terminalId: string): Promise<UploadDirectoryResult> {
+  return await invoke<UploadDirectoryResult>('upload_directory', {
+    terminalId,
+    localDir,
+    destDir,
   });
 }
 

@@ -83,12 +83,15 @@ export function ConnectionWindow() {
   useEffect(() => {
     void refreshSessions();
 
-    // Listen for mode change events from main window
-    const unlisten = listen<ConnectionWindowMode>('connection-window-set-mode', (event) => {
+    // Listen for mode change events — only accept events intended for THIS window.
+    // Each event payload should specify a target label so windows don't interfere.
+    const unlisten = listen<{ mode: ConnectionWindowMode; target: string }>('connection-window-set-mode', (event) => {
+      // Only react if the event is targeted at this window's label
+      if (event.payload.target !== windowLabelRef.current) return;
       // connection-create window only shows create mode — ignore manage requests
-      if (windowLabelRef.current === 'connection-create' && event.payload === 'manage') return;
-      setMode(event.payload);
-      if (event.payload === 'manage') {
+      if (windowLabelRef.current === 'connection-create' && event.payload.mode === 'manage') return;
+      setMode(event.payload.mode);
+      if (event.payload.mode === 'manage') {
         void refreshSessions();
       }
     });

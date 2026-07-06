@@ -4,6 +4,10 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "pandaterm"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2.2.0", features = [] }
 
