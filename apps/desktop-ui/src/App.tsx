@@ -2637,10 +2637,12 @@ export function App() {
   }, [leftActivity]);
 
   function toggleLeftActivity(panel: 'files' | 'monitor' | 'processes') {
-    setLeftActivity(panel);
-    if (panel === 'monitor') {
+    // VSCode 风格：再次点击已激活的图标则收起侧边栏
+    const nextPanel = leftActivity === panel ? null : panel;
+    setLeftActivity(nextPanel);
+    if (nextPanel === 'monitor') {
       void refreshMonitorData();
-    } else if (panel === 'processes') {
+    } else if (nextPanel === 'processes') {
       void refreshProcessList();
     }
   }
@@ -3501,8 +3503,7 @@ export function App() {
             </span>
           </div>
         )}
-        {leftActivity && (
-        <div className="left-sidebar" style={{ width: `${resourcePanelWidth}%` }}>
+        <div className={`left-sidebar${leftActivity ? '' : ' collapsed'}`} style={leftActivity ? { width: `${resourcePanelWidth}%` } : { width: '48px' }}>
           <div className="activity-bar">
             <button
               className={`activity-bar-icon${leftActivity === 'files' ? ' active' : ''}`}
@@ -4034,10 +4035,10 @@ export function App() {
           </div>
         )}
         </div>
-        )}
 
         <div
-          className={leftActivity ? 'resource-resizer' : 'resource-resizer disabled'}
+          className={`resource-resizer${leftActivity ? '' : ' hidden'}`}
+
           role="separator"
           aria-orientation="vertical"
           aria-label="调整面板宽度"

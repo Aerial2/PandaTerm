@@ -286,6 +286,13 @@ button:disabled {
   background: var(--bg-secondary);
 }
 
+/* Collapsed state — only the activity bar is visible (VSCode-style toggle) */
+.left-sidebar.collapsed {
+  min-width: 48px;
+  max-width: 48px;
+}
+
+
 /* ============================================================
    File Panel — Left sidebar / resource explorer
    ============================================================ */
@@ -362,6 +369,10 @@ button:disabled {
 
 .resource-resizer.disabled::after {
   background: transparent;
+}
+
+.resource-resizer.hidden {
+  display: none;
 }
 
 /* ============================================================
