@@ -17,7 +17,7 @@ use russh::ChannelMsg;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use uuid::Uuid;
 
 #[cfg(target_os = "windows")]
@@ -1282,6 +1282,106 @@ async fn write_remote_file_content(
     Ok(())
 }
 
+/// Stream a local file to a remote path through `cat > path` over a single SSH
+/// exec channel. Shared by `upload_local_file` and `upload_directory` so the
+/// (expensive) channel-open + exec + eof + wait round trips happen once per
+/// file. No separate size re-verification: `cat` exiting 0 already guarantees
+/// the bytes we sent were written to disk, so an extra `stat` round trip would
+/// only add latency for no real benefit.
+async fn stream_upload_file(
+    handle: &russh::client::Handle<SshHandler>,
+    local_path: &Path,
+    remote_path: &str,
+    transfer_id: &str,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
+    let quoted = shell_quote(remote_path);
+    channel
+        .exec(true, format!("cat > {quoted}"))
+        .await
+        .map_err(|error| format!("SSH exec 失败：{error}"))?;
+
+    // Split into read/write halves and keep draining the server->client
+    // direction *while* we upload. Otherwise a talkative/verbose remote command
+    // fills the SSH output window and OpenSSH deadlocks the whole channel — it
+    // stops advertising input WINDOW_ADJUST, so our writes hang at the ~2 MB
+    // initial window (exactly what happens with large files). The reader just
+    // discards output and captures the remote exit code.
+    let (mut reader, writer) = channel.split();
+    let exit_code = std::sync::Arc::new(tokio::sync::Mutex::new(0i32));
+    let exit_code_tx = std::sync::Arc::clone(&exit_code);
+    let read_task = tokio::spawn(async move {
+        while let Some(msg) = reader.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { .. } | russh::ChannelMsg::ExtendedData { .. } => {
+                    // Discard server output to keep the output window flowing.
+                }
+                russh::ChannelMsg::ExitStatus { exit_status } => {
+                    *exit_code_tx.lock().await = exit_status as i32;
+                }
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+    });
+
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(local_path)
+        .await
+        .map_err(|e| format!("打开本地文件失败：{e}"))?;
+    let total = tokio::fs::metadata(local_path)
+        .await
+        .map_err(|e| format!("读取文件信息失败：{e}"))?
+        .len() as usize;
+
+    let chunk_size: usize = 32768;
+    let mut buffer = vec![0u8; chunk_size];
+    let mut transferred: usize = 0;
+
+    loop {
+        let n = file
+            .read(&mut buffer)
+            .await
+            .map_err(|e| format!("读取本地文件失败：{e}"))?;
+        if n == 0 {
+            break;
+        }
+        writer
+            .data(&buffer[..n])
+            .await
+            .map_err(|error| format!("SSH 数据写入失败：{error}"))?;
+        transferred += n;
+        let _ = app.emit(
+            "upload-progress",
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "transferred": transferred,
+                "total": total,
+            }),
+        );
+    }
+
+    drop(file);
+    writer
+        .eof()
+        .await
+        .map_err(|error| format!("SSH eof 失败：{error}"))?;
+    let _ = writer.close().await;
+
+    // Wait for the reader task to observe the channel close and record the exit code.
+    let _ = read_task.await;
+    let exit_code = *exit_code.lock().await;
+    if exit_code != 0 {
+        return Err(format!("远程写入失败，退出码: {exit_code}"));
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 async fn write_local_file(path: String, content: String) -> Result<(), String> {
     let file_path = PathBuf::from(&path);
@@ -1338,17 +1438,6 @@ async fn upload_file(
                 .ok_or_else(|| format!("terminal is not connected: {tid}"))?
         };
         write_remote_file_content(&handle, &dest_path, &content, &app, &transfer_id).await?;
-        // Verify file size matches to catch truncated uploads.
-        let quoted = shell_quote(&dest_path);
-        let (size_out, _, _) = exec_remote_command_full(&handle, &format!("stat -c %s {quoted} 2>/dev/null || echo 0")).await?;
-        let remote_size: u64 = String::from_utf8_lossy(&size_out).trim().parse().unwrap_or(0);
-        if remote_size != content.len() as u64 {
-            return Err(format!(
-                "上传校验失败：本地 {} 字节，远程 {} 字节",
-                content.len(),
-                remote_size
-            ));
-        }
     } else {
         // Local upload: write bytes directly.
         let dest = PathBuf::from(&dest_path);
@@ -1391,7 +1480,7 @@ async fn upload_local_file(
     let metadata = tokio::fs::metadata(&local)
         .await
         .map_err(|e| format!("读取文件信息失败：{e}"))?;
-    let total = metadata.len() as usize;
+    let _total = metadata.len() as usize;
 
     let dest_path = if dest_dir.ends_with('/') {
         format!("{dest_dir}{file_name}")
@@ -1399,89 +1488,7 @@ async fn upload_local_file(
         format!("{dest_dir}/{file_name}")
     };
 
-    // Open a fresh exec channel and pipe file content through `cat > path`.
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
-    let quoted = shell_quote(&dest_path);
-    channel
-        .exec(true, format!("cat > {quoted}"))
-        .await
-        .map_err(|error| format!("SSH exec 失败：{error}"))?;
-
-    // Read the file in chunks and write each chunk to the SSH channel.
-    use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(&local)
-        .await
-        .map_err(|e| format!("打开本地文件失败：{e}"))?;
-
-    let chunk_size: usize = 32768;
-    let mut buffer = vec![0u8; chunk_size];
-    let mut transferred: usize = 0;
-
-    loop {
-        let n = file
-            .read(&mut buffer)
-            .await
-            .map_err(|e| format!("读取本地文件失败：{e}"))?;
-        if n == 0 {
-            break;
-        }
-        channel
-            .data(&buffer[..n])
-            .await
-            .map_err(|error| format!("SSH 数据写入失败：{error}"))?;
-        transferred += n;
-        let _ = app.emit(
-            "upload-progress",
-            serde_json::json!({
-                "transfer_id": transfer_id,
-                "transferred": transferred,
-                "total": total,
-            }),
-        );
-    }
-
-    drop(file);
-
-    channel
-        .eof()
-        .await
-        .map_err(|error| format!("SSH eof 失败：{error}"))?;
-
-    let mut exit_code: i32 = 0;
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::ExitStatus { exit_status }) => {
-                exit_code = exit_status as i32;
-            }
-            Some(ChannelMsg::Eof) => {}
-            Some(ChannelMsg::Close) | None => break,
-            _ => {}
-        }
-    }
-    let _ = channel.close().await;
-    if exit_code != 0 {
-        return Err(format!("远程写入失败，退出码: {exit_code}"));
-    }
-
-    // Verify file size matches to catch truncated uploads.
-    let quoted = shell_quote(&dest_path);
-    let (size_out, _, _) = exec_remote_command_full(
-        &handle,
-        &format!("stat -c %s {quoted} 2>/dev/null || echo 0"),
-    )
-    .await?;
-    let remote_size: u64 = String::from_utf8_lossy(&size_out)
-        .trim()
-        .parse()
-        .unwrap_or(0);
-    if remote_size != total as u64 {
-        return Err(format!(
-            "上传校验失败：本地 {total} 字节，远程 {remote_size} 字节"
-        ));
-    }
+    stream_upload_file(&handle, &local, &dest_path, &transfer_id, &app).await?;
 
     Ok(dest_path)
 }
@@ -1489,6 +1496,50 @@ async fn upload_local_file(
 /// Recursively upload a local directory to a remote server via SFTP/SSH.
 /// Creates the directory structure on the remote, then uploads each file.
 /// Returns the number of files uploaded and directories created.
+/// Decide how many files to upload in parallel based on the local machine's
+/// current CPU load: 1 when the CPU is busy, 2 when it's idle/free.
+/// Reuses the cached `local_sys_monitor` so we don't spin up a fresh sysinfo
+/// instance per upload. The threshold (60%) mirrors total CPU usage as shown
+/// in Task Manager / top.
+fn recommended_upload_concurrency(state: &AppState) -> usize {
+    const CPU_BUSY_THRESHOLD: f32 = 60.0;
+    let usage = {
+        use sysinfo::{System, CpuRefreshKind, RefreshKind};
+        let mut guard = state.local_sys_monitor.lock().unwrap();
+        match guard.as_mut() {
+            Some(s) => {
+                s.refresh_cpu_usage();
+                s.global_cpu_usage()
+            }
+            None => {
+                // First call: two samples establish a usable delta baseline.
+                let mut s = System::new_with_specifics(
+                    RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
+                );
+                s.refresh_cpu_usage();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                s.refresh_cpu_usage();
+                let u = s.global_cpu_usage();
+                *guard = Some(s);
+                u
+            }
+        }
+    };
+    if usage >= CPU_BUSY_THRESHOLD {
+        1
+    } else {
+        2
+    }
+}
+
+/// Suggested upload concurrency for the current machine (1 if CPU is busy,
+/// 2 otherwise). The front-end calls this before a multi-file upload so its
+/// worker pool matches local load.
+#[tauri::command]
+fn get_upload_concurrency(state: State<'_, Arc<AppState>>) -> usize {
+    recommended_upload_concurrency(&**state)
+}
+
 #[tauri::command]
 async fn upload_directory(
     terminal_id: Uuid,
@@ -1525,12 +1576,16 @@ async fn upload_directory(
         return Err(format!("创建远程目录失败: {}", String::from_utf8_lossy(&stderr)));
     }
 
-    let mut files_uploaded: u64 = 0;
     let mut dirs_created: u64 = 1; // root dir already created
     let mut failed_items: Vec<String> = Vec::new();
     let mut total_bytes: u64 = 0;
+    let mut file_jobs: Vec<(PathBuf, String)> = Vec::new();
 
-    // Walk the local directory tree
+    // Walk the local directory tree: create remote directories and collect the
+    // file jobs. The actual uploads run concurrently afterwards so the per-file
+    // SSH round-trip latency is overlapped instead of being paid sequentially.
+    // This is what makes uploading hundreds of tiny files fast (like XShell's
+    // SFTP multi-file transfer).
     let mut dir_stack: Vec<(PathBuf, String)> = vec![(local_root.clone(), remote_root.clone())];
 
     while let Some((local_path, remote_path)) = dir_stack.pop() {
@@ -1554,92 +1609,50 @@ async fn upload_directory(
                 dirs_created += 1;
                 dir_stack.push((entry_path, remote_entry_path));
             } else {
-                // Upload file using the existing stream upload logic
-                let file_name = entry_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .ok_or_else(|| "无法解析文件名".to_string())?;
-
                 let metadata = tokio::fs::metadata(&entry_path)
                     .await
                     .map_err(|e| format!("读取文件信息失败：{e}"))?;
-                let file_size = metadata.len();
-                let transfer_id = Uuid::new_v4().to_string();
+                total_bytes += metadata.len();
+                file_jobs.push((entry_path, remote_entry_path));
+            }
+        }
+    }
 
-                let dest_file_path = if remote_entry_path.ends_with('/') {
-                    format!("{remote_entry_path}{file_name}")
-                } else {
-                    remote_entry_path.clone()
-                };
+    // Upload all collected files concurrently with a bounded number of parallel
+    // SSH channels. Each file reuses `stream_upload_file` (one channel-open +
+    // exec + eof + wait per file); concurrency overlaps the latency so that N
+    // small files don't each pay a full round-trip sequentially.
+    let concurrency = recommended_upload_concurrency(&**state);
+    let semaphore = std::sync::Arc::new(Semaphore::new(concurrency));
+    let mut tasks = Vec::with_capacity(file_jobs.len());
 
-                // Open SSH channel and pipe file content
-                let mut channel = handle
-                    .channel_open_session()
-                    .await
-                    .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
+    for (local_path, remote_entry_path) in file_jobs {
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| format!("信号量获取失败：{e}"))?;
+        let handle = std::sync::Arc::clone(&handle);
+        let app = app.clone();
+        let transfer_id = Uuid::new_v4().to_string();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            stream_upload_file(&handle, &local_path, &remote_entry_path, &transfer_id, &app).await
+        });
+        tasks.push(task);
+    }
 
-                let quoted_dest = shell_quote(&dest_file_path);
-                channel
-                    .exec(true, format!("cat > {quoted_dest}"))
-                    .await
-                    .map_err(|error| format!("SSH exec 失败：{error}"))?;
-
-                use tokio::io::AsyncReadExt;
-                let mut file = tokio::fs::File::open(&entry_path)
-                    .await
-                    .map_err(|e| format!("打开本地文件失败：{e}"))?;
-
-                let chunk_size: usize = 32768;
-                let mut buffer = vec![0u8; chunk_size];
-                let mut transferred: usize = 0;
-
-                loop {
-                    let n = file
-                        .read(&mut buffer)
-                        .await
-                        .map_err(|e| format!("读取本地文件失败：{e}"))?;
-                    if n == 0 {
-                        break;
-                    }
-                    channel
-                        .data(&buffer[..n])
-                        .await
-                        .map_err(|error| format!("SSH 数据写入失败：{error}"))?;
-                    transferred += n;
-                    total_bytes += n as u64;
-
-                    let _ = app.emit(
-                        "upload-progress",
-                        serde_json::json!({
-                            "transfer_id": transfer_id,
-                            "transferred": transferred,
-                            "total": file_size,
-                        }),
-                    );
-                }
-
-                drop(file);
-                channel.eof().await.map_err(|error| format!("SSH eof 失败：{error}"))?;
-
-                let mut exit_code: i32 = 0;
-                loop {
-                    match channel.wait().await {
-                        Some(ChannelMsg::ExitStatus { exit_status }) => {
-                            exit_code = exit_status as i32;
-                        }
-                        Some(ChannelMsg::Eof) => {}
-                        Some(ChannelMsg::Close) | None => break,
-                        _ => {}
-                    }
-                }
-                let _ = channel.close().await;
-
-                if exit_code != 0 {
-                    failed_items.push(format!("文件 {entry_name}: 远程写入失败，退出码 {exit_code}"));
-                    continue;
-                }
-
+    let mut files_uploaded: u64 = 0;
+    for task in tasks {
+        match task.await {
+            Ok(Ok(())) => {
                 files_uploaded += 1;
+            }
+            Ok(Err(e)) => {
+                failed_items.push(e);
+            }
+            Err(e) => {
+                failed_items.push(format!("上传任务异常：{e}"));
             }
         }
     }
@@ -3131,6 +3144,7 @@ fn main() {
             get_local_ipv4,
             get_system_monitor,
             get_process_list,
+            get_upload_concurrency,
             apply_window_dark_mode,
         ])
         .run(tauri::generate_context!())

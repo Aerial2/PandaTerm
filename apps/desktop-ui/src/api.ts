@@ -340,6 +340,12 @@ export async function getLocalIpv4(): Promise<string> {
   return await invoke<string>('get_local_ipv4');
 }
 
+/// Suggested upload concurrency for the local machine (1 if CPU is busy,
+/// 2 otherwise). Used to size the front-end upload worker pool.
+export async function getUploadConcurrency(): Promise<number> {
+  return await invoke<number>('get_upload_concurrency');
+}
+
 export interface SystemMonitorData {
   hostname: string;
   os_name: string;

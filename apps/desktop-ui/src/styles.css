@@ -1128,6 +1128,7 @@ button:disabled {
 .transfer-table {
   width: 100%;
   border-collapse: collapse;
+  table-layout: fixed;
   font-size: 12px;
 }
 
@@ -3221,6 +3222,50 @@ html.connection-window-html {
   background: var(--border-subtle);
 }
 
+/* Terminal right-click menu */
+.terminal-context-menu {
+  position: fixed;
+  z-index: 10000;
+  min-width: 160px;
+  padding: 4px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: #2c313a;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.terminal-context-item {
+  display: block;
+  width: 100%;
+  height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+
+.terminal-context-item:hover:not(:disabled) {
+  background: var(--accent-blue);
+  color: #000;
+}
+
+.terminal-context-item:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.terminal-context-sep {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border-subtle);
+}
+
 /* ============================================================
    Dialog (new file/folder, rename)
    ============================================================ */
@@ -3299,4 +3344,22 @@ html.connection-window-html {
 
 .dialog-btn.primary:hover {
   background: #4a9fef;
+}
+
+.dialog-message {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.dialog-btn.danger {
+  background: var(--accent-red);
+  border-color: var(--accent-red);
+  color: #fff;
+}
+
+.dialog-btn.danger:hover {
+  background: #e0524d;
 }

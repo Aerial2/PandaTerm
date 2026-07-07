@@ -67,6 +67,7 @@ import {
   copyPath,
   movePath,
   getLocalIpv4,
+  getUploadConcurrency,
   resizeLocalTerminal,
   resizeTerminal,
   sendLocalTerminalInput,
@@ -590,6 +591,13 @@ export function App() {
   const [newItemName, setNewItemName] = useState('');
   const [renameDialog, setRenameDialog] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+    danger?: boolean;
+    onConfirm: () => void | Promise<void>;
+  } | null>(null);
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
 
   // Close menubar dropdown when clicking outside
@@ -608,6 +616,7 @@ export function App() {
   const [activeEditorTabId, setActiveEditorTabId] = useState<string | null>(null);
   const [showEditor, setShowEditor] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: ResourceFile | null } | null>(null);
+  const [terminalContextMenu, setTerminalContextMenu] = useState<{ x: number; y: number; tabId: string; selection: string } | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1425,7 +1434,11 @@ export function App() {
       } else if (session.id === localSession.id) {
         void openLocalTerminalFromPanel();
       } else {
-        void openRemoteTerminal(session);
+        // Append the new connection as a terminal tab inside the active terminal
+        // (same behavior as double-clicking an existing tab) instead of spawning
+        // a separate workspace tab — otherwise the workspace tab bar is hidden for
+        // terminal-only sessions and the previous session looks "overwritten".
+        void openConnectionPanelSession(session);
       }
     }).then(fn => { connUnlisten = fn; });
     return () => { connUnlisten?.(); };
@@ -1913,13 +1926,36 @@ export function App() {
     }
 
     try {
-      for (let i = 0; i < fileList.length; i++) {
-        const file = fileList[i];
-        const localPath = localPaths?.[i];
-        const relPath = relativePaths?.[i];
-        // Determine the actual target directory for this file
-        // relPath format: "hooks/subdir/file.js" or "hooks/file.js" (when basePath includes root dir)
-        // We need destDir + the directory portion of relPath
+      const fileItems = fileList.map((file, i) => ({
+        file,
+        localPath: localPaths?.[i],
+        relPath: relativePaths?.[i],
+      }));
+
+      // One shared progress listener for all concurrent uploads. It maps each
+      // event's transfer_id back to its transfer record and updates progress.
+      const speedTrackers = new Map<string, { lastEventTime: number; lastEventTransferred: number }>();
+      const progressUnlisten = await listen<{ transfer_id: string; transferred: number; total: number }>(
+        'upload-progress',
+        (event) => {
+          const { transfer_id, transferred, total } = event.payload;
+          const tracker = speedTrackers.get(transfer_id);
+          const now = Date.now();
+          const db = transferred - (tracker?.lastEventTransferred ?? 0);
+          const dt = tracker ? (now - tracker.lastEventTime) / 1000 : 0;
+          const instSpeed = dt > 0 ? db / dt : 0;
+          speedTrackers.set(transfer_id, { lastEventTime: now, lastEventTransferred: transferred });
+          updateTransferRecord(transfer_id, (prev) => {
+            const progress = total > 0 ? Math.min((transferred / total) * 100, 100) : 0;
+            const smoothed = prev.speed > 0 ? prev.speed * 0.5 + instSpeed * 0.5 : instSpeed;
+            const sizePatch = prev.size === 0 && total > 0 ? { size: total } : {};
+            return { progress, transferred, speed: smoothed, message: '正在传输...', ...sizePatch };
+          });
+        },
+      );
+
+      const uploadOne = async (item: { file: File; localPath?: string; relPath?: string }) => {
+        const { file, localPath, relPath } = item;
         let fileDestDir = destDir;
         if (relPath) {
           const lastSlash = relPath.lastIndexOf('/');
@@ -1945,26 +1981,7 @@ export function App() {
         const abortCtrl = new AbortController();
         uploadAbortRefs.current.set(recordId, abortCtrl);
         const startTime = Date.now();
-        // Listen for real progress events from the Rust backend.
-        let lastEventTime = startTime;
-        let lastEventTransferred = 0;
-        const progressUnlisten = await listen<{ transfer_id: string; transferred: number; total: number }>('upload-progress', (event) => {
-          if (event.payload.transfer_id !== recordId) return;
-          const transferred = event.payload.transferred;
-          const total = event.payload.total;
-          const progress = total > 0 ? Math.min((transferred / total) * 100, 100) : 0;
-          const now = Date.now();
-          const dt = (now - lastEventTime) / 1000;
-          const db = transferred - lastEventTransferred;
-          const instSpeed = dt > 0 ? db / dt : 0;
-          lastEventTime = now;
-          lastEventTransferred = transferred;
-          updateTransferRecord(recordId, (prev) => {
-            const smoothed = prev.speed > 0 ? prev.speed * 0.5 + instSpeed * 0.5 : instSpeed;
-            const sizePatch = prev.size === 0 && total > 0 ? { size: total } : {};
-            return { progress, transferred, speed: smoothed, message: '正在传输...', ...sizePatch };
-          });
-        });
+        speedTrackers.set(recordId, { lastEventTime: startTime, lastEventTransferred: 0 });
         try {
           if (abortCtrl.signal.aborted) throw new DOMException('已取消', 'AbortError');
           if (useStreamUpload) {
@@ -1976,7 +1993,6 @@ export function App() {
             if (abortCtrl.signal.aborted) throw new DOMException('已取消', 'AbortError');
             await uploadFile(file.name, new Uint8Array(buffer), fileDestDir || destDir, recordId, terminalId);
           }
-          progressUnlisten();
           uploadAbortRefs.current.delete(recordId);
           uploaded += 1;
           const elapsed = (Date.now() - startTime) / 1000;
@@ -1984,18 +2000,44 @@ export function App() {
           updateTransferRecord(recordId, { status: 'success', progress: 100, transferred: file.size, speed: avgSpeed, message: '已完成' });
           addLogEntry('info', `上传成功：${displayFileName} → ${fileDestDir || destDir} (${formatFileSize(file.size)})`);
         } catch (error) {
-          progressUnlisten();
           uploadAbortRefs.current.delete(recordId);
           if (abortCtrl.signal.aborted) {
             updateTransferRecord(recordId, { status: 'cancelled', message: '已取消' });
-            continue;
+            return;
           }
           const message = error instanceof Error ? error.message : String(error);
           failed += `${displayFileName}: ${message}; `;
           updateTransferRecord(recordId, { status: 'failed', message });
           addLogEntry('error', `上传失败：${displayFileName} - ${message}`);
         }
+      };
+
+      // Bounded concurrency pool — upload several files in parallel so the
+      // per-file SSH round-trip latency is overlapped (like XShell's SFTP).
+      // Pick the pool size from local CPU load: busy => 1, idle => 2.
+      let CONCURRENCY = 2;
+      try {
+        const recommended = await getUploadConcurrency();
+        if (typeof recommended === 'number' && recommended >= 1) {
+          CONCURRENCY = Math.min(Math.max(Math.trunc(recommended), 1), 2);
+        }
+      } catch {
+        // Keep default of 2 if the command is unavailable.
       }
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < fileItems.length) {
+          const idx = cursor++;
+          if (idx >= fileItems.length) break;
+          await uploadOne(fileItems[idx]);
+        }
+      };
+      const poolSize = Math.min(CONCURRENCY, fileItems.length);
+      const workers: Promise<void>[] = [];
+      for (let w = 0; w < poolSize; w++) workers.push(worker());
+      await Promise.all(workers);
+
+      progressUnlisten();
       if (uploaded > 0) {
         setStatusMessage(`已上传 ${uploaded} 个文件到 ${targetLabel}：${destDir}`);
         await loadResourceDirectory(destDir, false);
@@ -2437,12 +2479,71 @@ export function App() {
     setContextMenu({ x: event.clientX, y: event.clientY, file: null });
   }
 
-  async function handleDeletePaths(files: ResourceFile[]) {
+  function handleTerminalContextMenu(event: React.MouseEvent, tabId: string) {
+    event.preventDefault();
+    const term = terminalsRef.current.get(tabId);
+    const selection = term?.getSelection() ?? '';
+    setTerminalContextMenu({ x: event.clientX, y: event.clientY, tabId, selection });
+  }
+
+  async function copyTerminalSelection(tabId: string) {
+    const term = terminalsRef.current.get(tabId);
+    const selection = term?.getSelection();
+    if (selection) {
+      try {
+        await navigator.clipboard.writeText(selection);
+      } catch {
+        // Non-critical — clipboard may be unavailable
+      }
+    }
+    setTerminalContextMenu(null);
+  }
+
+  async function pasteToTerminal(tabId: string) {
+    const term = terminalsRef.current.get(tabId);
+    if (!term) {
+      setTerminalContextMenu(null);
+      return;
+    }
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) writeTerminalInput(tabId, text);
+    } catch {
+      // Non-critical — clipboard may be unavailable
+    }
+    setTerminalContextMenu(null);
+  }
+
+  function searchTerminalSelection(selection: string) {
+    const query = selection.trim();
+    if (query) {
+      const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+      window.open(url, '_blank', 'noopener,noreferrer');
+    }
+    setTerminalContextMenu(null);
+  }
+
+  function clearTerminalScreen(tabId: string) {
+    const term = terminalsRef.current.get(tabId);
+    term?.clear();
+    setTerminalContextMenu(null);
+  }
+
+  function requestConfirm(opts: {
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    danger?: boolean;
+    onConfirm: () => void | Promise<void>;
+  }) {
+    setConfirmDialog({ confirmLabel: '确定', ...opts });
+  }
+
+  async function executeDeletePaths(files: ResourceFile[]) {
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
     const count = files.length;
     const label = count === 1 ? files[0].name : `${count} 个项目`;
-    if (!confirm(`确定删除「${label}」吗？此操作不可恢复。`)) return;
     setStatusMessage(`正在删除 ${label}...`);
     let successCount = 0;
     for (const file of files) {
@@ -2463,6 +2564,18 @@ export function App() {
     setSelectedFiles(new Set());
     setLastClickedIndex(-1);
     await loadResourceDirectory(currentPathRef.current || null, false);
+  }
+
+  async function handleDeletePaths(files: ResourceFile[]) {
+    const count = files.length;
+    const label = count === 1 ? files[0].name : `${count} 个项目`;
+    requestConfirm({
+      title: '删除确认',
+      message: `确定删除「${label}」吗？此操作不可恢复。`,
+      confirmLabel: '删除',
+      danger: true,
+      onConfirm: () => executeDeletePaths(files),
+    });
   }
 
   function handleCopyFiles(files: ResourceFile[]) {
@@ -2621,6 +2734,20 @@ export function App() {
       window.removeEventListener('contextmenu', close);
     };
   }, [contextMenu]);
+
+  // Close the terminal right-click menu on any outside click / new right-click
+  useEffect(() => {
+    if (!terminalContextMenu) return;
+    const close = () => setTerminalContextMenu(null);
+    window.addEventListener('click', close);
+    window.addEventListener('contextmenu', close);
+    window.addEventListener('blur', close);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('contextmenu', close);
+      window.removeEventListener('blur', close);
+    };
+  }, [terminalContextMenu]);
 
   // Auto-refresh system monitor data every 5 seconds when panel is open
   useEffect(() => {
@@ -3421,6 +3548,7 @@ export function App() {
                     terminalHostsRef.current.delete(tab.id);
                   }
                 }}
+                onContextMenu={(event) => handleTerminalContextMenu(event, tab.id)}
               />
             ))}
             {(paneTab.status === 'connecting' || paneTab.status === 'reconnecting') && (
@@ -4351,6 +4479,41 @@ export function App() {
         </div>
       )}
 
+      {terminalContextMenu && (
+        <div
+          className="terminal-context-menu"
+          style={{ left: terminalContextMenu.x, top: terminalContextMenu.y }}
+        >
+          <button
+            className="terminal-context-item"
+            disabled={!terminalContextMenu.selection}
+            onClick={() => void copyTerminalSelection(terminalContextMenu.tabId)}
+          >
+            复制
+          </button>
+          <button
+            className="terminal-context-item"
+            onClick={() => void pasteToTerminal(terminalContextMenu.tabId)}
+          >
+            粘贴
+          </button>
+          <button
+            className="terminal-context-item"
+            disabled={!terminalContextMenu.selection}
+            onClick={() => searchTerminalSelection(terminalContextMenu.selection)}
+          >
+            浏览器搜索
+          </button>
+          <div className="terminal-context-sep" />
+          <button
+            className="terminal-context-item"
+            onClick={() => clearTerminalScreen(terminalContextMenu.tabId)}
+          >
+            清屏
+          </button>
+        </div>
+      )}
+
       {newItemDialog && (
         <div className="dialog-backdrop" onMouseDown={() => setNewItemDialog(null)}>
           <div className="dialog-card" onMouseDown={(e) => e.stopPropagation()}>
@@ -4392,6 +4555,35 @@ export function App() {
             <div className="dialog-actions">
               <button className="dialog-btn" onClick={() => setRenameDialog(null)}>取消</button>
               <button className="dialog-btn primary" onClick={() => void handleRename()}>确定</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDialog && (
+        <div className="dialog-backdrop" onMouseDown={() => setConfirmDialog(null)}>
+          <div
+            className="dialog-card"
+            onMouseDown={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') setConfirmDialog(null);
+            }}
+          >
+            <h3>{confirmDialog.title}</h3>
+            <p className="dialog-message">{confirmDialog.message}</p>
+            <div className="dialog-actions">
+              <button className="dialog-btn" onClick={() => setConfirmDialog(null)}>取消</button>
+              <button
+                className={confirmDialog.danger ? 'dialog-btn danger' : 'dialog-btn primary'}
+                autoFocus
+                onClick={async () => {
+                  const action = confirmDialog.onConfirm;
+                  setConfirmDialog(null);
+                  await action();
+                }}
+              >
+                {confirmDialog.confirmLabel}
+              </button>
             </div>
           </div>
         </div>
