@@ -185,6 +185,29 @@ type ResourceFile = {
   modifiedTime: string;
 };
 
+type UploadConflictAction = 'overwrite' | 'skip' | 'rename';
+
+type UploadConflictDecision = {
+  action: UploadConflictAction;
+  newName?: string;
+};
+
+type UploadConflictDialogState = {
+  sourceName: string;
+  sourceSize: number;
+  sourceModifiedMs?: number | null;
+  target: ResourceFile;
+  existingNames: string[];
+  action: UploadConflictAction;
+  newName: string;
+  applyToAll: boolean;
+  resolve: (decision: UploadConflictDecision | null) => void;
+};
+
+type UploadConflictApplyAll = {
+  action: UploadConflictAction;
+};
+
 type ResourceSortKey = 'name' | 'size' | 'modifiedTime';
 type ResourceBottomTab = 'transfer' | 'log';
 
@@ -287,6 +310,29 @@ function formatModifiedTime(modifiedMs?: number | null) {
     hour: '2-digit',
     minute: '2-digit',
   }).format(new Date(modifiedMs));
+}
+
+function joinRemotePath(dir: string, name: string) {
+  return dir.endsWith('/') ? `${dir}${name}` : `${dir}/${name}`;
+}
+
+function splitUploadRelativePath(path: string) {
+  const slash = path.lastIndexOf('/');
+  return slash >= 0
+    ? { parent: path.slice(0, slash), name: path.slice(slash + 1) }
+    : { parent: '', name: path };
+}
+
+function buildDuplicateName(name: string, existingNames: Set<string>) {
+  const dot = name.lastIndexOf('.');
+  const hasExt = dot > 0;
+  const stem = hasExt ? name.slice(0, dot) : name;
+  const ext = hasExt ? name.slice(dot) : '';
+  for (let index = 1; index < 10000; index += 1) {
+    const candidate = `${stem} (${index})${ext}`;
+    if (!existingNames.has(candidate)) return candidate;
+  }
+  return `${stem} (${Date.now()})${ext}`;
 }
 
 function toResourceFile(entry: LocalDirectoryEntry): ResourceFile {
@@ -598,6 +644,8 @@ export function App() {
     danger?: boolean;
     onConfirm: () => void | Promise<void>;
   } | null>(null);
+  const [uploadConflictDialog, setUploadConflictDialog] = useState<UploadConflictDialogState | null>(null);
+  const uploadConflictApplyAllRef = useRef<UploadConflictApplyAll | null>(null);
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
 
   // Close menubar dropdown when clicking outside
@@ -697,9 +745,9 @@ export function App() {
     const tab = tabsRef.current.find((item) => item.id === tabId);
     if (!tab?.terminalId) return;
     if (tab.session.id === localSession.id) {
-      void resizeLocalTerminal(tab.terminalId, terminal.cols, terminal.rows);
+      void resizeLocalTerminal(tab.terminalId, terminal.cols, terminal.rows).catch(() => {});
     } else {
-      void resizeTerminal(tab.terminalId, terminal.cols, terminal.rows);
+      void resizeTerminal(tab.terminalId, terminal.cols, terminal.rows).catch(() => {});
     }
   }
 
@@ -792,6 +840,65 @@ export function App() {
     };
   }
 
+  function consumePendingRemoteOutput(terminalId: string, tabId: string, session: Session) {
+    const pendingRawPayloads = pendingOutputRef.current.get(terminalId);
+    if (!pendingRawPayloads || pendingRawPayloads.length === 0) return false;
+    pendingOutputRef.current.delete(terminalId);
+
+    const displayPayloads = pendingRawPayloads
+      .map(stripRemoteReadyMarker)
+      .filter((payload) => payload.length > 0);
+    const hasFailure = pendingRawPayloads.some(isRemoteSessionFailureOutput);
+    const hasDisconnected = pendingRawPayloads.some(isRemoteSessionDisconnectedOutput);
+    const hasReady = pendingRawPayloads.some(isRemoteSessionReadyOutput);
+    const nextStatus = hasFailure
+      ? 'failed'
+      : hasDisconnected
+        ? 'disconnected'
+        : hasReady
+          ? 'connected'
+          : null;
+    const nextStatusMessage = nextStatus === 'connected'
+      ? '已连接'
+      : nextStatus === 'failed'
+        ? '连接失败'
+        : nextStatus === 'disconnected'
+          ? '已断开'
+          : null;
+
+    setTabs((current) => current.map((item) => {
+      if (item.id !== tabId) return item;
+      return {
+        ...item,
+        terminalId,
+        status: nextStatus ?? item.status,
+        statusMessage: nextStatusMessage ?? item.statusMessage,
+        activityLog: nextStatusMessage
+          ? [...item.activityLog, createActivity(nextStatus === 'failed' ? 'error' : 'info', nextStatusMessage)].slice(-20)
+          : item.activityLog,
+        output: displayPayloads.length > 0
+          ? [...item.output, ...displayPayloads].slice(-500)
+          : item.output,
+      };
+    }));
+
+    const term = terminalsRef.current.get(tabId);
+    for (const payload of displayPayloads) {
+      term?.write(payload);
+    }
+
+    if (nextStatus) {
+      setOpeningConnection(null);
+      setStatusMessage(nextStatus === 'failed'
+        ? `连接失败：${session.name}`
+        : nextStatus === 'disconnected'
+          ? `已断开：${session.name}`
+          : `已连接：${session.name}`);
+    }
+
+    return Boolean(nextStatus);
+  }
+
   function addLogEntry(level: LogEntry['level'], text: string) {
     const entry: LogEntry = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -821,6 +928,45 @@ export function App() {
     setTransferRecords((current) =>
       current.map((r) => (r.id === id ? { ...r, ...(typeof patch === 'function' ? patch(r) : patch) } : r))
     );
+  }
+
+  function requestUploadConflictDecision(source: File, target: ResourceFile, existingNames: Set<string>): Promise<UploadConflictDecision | null> {
+    const applyAll = uploadConflictApplyAllRef.current;
+    if (applyAll) {
+      if (applyAll.action === 'rename') {
+        return Promise.resolve({ action: 'rename', newName: buildDuplicateName(source.name, existingNames) });
+      }
+      return Promise.resolve({ action: applyAll.action });
+    }
+
+    return new Promise((resolve) => {
+      setUploadConflictDialog({
+        sourceName: source.name,
+        sourceSize: source.size,
+        sourceModifiedMs: source.lastModified || null,
+        target,
+        existingNames: [...existingNames],
+        action: 'overwrite',
+        newName: buildDuplicateName(source.name, existingNames),
+        applyToAll: false,
+        resolve,
+      });
+    });
+  }
+
+  function resolveUploadConflictDialog(decision: UploadConflictDecision | null) {
+    const dialog = uploadConflictDialog;
+    if (!dialog) return;
+    if (dialog.applyToAll && decision) {
+      uploadConflictApplyAllRef.current = { action: decision.action };
+    }
+    dialog.resolve(decision);
+    setUploadConflictDialog(null);
+  }
+
+  function isUploadConflictRenameInvalid(dialog: UploadConflictDialogState) {
+    const name = dialog.newName.trim();
+    return !name || name.includes('/') || name.includes('\\') || dialog.existingNames.includes(name);
   }
 
   function deleteTransferRecord(id: string) {
@@ -1281,9 +1427,12 @@ export function App() {
               : item,
           ),
         );
+        const consumedPendingStatus = consumePendingRemoteOutput(terminalId, nextTab.id, session);
         setOpeningConnection(null);
         scheduleTerminalSettledFit(nextTab.id);
-        setStatusMessage(`SSH 已建立，等待远程终端输出：${session.name}`);
+        if (!consumedPendingStatus) {
+          setStatusMessage(`SSH 已建立，等待远程终端输出：${session.name}`);
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setOpeningConnection(null);
@@ -1365,9 +1514,12 @@ export function App() {
             : item,
         ),
       );
+      const consumedPendingStatus = consumePendingRemoteOutput(terminalId, tabId, session);
       setOpeningConnection(null);
       scheduleTerminalSettledFit(tabId);
-      setStatusMessage(`SSH 已建立，等待远程终端输出：${session.name}`);
+      if (!consumedPendingStatus) {
+        setStatusMessage(`SSH 已建立，等待远程终端输出：${session.name}`);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setOpeningConnection(null);
@@ -1466,12 +1618,12 @@ export function App() {
 
       // If no tab is mapped yet (race: PTY output arrived before startLocalTerminal resolved),
       // buffer the output so it can be flushed once the mapping is registered.
-      if (!targetTab && displayPayload) {
+      if (!targetTab && rawPayload) {
         const pending = pendingOutputRef.current.get(terminalId);
         if (pending) {
-          pending.push(displayPayload);
+          pending.push(rawPayload);
         } else {
-          pendingOutputRef.current.set(terminalId, [displayPayload]);
+          pendingOutputRef.current.set(terminalId, [rawPayload]);
         }
         return;
       }
@@ -1892,6 +2044,7 @@ export function App() {
     const terminalId = local ? null : tab?.terminalId ?? null;
     setIsUploading(true);
     let uploaded = 0;
+    let skipped = 0;
     let failed = '';
 
     // When relativePaths are provided (directory upload via webkitGetAsEntry),
@@ -1931,6 +2084,15 @@ export function App() {
         localPath: localPaths?.[i],
         relPath: relativePaths?.[i],
       }));
+      const visibleTargetNames = new Set(resourceFiles.map((file) => file.name));
+      const plannedRootNames = new Set(visibleTargetNames);
+      const hasVisibleConflict = !local && fileItems.some(({ file, relPath }) => {
+        if (relPath) {
+          const { parent, name } = splitUploadRelativePath(relPath);
+          return parent === '' && visibleTargetNames.has(name || file.name);
+        }
+        return visibleTargetNames.has(file.name);
+      });
 
       // One shared progress listener for all concurrent uploads. It maps each
       // event's transfer_id back to its transfer record and updates progress.
@@ -1957,17 +2119,41 @@ export function App() {
       const uploadOne = async (item: { file: File; localPath?: string; relPath?: string }) => {
         const { file, localPath, relPath } = item;
         let fileDestDir = destDir;
+        let targetFileName = file.name;
+        let isRootTarget = true;
         if (relPath) {
-          const lastSlash = relPath.lastIndexOf('/');
-          if (lastSlash > 0) {
-            fileDestDir = `${destDir}/${relPath.substring(0, lastSlash)}`;
-          } else if (lastSlash === 0) {
-            // relPath starts with "/" — shouldn't happen but handle gracefully
-            fileDestDir = destDir;
+          const { parent, name } = splitUploadRelativePath(relPath);
+          targetFileName = name || file.name;
+          isRootTarget = parent === '';
+          if (parent) {
+            fileDestDir = joinRemotePath(destDir, parent);
           }
-          // If lastSlash === -1, file is at root of the dropped dir → fileDestDir stays destDir
         }
-        const displayFileName = relPath || file.name;
+        let displayFileName = relPath || file.name;
+
+        if (!local && isRootTarget) {
+          const existingTarget = resourceFiles.find((entry) => entry.name === targetFileName);
+          if (existingTarget) {
+            const decision = await requestUploadConflictDecision(file, existingTarget, plannedRootNames);
+            if (!decision || decision.action === 'skip') {
+              skipped += 1;
+              addLogEntry('info', `已跳过上传：${displayFileName}`);
+              return;
+            }
+            if (decision.action === 'rename') {
+              const nextName = decision.newName?.trim() ?? '';
+              if (!nextName || nextName.includes('/') || nextName.includes('\\')) {
+                failed += `${displayFileName}: 无效的新文件名; `;
+                addLogEntry('error', `上传失败：${displayFileName} - 无效的新文件名`);
+                return;
+              }
+              targetFileName = nextName;
+              displayFileName = relPath ? targetFileName : nextName;
+            }
+          }
+          plannedRootNames.add(targetFileName);
+        }
+
         // 远程上传且有本地路径时，走流式上传，避免前端 base64 编码阻塞 UI。
         const useStreamUpload = !local && terminalId && localPath;
         const recordId = addTransferRecord({
@@ -1986,12 +2172,12 @@ export function App() {
           if (abortCtrl.signal.aborted) throw new DOMException('已取消', 'AbortError');
           if (useStreamUpload) {
             // 流式上传：Rust 端直接读取本地文件分块上传，前端不接触文件内容。
-            await uploadLocalFile(localPath!, fileDestDir || destDir, recordId, terminalId!);
+            await uploadLocalFile(localPath!, fileDestDir || destDir, recordId, terminalId!, targetFileName);
           } else {
             // 降级路径：前端读取文件内容并 base64 编码后上传。
             const buffer = await file.arrayBuffer();
             if (abortCtrl.signal.aborted) throw new DOMException('已取消', 'AbortError');
-            await uploadFile(file.name, new Uint8Array(buffer), fileDestDir || destDir, recordId, terminalId);
+            await uploadFile(targetFileName, new Uint8Array(buffer), fileDestDir || destDir, recordId, terminalId);
           }
           uploadAbortRefs.current.delete(recordId);
           uploaded += 1;
@@ -2016,13 +2202,17 @@ export function App() {
       // per-file SSH round-trip latency is overlapped (like XShell's SFTP).
       // Pick the pool size from local CPU load: busy => 1, idle => 2.
       let CONCURRENCY = 2;
-      try {
-        const recommended = await getUploadConcurrency();
-        if (typeof recommended === 'number' && recommended >= 1) {
-          CONCURRENCY = Math.min(Math.max(Math.trunc(recommended), 1), 2);
+      if (hasVisibleConflict) {
+        CONCURRENCY = 1;
+      } else {
+        try {
+          const recommended = await getUploadConcurrency();
+          if (typeof recommended === 'number' && recommended >= 1) {
+            CONCURRENCY = Math.min(Math.max(Math.trunc(recommended), 1), 2);
+          }
+        } catch {
+          // Keep default of 2 if the command is unavailable.
         }
-      } catch {
-        // Keep default of 2 if the command is unavailable.
       }
       let cursor = 0;
       const worker = async () => {
@@ -2039,8 +2229,10 @@ export function App() {
 
       progressUnlisten();
       if (uploaded > 0) {
-        setStatusMessage(`已上传 ${uploaded} 个文件到 ${targetLabel}：${destDir}`);
+        setStatusMessage(`已上传 ${uploaded} 个文件到 ${targetLabel}：${destDir}${skipped > 0 ? `，跳过 ${skipped} 个` : ''}`);
         await loadResourceDirectory(destDir, false);
+      } else if (skipped > 0) {
+        setStatusMessage(`已跳过 ${skipped} 个文件`);
       }
       if (failed) {
         setStatusMessage(`部分文件上传失败：${failed}`);
@@ -2079,12 +2271,13 @@ export function App() {
       // webkitRelativePath is "RootFolder/subDir/file.txt" so we need to
       // remove the relative sub-path from the local path to get the root dir.
       const relParts = relativePaths[0].split('/');
+      const rootName = relParts[0];
       // Remove the last part (filename) from relParts to get the relative directory path
       const relDirDepth = relParts.length - 1; // number of directory levels below root
       // Remove relDirDepth parts from the end of the local path, plus the filename
       const localParts = localPaths[0].split(/[/\\]/);
       const rootDir = localParts.slice(0, localParts.length - relDirDepth - 1).join('/');
-      if (rootDir) {
+      if (rootDir && !resourceFiles.some((entry) => entry.name === rootName)) {
         await handleDirectoryUpload(rootDir, tab.terminalId);
         if (folderInputRef.current) folderInputRef.current.value = '';
         return;
@@ -2152,10 +2345,11 @@ export function App() {
                 // firstLocalPath is "C:\full\path\dirName\subDir\file.txt".
                 // Root dir = localPath minus the relative path parts minus filename.
                 const relParts = firstRelPath.split('/');
+                const rootName = relParts[0];
                 const relDepth = relParts.length - 1; // directory levels below root
                 const localParts = firstLocalPath.split(/[/\\]/);
                 const rootDir = localParts.slice(0, localParts.length - relDepth - 1).join('/');
-                if (rootDir) {
+                if (rootDir && !resourceFiles.some((entry) => entry.name === rootName)) {
                   await handleDirectoryUpload(rootDir, tab.terminalId);
                   continue;
                 }
@@ -4555,6 +4749,90 @@ export function App() {
             <div className="dialog-actions">
               <button className="dialog-btn" onClick={() => setRenameDialog(null)}>取消</button>
               <button className="dialog-btn primary" onClick={() => void handleRename()}>确定</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {uploadConflictDialog && (
+        <div className="dialog-backdrop" onMouseDown={() => resolveUploadConflictDialog(null)}>
+          <div
+            className="dialog-card upload-conflict-dialog"
+            onMouseDown={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') resolveUploadConflictDialog(null);
+              if (e.key === 'Enter') {
+                const action = uploadConflictDialog.action;
+                const newName = uploadConflictDialog.newName.trim();
+                if (action !== 'rename' || !isUploadConflictRenameInvalid(uploadConflictDialog)) {
+                  resolveUploadConflictDialog(action === 'rename' ? { action, newName } : { action });
+                }
+              }
+            }}
+          >
+            <h3>文件已存在</h3>
+            <p className="dialog-message">目标目录中已经存在同名项目，请选择本次上传的处理方式。</p>
+            <div className="upload-conflict-files">
+              <div className="upload-conflict-file">
+                <span className="upload-conflict-label">上传文件</span>
+                <strong>{uploadConflictDialog.sourceName}</strong>
+                <span>{formatFileSize(uploadConflictDialog.sourceSize)} · {formatModifiedTime(uploadConflictDialog.sourceModifiedMs)}</span>
+              </div>
+              <div className="upload-conflict-file existing">
+                <span className="upload-conflict-label">已有项目</span>
+                <strong>{uploadConflictDialog.target.name}</strong>
+                <span>{uploadConflictDialog.target.type === 'directory' ? '文件夹' : uploadConflictDialog.target.size} · {uploadConflictDialog.target.modifiedTime}</span>
+              </div>
+            </div>
+            <div className="upload-conflict-options">
+              {([
+                ['overwrite', '覆盖', '用新文件替换目标中的同名项目'],
+                ['skip', '跳过', '保留已有项目，不上传该文件'],
+                ['rename', '重命名', '使用新名称上传，保留已有项目'],
+              ] as const).map(([action, label, hint]) => (
+                <button
+                  key={action}
+                  className={uploadConflictDialog.action === action ? 'upload-conflict-option active' : 'upload-conflict-option'}
+                  onClick={() => setUploadConflictDialog((current) => current ? { ...current, action } : current)}
+                >
+                  <strong>{label}</strong>
+                  <span>{hint}</span>
+                </button>
+              ))}
+            </div>
+            {uploadConflictDialog.action === 'rename' && (
+              <input
+                autoFocus
+                className="dialog-input"
+                value={uploadConflictDialog.newName}
+                placeholder="输入新文件名"
+                onChange={(e) => setUploadConflictDialog((current) => current ? { ...current, newName: e.target.value } : current)}
+              />
+            )}
+            {uploadConflictDialog.action === 'rename' && isUploadConflictRenameInvalid(uploadConflictDialog) && (
+              <p className="upload-conflict-warning">新文件名不能为空、不能包含路径分隔符，也不能与当前目录已有名称重复。</p>
+            )}
+            <label className="upload-conflict-apply-all">
+              <input
+                type="checkbox"
+                checked={uploadConflictDialog.applyToAll}
+                onChange={(e) => setUploadConflictDialog((current) => current ? { ...current, applyToAll: e.target.checked } : current)}
+              />
+              对后续冲突使用相同处理方式
+            </label>
+            <div className="dialog-actions">
+              <button className="dialog-btn" onClick={() => resolveUploadConflictDialog(null)}>取消</button>
+              <button
+                className="dialog-btn primary"
+                disabled={uploadConflictDialog.action === 'rename' && isUploadConflictRenameInvalid(uploadConflictDialog)}
+                onClick={() => {
+                  const action = uploadConflictDialog.action;
+                  const newName = uploadConflictDialog.newName.trim();
+                  resolveUploadConflictDialog(action === 'rename' ? { action, newName } : { action });
+                }}
+              >
+                确定
+              </button>
             </div>
           </div>
         </div>

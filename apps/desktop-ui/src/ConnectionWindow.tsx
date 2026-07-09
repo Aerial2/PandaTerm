@@ -80,8 +80,106 @@ export function ConnectionWindow() {
   const [isSavingConnection, setIsSavingConnection] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
+
+  // === 连接列表行拖拽：pointer-events 实现（参考 App.tsx 终端 tab 拖拽） ===
+  // 注意：早期版本用的是 HTML5 原生 `draggable` + onDragStart/onDragOver/onDrop。
+  // 在 Tauri 的 webview 中，这种原生拖拽会显示"禁止光标"且根本拖不动
+  // （和文件拖放 forbidden-cursor 是同一类 Tauri/webview 行为问题）。
+  // 因此这里改成和终端一致的 pointer-based 拖拽，自行管理拖动与放置，
+  // 不再依赖浏览器的原生 drag-and-drop。改动前请记得此坑，勿再改回 draggable。
+  const CONNECTION_DRAG_THRESHOLD = 12;
+  // targetId 存进 ref 而非仅 state：onUp 闭包读的是拖拽开始那次渲染的 dragOverId，
+  // 永远拿不到 onMove 后续更新的最新值，因此放置目标必须放在 ref 上。
+  const connectionDragRef = useRef<{ sourceId: string; startX: number; startY: number; active: boolean; targetId: string | null } | null>(null);
+  // 标记本次 pointerup 之前是否真的发生了拖拽，用于抑制随后的 onClick（避免误选中）。
+  const connectionDidDragRef = useRef(false);
+
+  // === 表头列宽拖拽（参考 App.tsx 终端面板分割线 resize 的 pointer 写法） ===
+  // 各列宽度以百分比保存在 state，拖动表头右缘手柄时调整"该列 + 右邻列"（总和不变），
+  // 配合 CSS `table-layout: fixed` 让百分比列宽严格生效。勿用 HTML5 draggable（Tauri 下禁止光标）。
+  type ConnColumnKey = 'index' | 'name' | 'host' | 'user' | 'protocol' | 'port';
+  const CONN_COLUMN_ORDER: ConnColumnKey[] = ['index', 'name', 'host', 'user', 'protocol', 'port'];
+  const CONN_COLUMN_DEFAULT_WIDTHS: Record<ConnColumnKey, number> = {
+    index: 6, name: 36, host: 19, user: 16, protocol: 10, port: 13,
+  };
+  const CONN_COLUMN_WIDTHS_KEY = 'pandaterm.connColumnWidths';
+  // 列宽属于 UI 偏好，用 localStorage 持久化，重开窗口/刷新后无需重新拖动。
+  function loadConnColumnWidths(): Record<ConnColumnKey, number> {
+    try {
+      const raw = localStorage.getItem(CONN_COLUMN_WIDTHS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<Record<ConnColumnKey, number>>;
+        const merged = { ...CONN_COLUMN_DEFAULT_WIDTHS };
+        for (const key of CONN_COLUMN_ORDER) {
+          const v = parsed[key];
+          if (typeof v === 'number' && v > 0) merged[key] = v;
+        }
+        return merged;
+      }
+    } catch {
+      // 忽略损坏的存储，回落到默认列宽
+    }
+    return { ...CONN_COLUMN_DEFAULT_WIDTHS };
+  }
+  const [connColumnWidths, setConnColumnWidths] = useState<Record<ConnColumnKey, number>>(loadConnColumnWidths);
+  // ref 持有最新列宽，供 onUp 闭包读取并写入 localStorage（避免读到过期 state）。
+  const connColumnWidthsRef = useRef(connColumnWidths);
+  const connTableRef = useRef<HTMLTableElement | null>(null);
+  const connColDragRef = useRef<{ col: ConnColumnKey; startX: number; start: Record<ConnColumnKey, number> } | null>(null);
+
+  function startConnColResize(col: ConnColumnKey, event: React.PointerEvent) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    connColDragRef.current = { col, startX: event.clientX, start: { ...connColumnWidths } };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+
+    const onMove = (moveEvent: globalThis.PointerEvent) => {
+      const drag = connColDragRef.current;
+      const tableEl = connTableRef.current;
+      if (!drag || !tableEl) return;
+      const tableWidth = tableEl.getBoundingClientRect().width;
+      if (tableWidth <= 0) return;
+      const deltaPct = ((moveEvent.clientX - drag.startX) / tableWidth) * 100;
+      const idx = CONN_COLUMN_ORDER.indexOf(drag.col);
+      const rightCol = CONN_COLUMN_ORDER[idx + 1];
+      const MIN = 4;
+      setConnColumnWidths((prev) => {
+        const next = { ...prev };
+        let left = drag.start[drag.col] + deltaPct;
+        if (rightCol) {
+          const startTotal = drag.start[drag.col] + drag.start[rightCol];
+          let right = drag.start[rightCol] - deltaPct;
+          if (left < MIN && right > MIN) { left = MIN; right = startTotal - MIN; }
+          else if (right < MIN && left > MIN) { right = MIN; left = startTotal - MIN; }
+          else if (left < MIN && right < MIN) { left = MIN; right = MIN; }
+          next[rightCol] = right;
+        }
+        if (left < MIN) left = MIN;
+        next[drag.col] = left;
+        connColumnWidthsRef.current = next;
+        return next;
+      });
+    };
+
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      connColDragRef.current = null;
+      // 松手时一次性持久化最新列宽（拖动中已同步到 ref），重开后仍能恢复。
+      try {
+        localStorage.setItem(CONN_COLUMN_WIDTHS_KEY, JSON.stringify(connColumnWidthsRef.current));
+      } catch {
+        // 忽略存储失败（如隐私模式）
+      }
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
 
   useEffect(() => {
     void refreshSessions();
@@ -324,6 +422,58 @@ export function ConnectionWindow() {
     }
   }
 
+  // 基于 pointer events 的连接行拖拽（参考 App.tsx 终端拖拽写法）。
+  // 启动前若处于搜索过滤状态则禁用排序（行顺序已与全量列表不一致）。
+  function startConnectionRowDrag(session: Session, event: React.PointerEvent) {
+    if (connectionSearchQuery) return;
+    if (event.button !== 0) return;
+
+    connectionDragRef.current = { sourceId: session.id, startX: event.clientX, startY: event.clientY, active: false, targetId: null };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+
+    const onMove = (moveEvent: globalThis.PointerEvent) => {
+      const drag = connectionDragRef.current;
+      if (!drag) return;
+      const distance = Math.hypot(moveEvent.clientX - drag.startX, moveEvent.clientY - drag.startY);
+      // 未超过阈值前不激活，保证普通点击/双击不受影响。
+      if (!drag.active && distance < CONNECTION_DRAG_THRESHOLD) return;
+      if (!drag.active) {
+        drag.active = true;
+        setDraggingId(drag.sourceId);
+        document.body.classList.add('connection-reordering');
+      }
+      // 通过坐标命中当前悬停的行，作为放置目标。同时写入 ref（供 onUp 读取最新值）。
+      const el = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY);
+      const row = el?.closest('[data-conn-row]') as HTMLElement | null;
+      const targetId = row?.dataset.connRow ?? null;
+      drag.targetId = targetId !== drag.sourceId ? targetId : null;
+      setDragOverId(drag.targetId);
+    };
+
+    const onUp = () => {
+      const drag = connectionDragRef.current;
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      document.body.classList.remove('connection-reordering');
+      if (drag?.active) {
+        // 标记发生了拖拽，抑制接踵而至的 onClick，避免误选中。
+        connectionDidDragRef.current = true;
+        setTimeout(() => { connectionDidDragRef.current = false; }, 0);
+        // 注意：必须从 ref 读 targetId，闭包里的 dragOverId 是旧渲染值（恒为 null）。
+        const target = drag.targetId;
+        setDraggingId(null);
+        setDragOverId(null);
+        if (target && target !== drag.sourceId) {
+          void handleReorderSessions(drag.sourceId, target);
+        }
+      }
+      connectionDragRef.current = null;
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
+
   async function emitConnectSession(session: Session) {
     try {
       const { emit } = await import('@tauri-apps/api/event');
@@ -417,42 +567,48 @@ export function ConnectionWindow() {
               </div>
 
               {filteredSessions.length > 0 ? (
-                <table className="connection-table">
+                <table className="connection-table" ref={connTableRef}>
                   <thead>
                     <tr>
-                      <th className="conn-th-index">#</th>
-                      <th className="conn-th-name">名称</th>
-                      <th className="conn-th-host">主机</th>
-                      <th className="conn-th-user">用户名</th>
-                      <th className="conn-th-protocol">协议</th>
-                      <th className="conn-th-port">端口</th>
+                      <th className="conn-th-index" style={{ width: `${connColumnWidths.index}%` }}>
+                        #
+                        <span className="conn-col-resizer" onPointerDown={(e) => startConnColResize('index', e)} />
+                      </th>
+                      <th className="conn-th-name" style={{ width: `${connColumnWidths.name}%` }}>
+                        名称
+                        <span className="conn-col-resizer" onPointerDown={(e) => startConnColResize('name', e)} />
+                      </th>
+                      <th className="conn-th-host" style={{ width: `${connColumnWidths.host}%` }}>
+                        主机
+                        <span className="conn-col-resizer" onPointerDown={(e) => startConnColResize('host', e)} />
+                      </th>
+                      <th className="conn-th-user" style={{ width: `${connColumnWidths.user}%` }}>
+                        用户名
+                        <span className="conn-col-resizer" onPointerDown={(e) => startConnColResize('user', e)} />
+                      </th>
+                      <th className="conn-th-protocol" style={{ width: `${connColumnWidths.protocol}%` }}>
+                        协议
+                        <span className="conn-col-resizer" onPointerDown={(e) => startConnColResize('protocol', e)} />
+                      </th>
+                      <th className="conn-th-port" style={{ width: `${connColumnWidths.port}%` }}>
+                        端口
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
                     {filteredSessions.map((session, rowIndex) => (
                       <tr
                         key={session.id}
-                        className={`connection-row${selectedSessionId === session.id ? ' selected' : ''}${draggingId === session.id ? ' dragging' : ''}`}
-                        draggable={!connectionSearchQuery}
-                        onClick={() => setSelectedSessionId(session.id)}
+                        data-conn-row={session.id}
+                        className={`connection-row${selectedSessionId === session.id ? ' selected' : ''}${draggingId === session.id ? ' dragging' : ''}${dragOverId === session.id ? ' drop-target' : ''}`}
+                        onClick={(event) => {
+                          // 若刚刚发生过拖拽，则吞掉这次点击，避免误选中目标行。
+                          if (connectionDidDragRef.current) return;
+                          setSelectedSessionId(session.id);
+                        }}
                         onDoubleClick={() => void emitConnectSession(session)}
                         onContextMenu={(e) => handleRowContextMenu(e, session)}
-                        onDragStart={(e) => {
-                          e.dataTransfer.setData('text/plain', session.id);
-                          e.dataTransfer.effectAllowed = 'move';
-                          setDraggingId(session.id);
-                        }}
-                        onDragOver={(e) => {
-                          if (connectionSearchQuery) return;
-                          e.preventDefault();
-                          e.dataTransfer.dropEffect = 'move';
-                        }}
-                        onDrop={(e) => {
-                          e.preventDefault();
-                          const sourceId = e.dataTransfer.getData('text/plain');
-                          void handleReorderSessions(sourceId, session.id);
-                        }}
-                        onDragEnd={() => setDraggingId(null)}
+                        onPointerDown={(event) => startConnectionRowDrag(session, event)}
                       >
                         <td className="conn-td-index">{rowIndex + 1}</td>
                         <td className="conn-td-name">{session.name}</td>

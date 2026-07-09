@@ -55,6 +55,7 @@ struct RemoteTerminalSession {
     control: mpsc::Sender<RemoteTerminalCommand>,
     closed: Arc<AtomicBool>,
     handle: SharedRemoteHandle,
+    session: Session,
 }
 
 enum RemoteTerminalCommand {
@@ -541,6 +542,8 @@ async fn connect_russh_session(
     let config = Arc::new(russh::client::Config {
         keepalive_interval: Some(Duration::from_secs(15)),
         keepalive_max: 3,
+        window_size: 16 * 1024 * 1024,
+        channel_buffer_size: 1024,
         ..russh::client::Config::default()
     });
     let handler = SshHandler;
@@ -599,10 +602,27 @@ async fn connect_russh_session(
     Ok(handle)
 }
 
+async fn connect_russh_transfer_session(
+    app: &AppHandle,
+    terminal_id: Uuid,
+    state: &AppState,
+) -> Result<SharedRemoteHandle, String> {
+    let session = {
+        let terminals = state.remote_terminals.lock().await;
+        terminals
+            .get(&terminal_id)
+            .map(|remote| remote.session.clone())
+            .ok_or_else(|| format!("terminal is not connected: {terminal_id}"))?
+    };
+    let transfer_terminal_id = format!("{terminal_id}:transfer");
+    let handle = connect_russh_session(app, &transfer_terminal_id, &session).await?;
+    Ok(Arc::new(handle))
+}
+
 async fn spawn_russh_terminal(
     app: AppHandle,
     terminal_id: String,
-    _session: Session,
+    session: Session,
     handle: russh::client::Handle<SshHandler>,
 ) -> Result<RemoteTerminalSession, String> {
     emit_remote_log(&app, &terminal_id, "Opening channel...");
@@ -700,6 +720,7 @@ async fn spawn_russh_terminal(
         control: tx,
         closed,
         handle: shared_handle,
+        session,
     })
 }
 
@@ -1227,99 +1248,30 @@ async fn read_remote_file_full(
 /// 写入循环与等待退出发在同一个任务里。russh 的 `data()` 在窗口满时会 await，
 /// 窗口调整帧由底层连接的后台事件循环自动处理，无需用户侧 `wait()` 驱动。
 /// 写完所有 chunk 后发 EOF，再循环 `wait()` 等待远端 `cat` 退出。
-async fn write_remote_file_content(
+async fn write_remote_file_chunk(
     handle: &russh::client::Handle<SshHandler>,
     path: &str,
-    content: &[u8],
-    app: &AppHandle,
-    transfer_id: &str,
-) -> Result<(), String> {
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
-    let quoted = shell_quote(path);
-    channel
-        .exec(true, format!("cat > {quoted}"))
-        .await
-        .map_err(|error| format!("SSH exec 失败：{error}"))?;
-    // Write in chunks to respect channel window limits.
-    let total = content.len();
-    let mut transferred: usize = 0;
-    for chunk in content.chunks(32768) {
-        channel
-            .data(chunk)
-            .await
-            .map_err(|error| format!("SSH 数据写入失败：{error}"))?;
-        transferred += chunk.len();
-        let _ = app.emit("upload-progress", serde_json::json!({
-            "transfer_id": transfer_id,
-            "transferred": transferred,
-            "total": total,
-        }));
-    }
-    channel
-        .eof()
-        .await
-        .map_err(|error| format!("SSH eof 失败：{error}"))?;
-    // Wait for the remote command to finish — must see ExitStatus and Close
-    // to ensure all data was written to disk.
-    let mut exit_code: i32 = 0;
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::ExitStatus { exit_status }) => {
-                exit_code = exit_status as i32;
-            }
-            Some(ChannelMsg::Eof) => {}
-            Some(ChannelMsg::Close) | None => break,
-            _ => {}
-        }
-    }
-    let _ = channel.close().await;
-    if exit_code != 0 {
-        return Err(format!("远程写入失败，退出码: {exit_code}"));
-    }
-    Ok(())
-}
-
-/// Stream a local file to a remote path through `cat > path` over a single SSH
-/// exec channel. Shared by `upload_local_file` and `upload_directory` so the
-/// (expensive) channel-open + exec + eof + wait round trips happen once per
-/// file. No separate size re-verification: `cat` exiting 0 already guarantees
-/// the bytes we sent were written to disk, so an extra `stat` round trip would
-/// only add latency for no real benefit.
-async fn stream_upload_file(
-    handle: &russh::client::Handle<SshHandler>,
-    local_path: &Path,
-    remote_path: &str,
-    transfer_id: &str,
-    app: &AppHandle,
+    chunk: &[u8],
+    append: bool,
 ) -> Result<(), String> {
     let channel = handle
         .channel_open_session()
         .await
         .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
-    let quoted = shell_quote(remote_path);
+    let quoted = shell_quote(path);
+    let operator = if append { ">>" } else { ">" };
     channel
-        .exec(true, format!("cat > {quoted}"))
+        .exec(true, format!("cat {operator} {quoted}"))
         .await
         .map_err(|error| format!("SSH exec 失败：{error}"))?;
 
-    // Split into read/write halves and keep draining the server->client
-    // direction *while* we upload. Otherwise a talkative/verbose remote command
-    // fills the SSH output window and OpenSSH deadlocks the whole channel — it
-    // stops advertising input WINDOW_ADJUST, so our writes hang at the ~2 MB
-    // initial window (exactly what happens with large files). The reader just
-    // discards output and captures the remote exit code.
     let (mut reader, writer) = channel.split();
     let exit_code = std::sync::Arc::new(tokio::sync::Mutex::new(0i32));
     let exit_code_tx = std::sync::Arc::clone(&exit_code);
     let read_task = tokio::spawn(async move {
         while let Some(msg) = reader.wait().await {
             match msg {
-                russh::ChannelMsg::Data { .. } | russh::ChannelMsg::ExtendedData { .. } => {
-                    // Discard server output to keep the output window flowing.
-                }
+                russh::ChannelMsg::Data { .. } | russh::ChannelMsg::ExtendedData { .. } => {}
                 russh::ChannelMsg::ExitStatus { exit_status } => {
                     *exit_code_tx.lock().await = exit_status as i32;
                 }
@@ -1328,6 +1280,71 @@ async fn stream_upload_file(
             }
         }
     });
+
+    for part in chunk.chunks(32768) {
+        writer
+            .data(part)
+            .await
+            .map_err(|error| format!("SSH 数据写入失败：{error}"))?;
+    }
+    writer
+        .eof()
+        .await
+        .map_err(|error| format!("SSH eof 失败：{error}"))?;
+    let _ = writer.close().await;
+    let _ = read_task.await;
+
+    let exit_code = *exit_code.lock().await;
+    if exit_code != 0 {
+        return Err(format!("远程写入失败，退出码: {exit_code}"));
+    }
+    Ok(())
+}
+
+async fn write_remote_file_content(
+    handle: &russh::client::Handle<SshHandler>,
+    path: &str,
+    content: &[u8],
+    app: &AppHandle,
+    transfer_id: &str,
+) -> Result<(), String> {
+    const REMOTE_WRITE_SLICE_SIZE: usize = 1024 * 1024;
+
+    let total = content.len();
+    if total == 0 {
+        write_remote_file_chunk(handle, path, &[], false).await?;
+        let _ = app.emit("upload-progress", serde_json::json!({
+            "transfer_id": transfer_id,
+            "transferred": 0,
+            "total": 0,
+        }));
+        return Ok(());
+    }
+
+    let mut transferred: usize = 0;
+    for (index, chunk) in content.chunks(REMOTE_WRITE_SLICE_SIZE).enumerate() {
+        write_remote_file_chunk(handle, path, chunk, index > 0).await?;
+        transferred += chunk.len();
+        let _ = app.emit("upload-progress", serde_json::json!({
+            "transfer_id": transfer_id,
+            "transferred": transferred,
+            "total": total,
+        }));
+    }
+    Ok(())
+}
+
+/// Stream a local file to a remote path through bounded SSH exec slices.
+/// Each slice stays below the common 2MB remote channel window, so uploads do
+/// not depend on long-lived stdin WINDOW_ADJUST behavior from the server.
+async fn stream_upload_file(
+    handle: &russh::client::Handle<SshHandler>,
+    local_path: &Path,
+    remote_path: &str,
+    transfer_id: &str,
+    app: &AppHandle,
+) -> Result<(), String> {
+    const REMOTE_WRITE_SLICE_SIZE: usize = 1024 * 1024;
 
     use tokio::io::AsyncReadExt;
     let mut file = tokio::fs::File::open(local_path)
@@ -1338,9 +1355,19 @@ async fn stream_upload_file(
         .map_err(|e| format!("读取文件信息失败：{e}"))?
         .len() as usize;
 
-    let chunk_size: usize = 32768;
-    let mut buffer = vec![0u8; chunk_size];
+    if total == 0 {
+        write_remote_file_chunk(handle, remote_path, &[], false).await?;
+        let _ = app.emit("upload-progress", serde_json::json!({
+            "transfer_id": transfer_id,
+            "transferred": 0,
+            "total": 0,
+        }));
+        return Ok(());
+    }
+
+    let mut buffer = vec![0u8; REMOTE_WRITE_SLICE_SIZE];
     let mut transferred: usize = 0;
+    let mut slice_index: usize = 0;
 
     loop {
         let n = file
@@ -1350,11 +1377,10 @@ async fn stream_upload_file(
         if n == 0 {
             break;
         }
-        writer
-            .data(&buffer[..n])
-            .await
-            .map_err(|error| format!("SSH 数据写入失败：{error}"))?;
+
+        write_remote_file_chunk(handle, remote_path, &buffer[..n], slice_index > 0).await?;
         transferred += n;
+        slice_index += 1;
         let _ = app.emit(
             "upload-progress",
             serde_json::json!({
@@ -1363,20 +1389,6 @@ async fn stream_upload_file(
                 "total": total,
             }),
         );
-    }
-
-    drop(file);
-    writer
-        .eof()
-        .await
-        .map_err(|error| format!("SSH eof 失败：{error}"))?;
-    let _ = writer.close().await;
-
-    // Wait for the reader task to observe the channel close and record the exit code.
-    let _ = read_task.await;
-    let exit_code = *exit_code.lock().await;
-    if exit_code != 0 {
-        return Err(format!("远程写入失败，退出码: {exit_code}"));
     }
 
     Ok(())
@@ -1429,14 +1441,9 @@ async fn upload_file(
     };
 
     if let Some(tid) = terminal_id {
-        // Remote upload: write via SSH exec channel.
-        let handle = {
-            let terminals = state.remote_terminals.lock().await;
-            terminals
-                .get(&tid)
-                .map(|session| Arc::clone(&session.handle))
-                .ok_or_else(|| format!("terminal is not connected: {tid}"))?
-        };
+        // Remote upload uses a dedicated SSH connection so transfer exec
+        // channels cannot close or starve the interactive terminal channel.
+        let handle = connect_russh_transfer_session(&app, tid, &**state).await?;
         write_remote_file_content(&handle, &dest_path, &content, &app, &transfer_id).await?;
     } else {
         // Local upload: write bytes directly.
@@ -1460,22 +1467,24 @@ async fn upload_local_file(
     local_path: String,
     dest_dir: String,
     transfer_id: String,
+    remote_name: Option<String>,
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let handle = {
-        let terminals = state.remote_terminals.lock().await;
-        terminals
-            .get(&terminal_id)
-            .map(|session| Arc::clone(&session.handle))
-            .ok_or_else(|| format!("terminal is not connected: {terminal_id}"))?
-    };
+    let handle = connect_russh_transfer_session(&app, terminal_id, &**state).await?;
 
     let local = PathBuf::from(&local_path);
-    let file_name = local
+    let local_file_name = local
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .ok_or_else(|| "无法解析文件名".to_string())?;
+    let file_name = remote_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(local_file_name);
+
+    if file_name.contains('/') || file_name.contains('\\') {
+        return Err("远程文件名不能包含路径分隔符".to_string());
+    }
 
     let metadata = tokio::fs::metadata(&local)
         .await
@@ -1548,13 +1557,7 @@ async fn upload_directory(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    let handle = {
-        let terminals = state.remote_terminals.lock().await;
-        terminals
-            .get(&terminal_id)
-            .map(|session| Arc::clone(&session.handle))
-            .ok_or_else(|| format!("terminal is not connected: {terminal_id}"))?
-    };
+    let handle = connect_russh_transfer_session(&app, terminal_id, &**state).await?;
 
     let local_root = PathBuf::from(&local_dir);
     let dir_name = local_root
@@ -1622,7 +1625,9 @@ async fn upload_directory(
     // SSH channels. Each file reuses `stream_upload_file` (one channel-open +
     // exec + eof + wait per file); concurrency overlaps the latency so that N
     // small files don't each pay a full round-trip sequentially.
-    let concurrency = recommended_upload_concurrency(&**state);
+    // Keep one exec channel active on the transfer connection for compatibility
+    // with servers configured with MaxSessions=1 or strict channel policies.
+    let concurrency = 1;
     let semaphore = std::sync::Arc::new(Semaphore::new(concurrency));
     let mut tasks = Vec::with_capacity(file_jobs.len());
 

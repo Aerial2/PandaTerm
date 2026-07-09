@@ -264,12 +264,19 @@ export async function uploadFile(fileName: string, content: Uint8Array, destDir:
 /// the file in chunks and pipes it through SSH, so we avoid base64-encoding
 /// large files on the JS side (which blocks the UI and freezes progress).
 /// Only works for remote uploads (requires a connected terminalId).
-export async function uploadLocalFile(localPath: string, destDir: string, transferId: string, terminalId: string): Promise<string> {
+export async function uploadLocalFile(
+  localPath: string,
+  destDir: string,
+  transferId: string,
+  terminalId: string,
+  remoteName?: string,
+): Promise<string> {
   return await invoke<string>('upload_local_file', {
     terminalId,
     localPath,
     destDir,
     transferId,
+    remoteName: remoteName ?? null,
   });
 }
 
