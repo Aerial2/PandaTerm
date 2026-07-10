@@ -13,6 +13,7 @@ tauri-build = { version = "2.2.0", features = [] }
 
 [dependencies]
 panda-core = { path = "../crates/panda-core" }
+panda-crypto = { path = "../crates/panda-crypto" }
 panda-session = { path = "../crates/panda-session" }
 panda-transfer = { path = "../crates/panda-transfer" }
 serde.workspace = true
@@ -26,3 +27,6 @@ encoding_rs = "0.8.35"
 portable-pty = "0.9.0"
 russh = "0.51"
 sysinfo = "0.33"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

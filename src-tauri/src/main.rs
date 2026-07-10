@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use encoding_rs::GBK;
 use panda_core::{TerminalEvent, TerminalEventKind};
+use panda_crypto::{protect_secret, unprotect_secret, ProtectedSecret, ProtectionMode, SecretError};
 use panda_session::{AuthType, ReconnectPolicy, Session, SessionCatalog};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use russh::ChannelMsg;
@@ -38,6 +39,7 @@ struct TransferCancellationEntry {
 
 struct AppState {
     sessions: Mutex<SessionCatalog>,
+    credentials: Mutex<CredentialVaultState>,
     local_terminals: Mutex<HashMap<Uuid, LocalTerminalSession>>,
     remote_terminals: Mutex<HashMap<Uuid, RemoteTerminalSession>>,
     /// Reused SSH handles for file transfer (keyed by interactive terminal id).
@@ -65,13 +67,64 @@ struct RemoteTerminalSession {
     closed: Arc<AtomicBool>,
     close_notification: Arc<Notify>,
     handle: SharedRemoteHandle,
-    session: Session,
+    session_id: Uuid,
 }
 
 enum RemoteTerminalCommand {
     Write(String),
     Resize { cols: u16, rows: u16 },
     Close,
+}
+
+const CREDENTIAL_VAULT_VERSION: u8 = 1;
+const CREDENTIAL_ID_PREFIX: &str = "credential:";
+const CREDENTIAL_VERIFIER_CONTEXT: &str = "pandaterm:credential-verifier";
+const CREDENTIAL_VERIFIER_VALUE: &str = "pandaterm-master-password-verifier-v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CredentialVault {
+    version: u8,
+    mode: ProtectionMode,
+    verifier: Option<ProtectedSecret>,
+    entries: HashMap<String, ProtectedSecret>,
+}
+
+impl Default for CredentialVault {
+    fn default() -> Self {
+        Self {
+            version: CREDENTIAL_VAULT_VERSION,
+            mode: ProtectionMode::Dpapi,
+            verifier: None,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+struct CredentialVaultState {
+    vault: CredentialVault,
+    master_password: Option<String>,
+    load_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CredentialStatus {
+    mode: ProtectionMode,
+    locked: bool,
+    credential_count: usize,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CredentialProtectionRequest {
+    mode: ProtectionMode,
+    master_password: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SaveSessionRequest {
+    session: Session,
+    secret: Option<String>,
+    passphrase: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,7 +333,173 @@ fn known_hosts_path() -> Result<PathBuf, String> {
     Ok(pandaterm_data_dir()?.join("known_hosts.json"))
 }
 
-/// Local obfuscation for secrets at rest (not a full KMS; better than plaintext JSON).
+fn credential_vault_path() -> Result<PathBuf, String> {
+    Ok(pandaterm_data_dir()?.join("credentials.json"))
+}
+
+fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("无法定位文件目录：{}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|error| format!("目录创建失败：{error}"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pandaterm-data");
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("临时文件创建失败：{error}"))?;
+        file.write_all(content.as_bytes())
+            .map_err(|error| format!("临时文件写入失败：{error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("临时文件同步失败：{error}"))?;
+        drop(file);
+        replace_file(&temporary, path)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let succeeded = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if succeeded == 0 {
+        Err(format!("原子替换失败：{}", std::io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::rename(source, destination).map_err(|error| format!("原子替换失败：{error}"))
+}
+
+fn credential_context(id: &str) -> String {
+    format!("pandaterm:credential:{id}")
+}
+
+fn credential_id(session_id: Uuid, kind: &str) -> String {
+    format!("{CREDENTIAL_ID_PREFIX}{session_id}:{kind}")
+}
+
+fn is_credential_id(value: &str) -> bool {
+    value.starts_with(CREDENTIAL_ID_PREFIX)
+}
+
+fn load_credential_vault() -> Result<CredentialVault, String> {
+    let path = credential_vault_path()?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CredentialVault::default());
+        }
+        Err(error) => return Err(format!("凭据仓库读取失败：{error}")),
+    };
+    let vault: CredentialVault = serde_json::from_str(&content)
+        .map_err(|error| format!("凭据仓库已损坏，已拒绝覆盖原文件：{error}"))?;
+    if vault.version != CREDENTIAL_VAULT_VERSION {
+        return Err(format!("不支持的凭据仓库版本：{}", vault.version));
+    }
+    Ok(vault)
+}
+
+fn save_credential_vault(vault: &CredentialVault) -> Result<(), String> {
+    let path = credential_vault_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("凭据目录创建失败：{error}"))?;
+    }
+    let content = serde_json::to_string_pretty(vault)
+        .map_err(|error| format!("凭据序列化失败：{error}"))?;
+    atomic_write_text(&path, &content).map_err(|error| format!("凭据保存失败：{error}"))
+}
+
+fn ensure_vault_available(state: &CredentialVaultState) -> Result<(), String> {
+    match &state.load_error {
+        Some(error) => Err(error.clone()),
+        None => Ok(()),
+    }
+}
+
+fn credential_status_snapshot(state: &CredentialVaultState) -> CredentialStatus {
+    CredentialStatus {
+        mode: state.vault.mode,
+        locked: state.load_error.is_some()
+            || (state.vault.mode == ProtectionMode::MasterPassword
+                && state.master_password.is_none()),
+        credential_count: state.vault.entries.len(),
+        error: state.load_error.clone(),
+    }
+}
+
+fn vault_master_password(state: &CredentialVaultState) -> Result<Option<&str>, String> {
+    ensure_vault_available(state)?;
+    match state.vault.mode {
+        ProtectionMode::Dpapi => Ok(None),
+        ProtectionMode::MasterPassword => state
+            .master_password
+            .as_deref()
+            .map(Some)
+            .ok_or_else(|| "凭据仓库已锁定，请先输入 Master Password 解锁".to_string()),
+    }
+}
+
+fn resolve_credential(state: &CredentialVaultState, id: &str) -> Result<String, String> {
+    let protected = state
+        .vault
+        .entries
+        .get(id)
+        .ok_or_else(|| format!("未找到连接凭据：{id}"))?;
+    unprotect_secret(protected, vault_master_password(state)?, &credential_context(id))
+        .map_err(|error| format!("凭据解密失败：{error}"))
+}
+
+fn store_credential(
+    state: &mut CredentialVaultState,
+    id: String,
+    plaintext: &str,
+) -> Result<String, String> {
+    let protected = protect_secret(
+        plaintext,
+        state.vault.mode,
+        vault_master_password(state)?,
+        &credential_context(&id),
+    )
+    .map_err(|error| format!("凭据加密失败：{error}"))?;
+    state.vault.entries.insert(id.clone(), protected);
+    Ok(id)
+}
+
+/// Legacy local obfuscation retained only for one-time migration of pterm1 data.
 const SECRET_PREFIX: &str = "pterm1:";
 
 fn secret_obfuscation_key() -> [u8; 32] {
@@ -306,18 +525,6 @@ fn secret_obfuscation_key() -> [u8; 32] {
     key
 }
 
-fn obfuscate_secret(plain: &str) -> String {
-    if plain.is_empty() || plain.starts_with(SECRET_PREFIX) {
-        return plain.to_string();
-    }
-    let key = secret_obfuscation_key();
-    let mut out = Vec::with_capacity(plain.len());
-    for (i, b) in plain.as_bytes().iter().enumerate() {
-        out.push(b ^ key[i % 32] ^ ((i as u8).wrapping_mul(31)));
-    }
-    format!("{SECRET_PREFIX}{}", base64_encode(&out))
-}
-
 fn deobfuscate_secret(stored: &str) -> String {
     let Some(rest) = stored.strip_prefix(SECRET_PREFIX) else {
         return stored.to_string();
@@ -331,40 +538,6 @@ fn deobfuscate_secret(stored: &str) -> String {
         out.push(b ^ key[i % 32] ^ ((i as u8).wrapping_mul(31)));
     }
     String::from_utf8(out).unwrap_or_else(|_| stored.to_string())
-}
-
-fn protect_session_secrets(session: &mut Session, protect: bool) {
-    match &mut session.auth {
-        AuthType::Password { secret_id } => {
-            *secret_id = if protect {
-                obfuscate_secret(secret_id)
-            } else {
-                deobfuscate_secret(secret_id)
-            };
-        }
-        AuthType::KeyboardInteractive {
-            response_secret_id,
-        } => {
-            *response_secret_id = if protect {
-                obfuscate_secret(response_secret_id)
-            } else {
-                deobfuscate_secret(response_secret_id)
-            };
-        }
-        AuthType::PrivateKey {
-            passphrase_secret_id,
-            ..
-        } => {
-            if let Some(pass) = passphrase_secret_id.as_mut() {
-                *pass = if protect {
-                    obfuscate_secret(pass)
-                } else {
-                    deobfuscate_secret(pass)
-                };
-            }
-        }
-        AuthType::Agent | AuthType::Gssapi { .. } => {}
-    }
 }
 
 fn load_known_hosts() -> HashMap<String, String> {
@@ -425,11 +598,7 @@ fn load_persistent_sessions() -> Vec<Session> {
         return Vec::new();
     };
 
-    let mut sessions = serde_json::from_str::<Vec<Session>>(&content).unwrap_or_default();
-    for session in &mut sessions {
-        protect_session_secrets(session, false);
-    }
-    sessions
+    serde_json::from_str::<Vec<Session>>(&content).unwrap_or_default()
 }
 
 fn save_persistent_sessions(sessions: &[Session]) -> Result<(), String> {
@@ -438,18 +607,10 @@ fn save_persistent_sessions(sessions: &[Session]) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|error| format!("连接配置目录创建失败：{error}"))?;
     }
 
-    let protected: Vec<Session> = sessions
-        .iter()
-        .map(|session| {
-            let mut clone = session.clone();
-            protect_session_secrets(&mut clone, true);
-            clone
-        })
-        .collect();
-
-    let content = serde_json::to_string_pretty(&protected)
+    let content = serde_json::to_string_pretty(sessions)
         .map_err(|error| format!("连接配置序列化失败：{error}"))?;
-    fs::write(&path, content).map_err(|error| format!("连接配置保存失败：{error}"))
+    atomic_write_text(&path, &content)
+        .map_err(|error| format!("连接配置保存失败：{error}"))
 }
 
 fn same_session_identity(left: &Session, right: &Session) -> bool {
@@ -476,6 +637,101 @@ fn load_initial_sessions() -> Vec<Session> {
     // survives restarts. Newly imported Xshell sessions are already sorted by
     // name inside load_xshell_sessions and simply appended above.
     sessions
+}
+
+fn migrate_legacy_credentials(
+    sessions: &mut [Session],
+    credentials: &mut CredentialVaultState,
+) -> Result<bool, String> {
+    let mut changed = false;
+    for session in sessions {
+        let candidate = match &mut session.auth {
+            AuthType::Password { secret_id } => Some((secret_id, "password")),
+            AuthType::KeyboardInteractive { response_secret_id } => {
+                Some((response_secret_id, "keyboard-interactive"))
+            }
+            AuthType::PrivateKey {
+                passphrase_secret_id: Some(passphrase),
+                ..
+            } => Some((passphrase, "private-key-passphrase")),
+            AuthType::PrivateKey {
+                passphrase_secret_id: None,
+                ..
+            }
+            | AuthType::Agent
+            | AuthType::Gssapi { .. } => None,
+        };
+
+        let Some((value, kind)) = candidate else {
+            continue;
+        };
+        if value.is_empty() || is_credential_id(value) {
+            continue;
+        }
+
+        let plaintext = deobfuscate_secret(value);
+        let id = credential_id(session.id, kind);
+        *value = store_credential(credentials, id, &plaintext)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn load_secure_state() -> (Vec<Session>, CredentialVaultState) {
+    let mut sessions = load_initial_sessions();
+    let (vault, load_error) = match load_credential_vault() {
+        Ok(vault) => (vault, None),
+        Err(error) => {
+            eprintln!("[Credential] {error}");
+            (CredentialVault::default(), Some(error))
+        }
+    };
+    let mut credentials = CredentialVaultState {
+        vault,
+        master_password: None,
+        load_error,
+    };
+
+    if credentials.load_error.is_none() {
+        match migrate_legacy_credentials(&mut sessions, &mut credentials) {
+            Ok(true) => {
+                if let Err(error) = save_credential_vault(&credentials.vault)
+                    .and_then(|_| save_persistent_sessions(&sessions))
+                {
+                    eprintln!("[Credential] automatic migration failed: {error}");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("[Credential] automatic migration failed: {error}"),
+        }
+    }
+
+    (sessions, credentials)
+}
+
+fn resolved_session(session: &Session, credentials: &CredentialVaultState) -> Result<Session, String> {
+    let mut resolved = session.clone();
+    match &mut resolved.auth {
+        AuthType::Password { secret_id } => {
+            *secret_id = resolve_credential(credentials, secret_id)?;
+        }
+        AuthType::KeyboardInteractive { response_secret_id } => {
+            *response_secret_id = resolve_credential(credentials, response_secret_id)?;
+        }
+        AuthType::PrivateKey {
+            passphrase_secret_id: Some(passphrase),
+            ..
+        } => {
+            *passphrase = resolve_credential(credentials, passphrase)?;
+        }
+        AuthType::PrivateKey {
+            passphrase_secret_id: None,
+            ..
+        }
+        | AuthType::Agent
+        | AuthType::Gssapi { .. } => {}
+    }
+    Ok(resolved)
 }
 
 fn local_terminal_profile() -> LocalTerminalProfile {
@@ -825,16 +1081,41 @@ async fn connect_russh_transfer_session(
         }
     }
 
-    let session = {
+    let stored_session_id = {
         let terminals = state.remote_terminals.lock().await;
         terminals
             .get(&terminal_id)
-            .map(|remote| remote.session.clone())
+            .map(|remote| remote.session_id)
             .ok_or_else(|| format!("terminal is not connected: {terminal_id}"))?
+    };
+    let stored_session = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .all()
+            .iter()
+            .find(|session| session.id == stored_session_id)
+            .cloned()
+            .ok_or_else(|| format!("session not found: {stored_session_id}"))?
+    };
+    let resolved = {
+        let credentials = state.credentials.lock().await;
+        resolved_session(&stored_session, &credentials)
+    };
+    let session = match resolved {
+        Ok(session) => session,
+        Err(error) => {
+            emit_remote_log(
+                app,
+                &format!("{terminal_id}:transfer"),
+                format!("Credential unavailable ({error}); using interactive connection"),
+            );
+            return interactive_remote_handle(state, terminal_id).await;
+        }
     };
     let transfer_terminal_id = format!("{terminal_id}:transfer");
     match connect_russh_session(app, &transfer_terminal_id, &session).await {
         Ok(handle) => {
+            drop(session);
             let shared = Arc::new(handle);
             match exec_remote_command_full(&shared, "true").await {
                 Ok((_, _, Some(0))) => {
@@ -880,7 +1161,7 @@ async fn invalidate_transfer_handle(state: &AppState, terminal_id: Uuid) {
 async fn spawn_russh_terminal(
     app: AppHandle,
     terminal_id: String,
-    session: Session,
+    session_id: Uuid,
     handle: russh::client::Handle<SshHandler>,
 ) -> Result<RemoteTerminalSession, String> {
     emit_remote_log(&app, &terminal_id, "Opening channel...");
@@ -982,7 +1263,7 @@ async fn spawn_russh_terminal(
         closed,
         close_notification,
         handle: shared_handle,
-        session,
+        session_id,
     })
 }
 
@@ -3728,6 +4009,199 @@ async fn local_terminal_write(
     })
 }
 
+fn prepare_session_for_save(
+    request: SaveSessionRequest,
+    existing: Option<&Session>,
+    credentials: &mut CredentialVaultState,
+) -> Result<Session, String> {
+    let SaveSessionRequest {
+        mut session,
+        secret,
+        passphrase,
+    } = request;
+
+    match &mut session.auth {
+        AuthType::Password { secret_id } => {
+            let id = credential_id(session.id, "password");
+            if let Some(value) = secret.filter(|value| !value.is_empty()) {
+                *secret_id = store_credential(credentials, id, &value)?;
+            } else if let Some(AuthType::Password {
+                secret_id: existing_id,
+            }) = existing.map(|item| &item.auth)
+            {
+                *secret_id = existing_id.clone();
+            } else {
+                return Err("密码不能为空".to_string());
+            }
+        }
+        AuthType::KeyboardInteractive { response_secret_id } => {
+            let id = credential_id(session.id, "keyboard-interactive");
+            if let Some(value) = secret.filter(|value| !value.is_empty()) {
+                *response_secret_id = store_credential(credentials, id, &value)?;
+            } else if let Some(AuthType::KeyboardInteractive {
+                response_secret_id: existing_id,
+            }) = existing.map(|item| &item.auth)
+            {
+                *response_secret_id = existing_id.clone();
+            } else {
+                return Err("交互提示响应不能为空".to_string());
+            }
+        }
+        AuthType::PrivateKey {
+            passphrase_secret_id,
+            ..
+        } => {
+            let id = credential_id(session.id, "private-key-passphrase");
+            if let Some(value) = passphrase.filter(|value| !value.is_empty()) {
+                *passphrase_secret_id = Some(store_credential(credentials, id, &value)?);
+            } else if let Some(AuthType::PrivateKey {
+                passphrase_secret_id: existing_id,
+                ..
+            }) = existing.map(|item| &item.auth)
+            {
+                *passphrase_secret_id = existing_id.clone();
+            } else {
+                *passphrase_secret_id = None;
+            }
+        }
+        AuthType::Agent | AuthType::Gssapi { .. } => {}
+    }
+
+    Ok(session)
+}
+
+fn session_credential_ids(session: &Session) -> Vec<&str> {
+    match &session.auth {
+        AuthType::Password { secret_id } => vec![secret_id.as_str()],
+        AuthType::KeyboardInteractive { response_secret_id } => {
+            vec![response_secret_id.as_str()]
+        }
+        AuthType::PrivateKey {
+            passphrase_secret_id: Some(passphrase),
+            ..
+        } => vec![passphrase.as_str()],
+        AuthType::PrivateKey {
+            passphrase_secret_id: None,
+            ..
+        }
+        | AuthType::Agent
+        | AuthType::Gssapi { .. } => Vec::new(),
+    }
+}
+
+fn remove_session_credentials(vault: &mut CredentialVault, session: &Session) {
+    for id in session_credential_ids(session) {
+        vault.entries.remove(id);
+    }
+}
+
+#[tauri::command]
+async fn credential_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CredentialStatus, String> {
+    let credentials = state.credentials.lock().await;
+    Ok(credential_status_snapshot(&credentials))
+}
+
+#[tauri::command]
+async fn unlock_credentials(
+    master_password: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CredentialStatus, String> {
+    let mut credentials = state.credentials.lock().await;
+    ensure_vault_available(&credentials)?;
+    if credentials.vault.mode != ProtectionMode::MasterPassword {
+        return Err("当前凭据仓库未启用 Master Password".to_string());
+    }
+    let verifier = credentials
+        .vault
+        .verifier
+        .as_ref()
+        .ok_or_else(|| "Master Password 校验数据缺失".to_string())?;
+    let value = unprotect_secret(
+        verifier,
+        Some(&master_password),
+        CREDENTIAL_VERIFIER_CONTEXT,
+    )
+    .map_err(|error| match error {
+        SecretError::AuthenticationFailed => "Master Password 不正确".to_string(),
+        _ => format!("Master Password 校验失败：{error}"),
+    })?;
+    if value != CREDENTIAL_VERIFIER_VALUE {
+        return Err("Master Password 不正确".to_string());
+    }
+    credentials.master_password = Some(master_password);
+    Ok(credential_status_snapshot(&credentials))
+}
+
+#[tauri::command]
+async fn lock_credentials(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.credentials.lock().await.master_password = None;
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_credential_protection(
+    request: CredentialProtectionRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CredentialStatus, String> {
+    if request.mode == ProtectionMode::MasterPassword
+        && request.master_password.as_deref().unwrap_or_default().len() < 8
+    {
+        return Err("Master Password 至少需要 8 个字符".to_string());
+    }
+
+    let mut credentials = state.credentials.lock().await;
+    let current_password = vault_master_password(&credentials)?.map(ToString::to_string);
+    let plaintext_entries = credentials
+        .vault
+        .entries
+        .iter()
+        .map(|(id, protected)| {
+            unprotect_secret(protected, current_password.as_deref(), &credential_context(id))
+                .map(|plaintext| (id.clone(), plaintext))
+                .map_err(|error| format!("凭据迁移解密失败：{error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let next_password = match request.mode {
+        ProtectionMode::Dpapi => None,
+        ProtectionMode::MasterPassword => request.master_password,
+    };
+    let mut next_vault = CredentialVault {
+        version: CREDENTIAL_VAULT_VERSION,
+        mode: request.mode,
+        verifier: None,
+        entries: HashMap::new(),
+    };
+    for (id, plaintext) in plaintext_entries {
+        let protected = protect_secret(
+            &plaintext,
+            request.mode,
+            next_password.as_deref(),
+            &credential_context(&id),
+        )
+        .map_err(|error| format!("凭据迁移加密失败：{error}"))?;
+        next_vault.entries.insert(id, protected);
+    }
+    if request.mode == ProtectionMode::MasterPassword {
+        next_vault.verifier = Some(
+            protect_secret(
+                CREDENTIAL_VERIFIER_VALUE,
+                ProtectionMode::MasterPassword,
+                next_password.as_deref(),
+                CREDENTIAL_VERIFIER_CONTEXT,
+            )
+            .map_err(|error| format!("Master Password 校验数据创建失败：{error}"))?,
+        );
+    }
+
+    save_credential_vault(&next_vault)?;
+    credentials.vault = next_vault;
+    credentials.master_password = next_password;
+    Ok(credential_status_snapshot(&credentials))
+}
+
 #[tauri::command]
 async fn list_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<Session>, String> {
     let sessions = state.sessions.lock().await;
@@ -3736,14 +4210,44 @@ async fn list_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<Session>, 
 
 #[tauri::command]
 async fn save_session(
-    session: Session,
+    request: SaveSessionRequest,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<Session>, String> {
     let mut sessions = state.sessions.lock().await;
+    let existing = sessions
+        .all()
+        .iter()
+        .find(|item| item.id == request.session.id)
+        .cloned();
+    let mut credentials = state.credentials.lock().await;
+    let session = prepare_session_for_save(request, existing.as_ref(), &mut credentials)?;
+    let obsolete_credentials = existing
+        .as_ref()
+        .map(|previous| {
+            let retained = session_credential_ids(&session);
+            session_credential_ids(previous)
+                .into_iter()
+                .filter(|old_id| !retained.contains(old_id))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     sessions
         .upsert(session)
         .map_err(|error| error.to_string())?;
+
+    // Commit new credentials before their references. Old credentials remain until
+    // the session file succeeds, so an interrupted cross-file update stays usable.
+    save_credential_vault(&credentials.vault)?;
     save_persistent_sessions(sessions.all())?;
+    if !obsolete_credentials.is_empty() {
+        for old_id in obsolete_credentials {
+            credentials.vault.entries.remove(&old_id);
+        }
+        if let Err(error) = save_credential_vault(&credentials.vault) {
+            eprintln!("[Credential] obsolete credential cleanup deferred: {error}");
+        }
+    }
     Ok(sessions.all().to_vec())
 }
 
@@ -3753,10 +4257,22 @@ async fn delete_session(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<Session>, String> {
     let mut sessions = state.sessions.lock().await;
+    let removed = sessions
+        .all()
+        .iter()
+        .find(|session| session.id == session_id)
+        .cloned()
+        .ok_or_else(|| format!("session not found: {session_id}"))?;
+    let mut credentials = state.credentials.lock().await;
+    ensure_vault_available(&credentials)?;
     sessions
         .remove(session_id)
         .map_err(|error| error.to_string())?;
     save_persistent_sessions(sessions.all())?;
+    remove_session_credentials(&mut credentials.vault, &removed);
+    if let Err(error) = save_credential_vault(&credentials.vault) {
+        eprintln!("[Credential] deleted session credential cleanup deferred: {error}");
+    }
     Ok(sessions.all().to_vec())
 }
 
@@ -3788,6 +4304,10 @@ async fn connect_session(
             .cloned()
             .ok_or_else(|| format!("session not found: {session_id}"))?
     };
+    let session = {
+        let credentials = state.credentials.lock().await;
+        resolved_session(&session, &credentials)?
+    };
 
     // Each connect call creates a brand-new terminal instance.
     let terminal_id = Uuid::new_v4();
@@ -3801,7 +4321,15 @@ async fn connect_session(
             return Err(error);
         }
     };
-    let remote_session = match spawn_russh_terminal(app.clone(), terminal_id_str.clone(), session.clone(), handle).await {
+    drop(session);
+    let remote_session = match spawn_russh_terminal(
+        app.clone(),
+        terminal_id_str.clone(),
+        session_id,
+        handle,
+    )
+    .await
+    {
         Ok(remote_session) => remote_session,
         Err(error) => {
             emit_remote_log(&app, &terminal_id_str, format!("FAILED {error}"));
@@ -3931,8 +4459,10 @@ fn apply_window_dark_mode(window_label: String, app: tauri::AppHandle) -> Result
 }
 
 fn main() {
+    let (sessions, credentials) = load_secure_state();
     let state = Arc::new(AppState {
-        sessions: Mutex::new(SessionCatalog::new(load_initial_sessions())),
+        sessions: Mutex::new(SessionCatalog::new(sessions)),
+        credentials: Mutex::new(credentials),
         local_terminals: Mutex::new(HashMap::new()),
         remote_terminals: Mutex::new(HashMap::new()),
         transfer_handles: Mutex::new(HashMap::new()),
@@ -3995,6 +4525,10 @@ fn main() {
             save_session,
             delete_session,
             reorder_sessions,
+            credential_status,
+            unlock_credentials,
+            lock_credentials,
+            set_credential_protection,
             connect_session,
             disconnect_session,
             terminal_write,
@@ -4093,6 +4627,25 @@ mod tests {
         assert_eq!(fs::read(&second).expect("read second download").len(), 6);
 
         fs::remove_dir_all(directory.as_ref()).expect("remove test directory");
+    }
+
+    #[test]
+    fn atomic_text_write_replaces_complete_file() {
+        let directory = std::env::temp_dir().join(format!("pandaterm-test-{}", Uuid::new_v4()));
+        let path = directory.join("credentials.json");
+
+        atomic_write_text(&path, "first").expect("write initial file");
+        atomic_write_text(&path, "second").expect("replace file");
+        assert_eq!(fs::read_to_string(&path).expect("read replaced file"), "second");
+        assert_eq!(
+            fs::read_dir(&directory)
+                .expect("read test directory")
+                .filter_map(Result::ok)
+                .count(),
+            1
+        );
+
+        fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     #[cfg(target_os = "windows")]

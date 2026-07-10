@@ -5,5 +5,13 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+aes-gcm = "0.11.0"
+argon2 = "0.5.3"
+base64 = "0.22.1"
+rand = "0.10.2"
 serde.workspace = true
 thiserror.workspace = true
+zeroize = "1.9.0"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_System_Memory"] }

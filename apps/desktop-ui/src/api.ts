@@ -185,12 +185,48 @@ export async function localTerminalWrite(data: string, cwd?: string | null): Pro
   });
 }
 
+export type CredentialProtectionMode = 'dpapi' | 'master_password';
+
+export type CredentialStatus = {
+  mode: CredentialProtectionMode;
+  locked: boolean;
+  credential_count: number;
+  error?: string | null;
+};
+
 export async function listSessions(): Promise<Session[]> {
   return await invoke<Session[]>('list_sessions');
 }
 
-export async function saveSession(session: Session): Promise<Session[]> {
-  return await invoke<Session[]>('save_session', { session });
+export async function saveSession(
+  session: Session,
+  secret?: string | null,
+  passphrase?: string | null,
+): Promise<Session[]> {
+  return await invoke<Session[]>('save_session', {
+    request: { session, secret: secret || null, passphrase: passphrase || null },
+  });
+}
+
+export async function getCredentialStatus(): Promise<CredentialStatus> {
+  return await invoke<CredentialStatus>('credential_status');
+}
+
+export async function unlockCredentials(masterPassword: string): Promise<CredentialStatus> {
+  return await invoke<CredentialStatus>('unlock_credentials', { masterPassword });
+}
+
+export async function lockCredentials(): Promise<void> {
+  await invoke('lock_credentials');
+}
+
+export async function setCredentialProtection(
+  mode: CredentialProtectionMode,
+  masterPassword?: string | null,
+): Promise<CredentialStatus> {
+  return await invoke<CredentialStatus>('set_credential_protection', {
+    request: { mode, master_password: masterPassword || null },
+  });
 }
 
 export async function deleteSession(sessionId: string): Promise<Session[]> {

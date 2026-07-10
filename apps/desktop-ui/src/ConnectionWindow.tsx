@@ -9,6 +9,8 @@ import {
   X,
   Monitor,
   Copy,
+  ShieldCheck,
+  LockKeyhole,
 } from 'lucide-react';
 import {
   listSessions,
@@ -16,8 +18,12 @@ import {
   deleteSession,
   reorderSessions,
   openConnectionWindow,
+  getCredentialStatus,
+  unlockCredentials,
+  lockCredentials,
+  setCredentialProtection,
 } from './api';
-import type { Session, AuthType } from './api';
+import type { CredentialStatus, Session, AuthType } from './api';
 import './styles.css';
 
 type ConnectionAuthMethod = 'password' | 'public_key' | 'keyboard_interactive' | 'gssapi';
@@ -78,6 +84,7 @@ export function ConnectionWindow() {
   const [connectionForm, setConnectionForm] = useState<ConnectionFormState>(initialConnectionForm);
   const [connectionFormError, setConnectionFormError] = useState('');
   const [isSavingConnection, setIsSavingConnection] = useState(false);
+  const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
@@ -183,6 +190,10 @@ export function ConnectionWindow() {
 
   useEffect(() => {
     void refreshSessions();
+    void getCredentialStatus().then((status) => {
+      setCredentialStatus(status);
+      if (status.error) setConnectionFormError(status.error);
+    }).catch(() => setCredentialStatus(null));
 
     // Listen for mode change events — only accept events intended for THIS window.
     // Each event payload should specify a target label so windows don't interfere.
@@ -274,10 +285,10 @@ export function ConnectionWindow() {
       host: session.host,
       username: session.username,
       port: String(session.port),
-      password: session.auth.type === 'password' ? session.auth.secret_id : '',
+      password: '',
       privateKeyPath: session.auth.type === 'private_key' ? session.auth.key_id : '',
-      privateKeyPassphrase: session.auth.type === 'private_key' ? (session.auth.passphrase_secret_id ?? '') : '',
-      keyboardInteractiveResponse: session.auth.type === 'keyboard_interactive' ? session.auth.response_secret_id : '',
+      privateKeyPassphrase: '',
+      keyboardInteractiveResponse: '',
       gssapiPrincipal: session.auth.type === 'gssapi' ? (session.auth.principal ?? '') : '',
     });
     setConnectionAuthMethod(
@@ -321,9 +332,12 @@ export function ConnectionWindow() {
     if (!host) return '主机地址不能为空';
     if (!username) return '用户名不能为空';
     if (!Number.isInteger(port) || port <= 0 || port > 65535) return '端口必须是 1-65535 之间的整数';
-    if (connectionAuthMethod === 'password' && !connectionForm.password.trim()) return '密码不能为空';
+    const existing = editingId ? sessions.find((session) => session.id === editingId) : undefined;
+    const keepsExistingPassword = existing?.auth.type === 'password';
+    const keepsExistingInteractive = existing?.auth.type === 'keyboard_interactive';
+    if (connectionAuthMethod === 'password' && !connectionForm.password.trim() && !keepsExistingPassword) return '密码不能为空';
     if (connectionAuthMethod === 'public_key' && !connectionForm.privateKeyPath.trim()) return '私钥路径不能为空';
-    if (connectionAuthMethod === 'keyboard_interactive' && !connectionForm.keyboardInteractiveResponse.trim()) {
+    if (connectionAuthMethod === 'keyboard_interactive' && !connectionForm.keyboardInteractiveResponse.trim() && !keepsExistingInteractive) {
       return '交互提示响应不能为空';
     }
     return null;
@@ -355,7 +369,15 @@ export function ConnectionWindow() {
     setConnectionFormError('');
 
     try {
-      const nextSessions = await saveSession(session);
+      const secret = connectionAuthMethod === 'password'
+        ? connectionForm.password
+        : connectionAuthMethod === 'keyboard_interactive'
+          ? connectionForm.keyboardInteractiveResponse
+          : null;
+      const passphrase = connectionAuthMethod === 'public_key'
+        ? connectionForm.privateKeyPassphrase
+        : null;
+      const nextSessions = await saveSession(session, secret, passphrase);
       setSessions(nextSessions);
       setConnectionForm(initialConnectionForm);
       setConnectionAuthMethod('password');
@@ -368,9 +390,12 @@ export function ConnectionWindow() {
         await emit('sessions-changed');
       } catch (e) { /* non-critical */ }
 
-      // Only auto-connect when creating a brand-new connection, not when editing
+      // Only auto-connect when creating a brand-new connection, not when editing.
+      // Use the backend-returned session so no plaintext credential enters the event bus.
       if (!original) {
-        await emitConnectSession(session);
+        const savedSession = nextSessions.find((item) => item.id === session.id);
+        if (!savedSession) throw new Error('连接已保存，但后端未返回对应会话');
+        await emitConnectSession(savedSession);
       }
     } catch (saveError) {
       const message = saveError instanceof Error ? saveError.message : String(saveError);
@@ -497,6 +522,47 @@ export function ConnectionWindow() {
     setContextMenu(null);
   }
 
+  async function handleCredentialSecurity() {
+    try {
+      if (!credentialStatus || credentialStatus.mode === 'dpapi') {
+        const password = window.prompt('设置 Master Password（至少 8 个字符）：');
+        if (!password) return;
+        const confirmation = window.prompt('再次输入 Master Password：');
+        if (password !== confirmation) {
+          setConnectionFormError('两次输入的 Master Password 不一致');
+          return;
+        }
+        setCredentialStatus(await setCredentialProtection('master_password', password));
+        setConnectionFormError('');
+        return;
+      }
+
+      if (credentialStatus.locked) {
+        const password = window.prompt('输入 Master Password 解锁凭据：');
+        if (!password) return;
+        setCredentialStatus(await unlockCredentials(password));
+        setConnectionFormError('');
+        return;
+      }
+
+      if (window.confirm('切换回 Windows 用户保护？凭据将绑定当前 Windows 用户，不能跨电脑解密。')) {
+        setCredentialStatus(await setCredentialProtection('dpapi'));
+        setConnectionFormError('');
+      }
+    } catch (error) {
+      setConnectionFormError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleLockCredentials() {
+    try {
+      await lockCredentials();
+      setCredentialStatus(await getCredentialStatus());
+    } catch (error) {
+      setConnectionFormError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   async function handleCloseWindow() {
     try {
       const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
@@ -536,6 +602,28 @@ export function ConnectionWindow() {
                   onClick={() => { const s = sessions.find(s => s.id === selectedSessionId); if (s) void deleteConnectionSession(s); }}>
                   <Trash2 size={14} /><span>删除</span>
                 </button>
+                <button
+                  className="connection-toolbar-btn"
+                  title={credentialStatus?.error
+                    ? credentialStatus.error
+                    : credentialStatus?.mode === 'master_password'
+                      ? (credentialStatus.locked ? '输入 Master Password 解锁' : '切换回 Windows 用户保护')
+                      : '启用 Master Password，允许安全迁移配置'}
+                  disabled={Boolean(credentialStatus?.error)}
+                  onClick={() => void handleCredentialSecurity()}
+                >
+                  <ShieldCheck size={14} />
+                  <span>{credentialStatus?.error
+                    ? '凭据仓库异常'
+                    : credentialStatus?.mode === 'master_password'
+                      ? (credentialStatus.locked ? '凭据已锁定' : 'Master Password')
+                      : 'Windows 保护'}</span>
+                </button>
+                {credentialStatus?.mode === 'master_password' && !credentialStatus.locked && (
+                  <button className="connection-toolbar-btn" title="立即锁定凭据" onClick={() => void handleLockCredentials()}>
+                    <LockKeyhole size={14} /><span>锁定</span>
+                  </button>
+                )}
               </div>
               <div className="connection-search-bar">
                 <Search size={15} />
@@ -551,6 +639,7 @@ export function ConnectionWindow() {
                 )}
               </div>
             </div>
+            {connectionFormError && <div className="connection-form-error">{connectionFormError}</div>}
 
             {/* Table */}
             <div className="connection-table-wrap">
@@ -722,7 +811,7 @@ export function ConnectionWindow() {
                     <input
                       type="password"
                       value={connectionForm.password}
-                      placeholder="输入 SSH 登录密码"
+                      placeholder={editingId ? '留空则保留已保存密码' : '输入 SSH 登录密码'}
                       onChange={(event) => updateConnectionForm('password', event.target.value)}
                     />
                   </label>
@@ -744,7 +833,7 @@ export function ConnectionWindow() {
                     <input
                       type="password"
                       value={connectionForm.privateKeyPassphrase}
-                      placeholder="没有口令可留空"
+                      placeholder={editingId ? '留空则保留已保存口令' : '没有口令可留空'}
                       onChange={(event) => updateConnectionForm('privateKeyPassphrase', event.target.value)}
                     />
                   </label>
@@ -758,7 +847,7 @@ export function ConnectionWindow() {
                     <input
                       type="password"
                       value={connectionForm.keyboardInteractiveResponse}
-                      placeholder="用于 Keyboard Interactive 的默认响应"
+                      placeholder={editingId ? '留空则保留已保存响应' : '用于 Keyboard Interactive 的默认响应'}
                       onChange={(event) => updateConnectionForm('keyboardInteractiveResponse', event.target.value)}
                     />
                   </label>
