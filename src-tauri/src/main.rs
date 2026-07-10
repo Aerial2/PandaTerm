@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use encoding_rs::GBK;
 use panda_core::{TerminalEvent, TerminalEventKind};
@@ -17,7 +17,7 @@ use russh::ChannelMsg;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use uuid::Uuid;
 
 #[cfg(target_os = "windows")]
@@ -31,10 +31,19 @@ extern "system" {
     ) -> i32;
 }
 
+struct TransferCancellationEntry {
+    signal: Arc<AtomicBool>,
+    registered: bool,
+}
+
 struct AppState {
     sessions: Mutex<SessionCatalog>,
     local_terminals: Mutex<HashMap<Uuid, LocalTerminalSession>>,
     remote_terminals: Mutex<HashMap<Uuid, RemoteTerminalSession>>,
+    /// Reused SSH handles for file transfer (keyed by interactive terminal id).
+    transfer_handles: Mutex<HashMap<Uuid, SharedRemoteHandle>>,
+    /// Transfer cancellation state keyed by the frontend transfer id.
+    transfer_cancellations: Mutex<HashMap<String, TransferCancellationEntry>>,
     /// Cached sysinfo::System for local CPU usage monitoring.
     /// Keeps CPU time counters alive so that `refresh_cpu_usage()` computes
     /// correct deltas between successive calls instead of starting from scratch.
@@ -54,6 +63,7 @@ type SharedRemoteHandle = Arc<russh::client::Handle<SshHandler>>;
 struct RemoteTerminalSession {
     control: mpsc::Sender<RemoteTerminalCommand>,
     closed: Arc<AtomicBool>,
+    close_notification: Arc<Notify>,
     handle: SharedRemoteHandle,
     session: Session,
 }
@@ -239,7 +249,7 @@ fn load_xshell_sessions() -> Vec<Session> {
         .filter_map(|path| parse_xshell_session(&path))
         .collect::<Vec<_>>();
 
-    sessions.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    sessions.sort_by_key(|session| session.name.to_lowercase());
     sessions
 }
 
@@ -255,6 +265,157 @@ fn session_store_path() -> Result<PathBuf, String> {
     Ok(home.join(".pandaterm").join("ssh-connections.json"))
 }
 
+fn pandaterm_data_dir() -> Result<PathBuf, String> {
+    let home = std::env::var_os(if cfg!(target_os = "windows") {
+        "USERPROFILE"
+    } else {
+        "HOME"
+    })
+    .map(PathBuf::from)
+    .ok_or_else(|| "无法定位用户目录".to_string())?;
+    Ok(home.join(".pandaterm"))
+}
+
+fn known_hosts_path() -> Result<PathBuf, String> {
+    Ok(pandaterm_data_dir()?.join("known_hosts.json"))
+}
+
+/// Local obfuscation for secrets at rest (not a full KMS; better than plaintext JSON).
+const SECRET_PREFIX: &str = "pterm1:";
+
+fn secret_obfuscation_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    let material = format!(
+        "pandaterm-v1|{}|{}|{}",
+        std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_else(|_| "user".into()),
+        std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "host".into()),
+        std::env::consts::OS,
+    );
+    let bytes = material.as_bytes();
+    for (i, slot) in key.iter_mut().enumerate() {
+        let b = bytes.get(i % bytes.len()).copied().unwrap_or(0);
+        *slot = b
+            .wrapping_mul(31)
+            .wrapping_add((i as u8).wrapping_mul(17))
+            .wrapping_add(0xA5);
+    }
+    key
+}
+
+fn obfuscate_secret(plain: &str) -> String {
+    if plain.is_empty() || plain.starts_with(SECRET_PREFIX) {
+        return plain.to_string();
+    }
+    let key = secret_obfuscation_key();
+    let mut out = Vec::with_capacity(plain.len());
+    for (i, b) in plain.as_bytes().iter().enumerate() {
+        out.push(b ^ key[i % 32] ^ ((i as u8).wrapping_mul(31)));
+    }
+    format!("{SECRET_PREFIX}{}", base64_encode(&out))
+}
+
+fn deobfuscate_secret(stored: &str) -> String {
+    let Some(rest) = stored.strip_prefix(SECRET_PREFIX) else {
+        return stored.to_string();
+    };
+    let Ok(bytes) = base64_decode(rest) else {
+        return stored.to_string();
+    };
+    let key = secret_obfuscation_key();
+    let mut out = Vec::with_capacity(bytes.len());
+    for (i, b) in bytes.iter().enumerate() {
+        out.push(b ^ key[i % 32] ^ ((i as u8).wrapping_mul(31)));
+    }
+    String::from_utf8(out).unwrap_or_else(|_| stored.to_string())
+}
+
+fn protect_session_secrets(session: &mut Session, protect: bool) {
+    match &mut session.auth {
+        AuthType::Password { secret_id } => {
+            *secret_id = if protect {
+                obfuscate_secret(secret_id)
+            } else {
+                deobfuscate_secret(secret_id)
+            };
+        }
+        AuthType::KeyboardInteractive {
+            response_secret_id,
+        } => {
+            *response_secret_id = if protect {
+                obfuscate_secret(response_secret_id)
+            } else {
+                deobfuscate_secret(response_secret_id)
+            };
+        }
+        AuthType::PrivateKey {
+            passphrase_secret_id,
+            ..
+        } => {
+            if let Some(pass) = passphrase_secret_id.as_mut() {
+                *pass = if protect {
+                    obfuscate_secret(pass)
+                } else {
+                    deobfuscate_secret(pass)
+                };
+            }
+        }
+        AuthType::Agent | AuthType::Gssapi { .. } => {}
+    }
+}
+
+fn load_known_hosts() -> HashMap<String, String> {
+    let Ok(path) = known_hosts_path() else {
+        return HashMap::new();
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_known_hosts(hosts: &HashMap<String, String>) -> Result<(), String> {
+    let path = known_hosts_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("known_hosts 目录创建失败：{e}"))?;
+    }
+    let content = serde_json::to_string_pretty(hosts)
+        .map_err(|e| format!("known_hosts 序列化失败：{e}"))?;
+    fs::write(path, content).map_err(|e| format!("known_hosts 写入失败：{e}"))
+}
+
+fn host_key_fingerprint(key: &russh::keys::PublicKey) -> String {
+    // algorithm + base64 public key material for stable MITM detection.
+    use russh::keys::PublicKeyBase64;
+    let alg = key.algorithm().to_string();
+    format!("{alg}:{}", key.public_key_base64())
+}
+
+fn verify_or_trust_host_key(host_port: &str, key: &russh::keys::PublicKey) -> Result<bool, String> {
+    let fingerprint = host_key_fingerprint(key);
+    let mut hosts = load_known_hosts();
+    match hosts.get(host_port) {
+        Some(known) if known == &fingerprint => Ok(true),
+        Some(known) => {
+            eprintln!(
+                "[SSH] host key mismatch for {host_port}: known={known} now={fingerprint}"
+            );
+            Err(format!(
+                "主机密钥已变更（{host_port}），可能存在中间人风险。若确认服务器已重装，请删除 ~/.pandaterm/known_hosts.json 后重试"
+            ))
+        }
+        None => {
+            hosts.insert(host_port.to_string(), fingerprint);
+            save_known_hosts(&hosts)?;
+            eprintln!("[SSH] trusted new host key for {host_port}");
+            Ok(true)
+        }
+    }
+}
+
 fn load_persistent_sessions() -> Vec<Session> {
     let Ok(path) = session_store_path() else {
         return Vec::new();
@@ -264,7 +425,11 @@ fn load_persistent_sessions() -> Vec<Session> {
         return Vec::new();
     };
 
-    serde_json::from_str::<Vec<Session>>(&content).unwrap_or_default()
+    let mut sessions = serde_json::from_str::<Vec<Session>>(&content).unwrap_or_default();
+    for session in &mut sessions {
+        protect_session_secrets(session, false);
+    }
+    sessions
 }
 
 fn save_persistent_sessions(sessions: &[Session]) -> Result<(), String> {
@@ -273,7 +438,16 @@ fn save_persistent_sessions(sessions: &[Session]) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|error| format!("连接配置目录创建失败：{error}"))?;
     }
 
-    let content = serde_json::to_string_pretty(sessions)
+    let protected: Vec<Session> = sessions
+        .iter()
+        .map(|session| {
+            let mut clone = session.clone();
+            protect_session_secrets(&mut clone, true);
+            clone
+        })
+        .collect();
+
+    let content = serde_json::to_string_pretty(&protected)
         .map_err(|error| format!("连接配置序列化失败：{error}"))?;
     fs::write(&path, content).map_err(|error| format!("连接配置保存失败：{error}"))
 }
@@ -358,7 +532,7 @@ fn decode_shell_text(bytes: &[u8]) -> String {
     #[cfg(target_os = "windows")]
     {
         let (text, _, _) = GBK.decode(bytes);
-        return normalize_shell_text(text.into_owned());
+        normalize_shell_text(text.into_owned())
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -379,7 +553,7 @@ fn decode_terminal_bytes(bytes: &[u8]) -> String {
     #[cfg(target_os = "windows")]
     {
         let (text, _, _) = GBK.decode(bytes);
-        return text.into_owned();
+        text.into_owned()
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -515,16 +689,29 @@ fn local_pty_command(cwd: &Path) -> CommandBuilder {
     }
 }
 
-struct SshHandler;
+struct SshHandler {
+    host_port: String,
+    /// Filled when host key verification fails so connect can surface a clear error.
+    host_key_error: Arc<std::sync::Mutex<Option<String>>>,
+}
 
 impl russh::client::Handler for SshHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        match verify_or_trust_host_key(&self.host_port, server_public_key) {
+            Ok(true) => Ok(true),
+            Ok(false) => Ok(false),
+            Err(message) => {
+                if let Ok(mut slot) = self.host_key_error.lock() {
+                    *slot = Some(message);
+                }
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -546,7 +733,12 @@ async fn connect_russh_session(
         channel_buffer_size: 1024,
         ..russh::client::Config::default()
     });
-    let handler = SshHandler;
+    let host_port = format!("{}:{}", session.host, session.port);
+    let host_key_error = Arc::new(std::sync::Mutex::new(None));
+    let handler = SshHandler {
+        host_port: host_port.clone(),
+        host_key_error: Arc::clone(&host_key_error),
+    };
 
     let mut handle = tokio::time::timeout(
         Duration::from_secs(15),
@@ -554,7 +746,14 @@ async fn connect_russh_session(
     )
     .await
     .map_err(|_| format!("SSH 连接超时（15s）：{}", session.host))?
-    .map_err(|error| format!("SSH 连接失败：{error}"))?;
+    .map_err(|error| {
+        if let Ok(guard) = host_key_error.lock() {
+            if let Some(message) = guard.as_ref() {
+                return message.clone();
+            }
+        }
+        format!("SSH 连接失败：{error}")
+    })?;
 
     emit_remote_log(app, terminal_id, "TCP connected, authenticating...");
 
@@ -602,11 +801,30 @@ async fn connect_russh_session(
     Ok(handle)
 }
 
+async fn interactive_remote_handle(
+    state: &AppState,
+    terminal_id: Uuid,
+) -> Result<SharedRemoteHandle, String> {
+    let terminals = state.remote_terminals.lock().await;
+    terminals
+        .get(&terminal_id)
+        .map(|remote| Arc::clone(&remote.handle))
+        .ok_or_else(|| format!("terminal is not connected: {terminal_id}"))
+}
+
 async fn connect_russh_transfer_session(
     app: &AppHandle,
     terminal_id: Uuid,
     state: &AppState,
 ) -> Result<SharedRemoteHandle, String> {
+    // Reuse a live transfer handle when possible (avoids re-auth per file).
+    {
+        let cache = state.transfer_handles.lock().await;
+        if let Some(existing) = cache.get(&terminal_id) {
+            return Ok(Arc::clone(existing));
+        }
+    }
+
     let session = {
         let terminals = state.remote_terminals.lock().await;
         terminals
@@ -615,8 +833,48 @@ async fn connect_russh_transfer_session(
             .ok_or_else(|| format!("terminal is not connected: {terminal_id}"))?
     };
     let transfer_terminal_id = format!("{terminal_id}:transfer");
-    let handle = connect_russh_session(app, &transfer_terminal_id, &session).await?;
-    Ok(Arc::new(handle))
+    match connect_russh_session(app, &transfer_terminal_id, &session).await {
+        Ok(handle) => {
+            let shared = Arc::new(handle);
+            match exec_remote_command_full(&shared, "true").await {
+                Ok((_, _, Some(0))) => {
+                    let mut cache = state.transfer_handles.lock().await;
+                    cache.insert(terminal_id, Arc::clone(&shared));
+                    Ok(shared)
+                }
+                Ok((_, stderr, code)) => {
+                    let detail = String::from_utf8_lossy(&stderr);
+                    emit_remote_log(
+                        app,
+                        &transfer_terminal_id,
+                        format!("Dedicated transfer channel returned {code:?} ({detail}); using interactive connection"),
+                    );
+                    interactive_remote_handle(state, terminal_id).await
+                }
+                Err(error) => {
+                    emit_remote_log(
+                        app,
+                        &transfer_terminal_id,
+                        format!("Dedicated transfer channel unavailable ({error}); using interactive connection"),
+                    );
+                    interactive_remote_handle(state, terminal_id).await
+                }
+            }
+        }
+        Err(error) => {
+            emit_remote_log(
+                app,
+                &transfer_terminal_id,
+                format!("Dedicated transfer connection unavailable ({error}); using interactive connection"),
+            );
+            interactive_remote_handle(state, terminal_id).await
+        }
+    }
+}
+
+async fn invalidate_transfer_handle(state: &AppState, terminal_id: Uuid) {
+    let mut cache = state.transfer_handles.lock().await;
+    cache.remove(&terminal_id);
 }
 
 async fn spawn_russh_terminal(
@@ -650,6 +908,8 @@ async fn spawn_russh_terminal(
     let (tx, mut rx) = mpsc::channel::<RemoteTerminalCommand>(32);
     let closed = Arc::new(AtomicBool::new(false));
     let closed_clone = Arc::clone(&closed);
+    let close_notification = Arc::new(Notify::new());
+    let close_notification_clone = Arc::clone(&close_notification);
     let terminal_id_clone = terminal_id.clone();
 
     let shared_handle: SharedRemoteHandle = Arc::new(handle);
@@ -710,6 +970,7 @@ async fn spawn_russh_terminal(
         }
 
         closed_clone.store(true, Ordering::SeqCst);
+        close_notification_clone.notify_one();
         let _ = channel.eof().await;
         let _ = channel.close().await;
         emit_terminal_output(&app, terminal_id_clone, "\r\n连接已关闭\r\n".to_string());
@@ -719,6 +980,7 @@ async fn spawn_russh_terminal(
     Ok(RemoteTerminalSession {
         control: tx,
         closed,
+        close_notification,
         handle: shared_handle,
         session,
     })
@@ -764,7 +1026,7 @@ async fn exec_remote_command(
 async fn exec_remote_command_full(
     handle: &russh::client::Handle<SshHandler>,
     command: &str,
-) -> Result<(Vec<u8>, Vec<u8>, i32), String> {
+) -> Result<(Vec<u8>, Vec<u8>, Option<i32>), String> {
     let mut channel = handle
         .channel_open_session()
         .await
@@ -776,15 +1038,61 @@ async fn exec_remote_command_full(
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
-    let mut exit_code: i32 = 0;
+    let mut exit_code: Option<i32> = None;
     loop {
         match channel.wait().await {
             Some(ChannelMsg::Data { ref data }) => stdout.extend_from_slice(data),
             Some(ChannelMsg::ExtendedData { ref data, .. }) => stderr.extend_from_slice(data),
             Some(ChannelMsg::ExitStatus { exit_status }) => {
-                exit_code = exit_status as i32;
+                exit_code = Some(exit_status as i32);
             }
             // Don't break on Eof — ExitStatus may arrive after it.
+            Some(ChannelMsg::Eof) => {}
+            Some(ChannelMsg::Close) | None => break,
+            _ => {}
+        }
+    }
+    let _ = channel.eof().await;
+    let _ = channel.close().await;
+    Ok((stdout, stderr, exit_code))
+}
+
+async fn exec_remote_command_full_cancellable(
+    handle: &russh::client::Handle<SshHandler>,
+    command: &str,
+    cancellation: &AtomicBool,
+) -> Result<(Vec<u8>, Vec<u8>, Option<i32>), String> {
+    if cancellation.load(Ordering::SeqCst) {
+        return Err("传输已取消".to_string());
+    }
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|error| format!("SSH exec 失败：{error}"))?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code = None;
+    loop {
+        let message = tokio::select! {
+            message = channel.wait() => message,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if cancellation.load(Ordering::SeqCst) {
+                    let _ = channel.eof().await;
+                    let _ = channel.close().await;
+                    return Err("传输已取消".to_string());
+                }
+                continue;
+            }
+        };
+        match message {
+            Some(ChannelMsg::Data { ref data }) => stdout.extend_from_slice(data),
+            Some(ChannelMsg::ExtendedData { ref data, .. }) => stderr.extend_from_slice(data),
+            Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status as i32),
             Some(ChannelMsg::Eof) => {}
             Some(ChannelMsg::Close) | None => break,
             _ => {}
@@ -931,6 +1239,67 @@ fn default_local_path() -> Result<PathBuf, String> {
     Ok(home)
 }
 
+fn default_download_directory() -> Result<PathBuf, String> {
+    let downloads = default_local_path()?.join("Downloads");
+    fs::create_dir_all(&downloads).map_err(|error| format!("创建下载目录失败：{error}"))?;
+    Ok(downloads)
+}
+
+fn local_destination_candidate(
+    directory: &Path,
+    file_name: &str,
+    index: usize,
+) -> Result<PathBuf, String> {
+    let mut components = Path::new(file_name).components();
+    let Some(std::path::Component::Normal(normal_name)) = components.next() else {
+        return Err("无法确定下载文件名".to_string());
+    };
+    if components.next().is_some() || file_name.contains(['/', '\\']) {
+        return Err("下载文件名包含非法路径分隔符".to_string());
+    }
+    if index == 0 {
+        return Ok(directory.join(normal_name));
+    }
+
+    let path = Path::new(normal_name);
+    let stem = path
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_name.to_string());
+    let extension = path
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy()))
+        .unwrap_or_default();
+    Ok(directory.join(format!("{stem} ({index}){extension}")))
+}
+
+fn write_unique_local_file(
+    directory: &Path,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    for index in 0..=10_000 {
+        let candidate = local_destination_candidate(directory, file_name, index)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(bytes) {
+                    drop(file);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(format!("写入本地文件失败：{error}"));
+                }
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("创建本地文件失败：{error}")),
+        }
+    }
+    Err("下载目录中同名文件过多".to_string())
+}
+
 fn resolve_local_path(path: Option<String>) -> Result<PathBuf, String> {
     match path.filter(|value| !value.trim().is_empty()) {
         Some(value) => Ok(PathBuf::from(value)),
@@ -1032,10 +1401,14 @@ async fn list_local_directory(path: Option<String>) -> Result<LocalDirectoryList
     })
 }
 
+fn windows_drive_letters() -> std::ops::RangeInclusive<char> {
+    'A'..='Z'
+}
+
 /// List available Windows drive letters as directory entries.
 fn list_windows_drives() -> Result<LocalDirectoryListing, String> {
     let mut entries = Vec::new();
-    for letter in 'A'..'Z' {
+    for letter in windows_drive_letters() {
         let drive = format!("{letter}:\\");
         if PathBuf::from(&drive).is_dir() {
             entries.push(LocalDirectoryEntry {
@@ -1067,9 +1440,13 @@ async fn read_local_file_preview(path: String) -> Result<LocalFilePreview, Strin
     }
 
     let read_size = metadata.len().min(LOCAL_FILE_PREVIEW_LIMIT) as usize;
-    let bytes = fs::read(&canonical_file).map_err(|error| error.to_string())?;
-    let preview_bytes = &bytes[..read_size.min(bytes.len())];
-    let content = String::from_utf8(preview_bytes.to_vec())
+    let mut bytes = Vec::with_capacity(read_size);
+    fs::File::open(&canonical_file)
+        .map_err(|error| error.to_string())?
+        .take(LOCAL_FILE_PREVIEW_LIMIT)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let content = String::from_utf8(bytes)
         .map_err(|_| "暂不支持预览二进制文件".to_string())?;
 
     Ok(LocalFilePreview {
@@ -1142,14 +1519,24 @@ async fn list_remote_directory(
         .filter(|value| !value.is_empty())
         .unwrap_or(".");
     let quoted = shell_quote(target);
-    // Resolve the canonical path, compute its parent, then list immediate
-    // children with type/size/mtime via GNU find's printf.
+    // Probe GNU find -printf; fall back to portable shell loop (BusyBox/BSD).
     let command = format!(
         "__p=$(cd {quoted} 2>/dev/null && pwd) || __p={quoted}; \
          printf 'P:%s\\n' \"$__p\"; \
          __d=$(dirname \"$__p\"); [ \"$__d\" = \"$__p\" ] && __d=''; \
          printf 'D:%s\\n' \"$__d\"; \
-         find \"$__p\" -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%f\\n' 2>/dev/null"
+         if find \"$__p\" -mindepth 1 -maxdepth 1 -printf '' >/dev/null 2>&1; then \
+           find \"$__p\" -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%f\\n' 2>/dev/null; \
+         else \
+           for f in \"$__p\"/* \"$__p\"/.[!.]* \"$__p\"/..?*; do \
+             [ -e \"$f\" ] || continue; \
+             name=$(basename \"$f\"); \
+             if [ -d \"$f\" ]; then t=d; else t=f; fi; \
+             sz=$(stat -c %s \"$f\" 2>/dev/null || stat -f %z \"$f\" 2>/dev/null || echo 0); \
+             mt=$(stat -c %Y \"$f\" 2>/dev/null || stat -f %m \"$f\" 2>/dev/null || echo 0); \
+             printf '%s\\t%s\\t%s\\t%s\\n' \"$t\" \"$sz\" \"$mt\" \"$name\"; \
+           done; \
+         fi"
     );
     let output = exec_remote_command(&handle, &command).await?;
     let text = String::from_utf8_lossy(&output);
@@ -1172,8 +1559,8 @@ async fn read_remote_file_preview(
 
     let quoted = shell_quote(&path);
     let command = format!(
-        "printf 'SIZE:%s\\n' \"$(stat -c %s {quoted} 2>/dev/null || echo 0)\"; \
-         head -c {limit} {quoted} 2>/dev/null",
+        "printf 'SIZE:%s\\n' \"$(stat -c %s {quoted} 2>/dev/null || stat -f %z {quoted} 2>/dev/null || wc -c < {quoted} 2>/dev/null || echo 0)\"; \
+         head -c {limit} {quoted} 2>/dev/null || dd if={quoted} bs={limit} count=1 2>/dev/null",
         limit = REMOTE_FILE_PREVIEW_LIMIT
     );
     let output = exec_remote_command(&handle, &command).await?;
@@ -1216,9 +1603,19 @@ async fn read_remote_file_full(
 
     let quoted = shell_quote(&path);
     // Check size first to avoid pulling huge files through the SSH channel.
-    let size_output = exec_remote_command(&handle, &format!("stat -c %s {quoted} 2>/dev/null || echo 0")).await?;
+    let size_output = exec_remote_command(
+        &handle,
+        &format!(
+            "stat -c %s {quoted} 2>/dev/null || stat -f %z {quoted} 2>/dev/null || wc -c < {quoted} 2>/dev/null || echo 0"
+        ),
+    )
+    .await?;
     let size_str = String::from_utf8_lossy(&size_output);
-    let size: u64 = size_str.trim().parse().unwrap_or(0);
+    let size: u64 = size_str
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     if size > REMOTE_FILE_FULL_LIMIT {
         return Err(format!(
             "文件过大（{} 字节），编辑器最多支持 {} 字节的文件",
@@ -1241,112 +1638,149 @@ async fn read_remote_file_full(
     })
 }
 
-/// Write full file content to a remote path by piping data through `cat > path`
-/// on a fresh exec channel — no base64 / escaping needed.
-/// Emits "upload-progress" events with { transfer_id, transferred, total }.
-///
-/// 写入循环与等待退出发在同一个任务里。russh 的 `data()` 在窗口满时会 await，
-/// 窗口调整帧由底层连接的后台事件循环自动处理，无需用户侧 `wait()` 驱动。
-/// 写完所有 chunk 后发 EOF，再循环 `wait()` 等待远端 `cat` 退出。
-async fn write_remote_file_chunk(
-    handle: &russh::client::Handle<SshHandler>,
-    path: &str,
-    chunk: &[u8],
-    append: bool,
+const REMOTE_UPLOAD_COMPLETION_MARKER: &[u8] = b"__PANDATERM_UPLOAD_COMPLETE__";
+
+fn validate_remote_upload_completion(
+    exit_code: Option<i32>,
+    completion_marker_seen: bool,
 ) -> Result<(), String> {
-    let channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
-    let quoted = shell_quote(path);
-    let operator = if append { ">>" } else { ">" };
-    channel
-        .exec(true, format!("cat {operator} {quoted}"))
-        .await
-        .map_err(|error| format!("SSH exec 失败：{error}"))?;
-
-    let (mut reader, writer) = channel.split();
-    let exit_code = std::sync::Arc::new(tokio::sync::Mutex::new(0i32));
-    let exit_code_tx = std::sync::Arc::clone(&exit_code);
-    let read_task = tokio::spawn(async move {
-        while let Some(msg) = reader.wait().await {
-            match msg {
-                russh::ChannelMsg::Data { .. } | russh::ChannelMsg::ExtendedData { .. } => {}
-                russh::ChannelMsg::ExitStatus { exit_status } => {
-                    *exit_code_tx.lock().await = exit_status as i32;
-                }
-                russh::ChannelMsg::Close => break,
-                _ => {}
-            }
-        }
-    });
-
-    for part in chunk.chunks(32768) {
-        writer
-            .data(part)
-            .await
-            .map_err(|error| format!("SSH 数据写入失败：{error}"))?;
+    match (exit_code, completion_marker_seen) {
+        (Some(0) | None, true) => Ok(()),
+        (Some(0), false) => Err("远程写入失败：未收到完成标记".to_string()),
+        (Some(code), _) => Err(format!("远程写入失败，退出码: {code}")),
+        (None, false) => Err("远程写入失败：SSH 通道未返回退出状态或完成标记".to_string()),
     }
-    writer
-        .eof()
-        .await
-        .map_err(|error| format!("SSH eof 失败：{error}"))?;
-    let _ = writer.close().await;
-    let _ = read_task.await;
-
-    let exit_code = *exit_code.lock().await;
-    if exit_code != 0 {
-        return Err(format!("远程写入失败，退出码: {exit_code}"));
-    }
-    Ok(())
 }
 
+fn emit_upload_progress(
+    app: &AppHandle,
+    transfer_id: &str,
+    transferred: usize,
+    total: usize,
+) {
+    let _ = app.emit(
+        "upload-progress",
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "phase": "transferring",
+            "transferred": transferred,
+            "total": total,
+        }),
+    );
+}
+
+fn emit_upload_phase(app: &AppHandle, transfer_id: &str, phase: &str) {
+    let _ = app.emit(
+        "upload-progress",
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "phase": phase,
+        }),
+    );
+}
+
+/// Write full file content to a remote path by piping data through one
+/// `cat > path` exec channel. Concurrently drains server→client output so
+/// OpenSSH window updates keep flowing (avoids the classic ~2MB hang).
 async fn write_remote_file_content(
     handle: &russh::client::Handle<SshHandler>,
     path: &str,
     content: &[u8],
     app: &AppHandle,
     transfer_id: &str,
+    cancellation: Option<&AtomicBool>,
+    attempt_started: &AtomicBool,
 ) -> Result<(), String> {
-    const REMOTE_WRITE_SLICE_SIZE: usize = 1024 * 1024;
-
+    if cancellation.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err("上传已取消".to_string());
+    }
     let total = content.len();
-    if total == 0 {
-        write_remote_file_chunk(handle, path, &[], false).await?;
-        let _ = app.emit("upload-progress", serde_json::json!({
-            "transfer_id": transfer_id,
-            "transferred": 0,
-            "total": 0,
-        }));
-        return Ok(());
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
+    let quoted = shell_quote(path);
+    channel
+        .exec(
+            true,
+            format!(
+                "if cat > {quoted}; then printf '%s\\n' __PANDATERM_UPLOAD_COMPLETE__; else exit $?; fi"
+            ),
+        )
+        .await
+        .map_err(|error| format!("SSH exec 失败：{error}"))?;
+
+    let (mut reader, writer) = channel.split();
+    let read_task = tokio::spawn(async move {
+        let mut exit_code = None;
+        let mut completion_output = Vec::new();
+        while let Some(msg) = reader.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => {
+                    let remaining = 128usize.saturating_sub(completion_output.len());
+                    completion_output.extend_from_slice(&data[..data.len().min(remaining)]);
+                }
+                russh::ChannelMsg::ExtendedData { .. } => {}
+                russh::ChannelMsg::ExitStatus { exit_status } => {
+                    exit_code = Some(exit_status as i32);
+                }
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        let completion_marker_seen = completion_output
+            .windows(REMOTE_UPLOAD_COMPLETION_MARKER.len())
+            .any(|window| window == REMOTE_UPLOAD_COMPLETION_MARKER);
+        (exit_code, completion_marker_seen)
+    });
+
+    let mut transferred = 0usize;
+    let mut last_progress_emit = Instant::now();
+    for part in content.chunks(32 * 1024) {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            let _ = writer.close().await;
+            read_task.abort();
+            return Err("上传已取消".to_string());
+        }
+        writer
+            .data(part)
+            .await
+            .map_err(|error| format!("SSH 数据写入失败：{error}"))?;
+        attempt_started.store(true, Ordering::SeqCst);
+        transferred += part.len();
+        if last_progress_emit.elapsed() >= Duration::from_secs(1) {
+            emit_upload_progress(app, transfer_id, transferred, total);
+            last_progress_emit = Instant::now();
+        }
     }
 
-    let mut transferred: usize = 0;
-    for (index, chunk) in content.chunks(REMOTE_WRITE_SLICE_SIZE).enumerate() {
-        write_remote_file_chunk(handle, path, chunk, index > 0).await?;
-        transferred += chunk.len();
-        let _ = app.emit("upload-progress", serde_json::json!({
-            "transfer_id": transfer_id,
-            "transferred": transferred,
-            "total": total,
-        }));
-    }
-    Ok(())
+    emit_upload_phase(app, transfer_id, "verifying");
+    writer
+        .eof()
+        .await
+        .map_err(|error| format!("SSH eof 失败：{error}"))?;
+    let (observed_exit_code, completion_marker_seen) = read_task
+        .await
+        .map_err(|error| format!("等待远程写入确认失败：{error}"))?;
+    let _ = writer.close().await;
+    validate_remote_upload_completion(observed_exit_code, completion_marker_seen)
 }
 
-/// Stream a local file to a remote path through bounded SSH exec slices.
-/// Each slice stays below the common 2MB remote channel window, so uploads do
-/// not depend on long-lived stdin WINDOW_ADJUST behavior from the server.
+/// Stream a local file to remote via one SSH channel + concurrent output drain.
 async fn stream_upload_file(
     handle: &russh::client::Handle<SshHandler>,
     local_path: &Path,
     remote_path: &str,
     transfer_id: &str,
     app: &AppHandle,
+    cancellation: Option<&AtomicBool>,
+    attempt_started: &AtomicBool,
 ) -> Result<(), String> {
-    const REMOTE_WRITE_SLICE_SIZE: usize = 1024 * 1024;
-
     use tokio::io::AsyncReadExt;
+
+    if cancellation.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err("上传已取消".to_string());
+    }
     let mut file = tokio::fs::File::open(local_path)
         .await
         .map_err(|e| format!("打开本地文件失败：{e}"))?;
@@ -1355,21 +1789,54 @@ async fn stream_upload_file(
         .map_err(|e| format!("读取文件信息失败：{e}"))?
         .len() as usize;
 
-    if total == 0 {
-        write_remote_file_chunk(handle, remote_path, &[], false).await?;
-        let _ = app.emit("upload-progress", serde_json::json!({
-            "transfer_id": transfer_id,
-            "transferred": 0,
-            "total": 0,
-        }));
-        return Ok(());
-    }
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
+    let quoted = shell_quote(remote_path);
+    channel
+        .exec(
+            true,
+            format!(
+                "if cat > {quoted}; then printf '%s\\n' __PANDATERM_UPLOAD_COMPLETE__; else exit $?; fi"
+            ),
+        )
+        .await
+        .map_err(|error| format!("SSH exec 失败：{error}"))?;
 
-    let mut buffer = vec![0u8; REMOTE_WRITE_SLICE_SIZE];
-    let mut transferred: usize = 0;
-    let mut slice_index: usize = 0;
+    let (mut reader, writer) = channel.split();
+    let read_task = tokio::spawn(async move {
+        let mut exit_code = None;
+        let mut completion_output = Vec::new();
+        while let Some(msg) = reader.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => {
+                    let remaining = 128usize.saturating_sub(completion_output.len());
+                    completion_output.extend_from_slice(&data[..data.len().min(remaining)]);
+                }
+                russh::ChannelMsg::ExtendedData { .. } => {}
+                russh::ChannelMsg::ExitStatus { exit_status } => {
+                    exit_code = Some(exit_status as i32);
+                }
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        let completion_marker_seen = completion_output
+            .windows(REMOTE_UPLOAD_COMPLETION_MARKER.len())
+            .any(|window| window == REMOTE_UPLOAD_COMPLETION_MARKER);
+        (exit_code, completion_marker_seen)
+    });
 
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut transferred = 0usize;
+    let mut last_progress_emit = Instant::now();
     loop {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            let _ = writer.close().await;
+            read_task.abort();
+            return Err("上传已取消".to_string());
+        }
         let n = file
             .read(&mut buffer)
             .await
@@ -1377,20 +1844,134 @@ async fn stream_upload_file(
         if n == 0 {
             break;
         }
-
-        write_remote_file_chunk(handle, remote_path, &buffer[..n], slice_index > 0).await?;
+        writer
+            .data(&buffer[..n])
+            .await
+            .map_err(|error| format!("SSH 数据写入失败：{error}"))?;
+        attempt_started.store(true, Ordering::SeqCst);
         transferred += n;
-        slice_index += 1;
-        let _ = app.emit(
-            "upload-progress",
-            serde_json::json!({
-                "transfer_id": transfer_id,
-                "transferred": transferred,
-                "total": total,
-            }),
-        );
+        if last_progress_emit.elapsed() >= Duration::from_secs(1) {
+            emit_upload_progress(app, transfer_id, transferred, total);
+            last_progress_emit = Instant::now();
+        }
     }
 
+    emit_upload_phase(app, transfer_id, "verifying");
+    writer
+        .eof()
+        .await
+        .map_err(|error| format!("SSH eof 失败：{error}"))?;
+    let (observed_exit_code, completion_marker_seen) = read_task
+        .await
+        .map_err(|error| format!("等待远程写入确认失败：{error}"))?;
+    let _ = writer.close().await;
+    validate_remote_upload_completion(observed_exit_code, completion_marker_seen)
+}
+
+async fn remove_remote_temp_file(
+    handle: &russh::client::Handle<SshHandler>,
+    temp_path: &str,
+) {
+    let _ = exec_remote_command_full(handle, &format!("rm -f {}", shell_quote(temp_path))).await;
+}
+
+async fn commit_remote_temp_file(
+    handle: &russh::client::Handle<SshHandler>,
+    temp_path: &str,
+    destination_path: &str,
+) -> Result<(), String> {
+    let command = format!(
+        "mv -f {} {}",
+        shell_quote(temp_path),
+        shell_quote(destination_path)
+    );
+    let (_, stderr, code) = exec_remote_command_full(handle, &command).await?;
+    if code != Some(0) {
+        return Err(format!(
+            "远程文件提交失败: {}",
+            String::from_utf8_lossy(&stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn remote_temp_path(destination_path: &str, transfer_id: &str) -> String {
+    let suffix: String = transfer_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .collect();
+    format!("{destination_path}.pandaterm-{}.part", if suffix.is_empty() { "transfer" } else { &suffix })
+}
+
+async fn write_remote_file_atomic(
+    handle: &russh::client::Handle<SshHandler>,
+    destination_path: &str,
+    content: &[u8],
+    app: &AppHandle,
+    transfer_id: &str,
+    cancellation: Option<&AtomicBool>,
+    attempt_started: &AtomicBool,
+) -> Result<(), String> {
+    let temp_path = remote_temp_path(destination_path, transfer_id);
+    if let Err(error) = write_remote_file_content(
+        handle,
+        &temp_path,
+        content,
+        app,
+        transfer_id,
+        cancellation,
+        attempt_started,
+    )
+    .await
+    {
+        remove_remote_temp_file(handle, &temp_path).await;
+        return Err(error);
+    }
+    if cancellation.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        remove_remote_temp_file(handle, &temp_path).await;
+        return Err("上传已取消".to_string());
+    }
+    emit_upload_phase(app, transfer_id, "committing");
+    if let Err(error) = commit_remote_temp_file(handle, &temp_path, destination_path).await {
+        remove_remote_temp_file(handle, &temp_path).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn stream_upload_file_atomic(
+    handle: &russh::client::Handle<SshHandler>,
+    local_path: &Path,
+    destination_path: &str,
+    transfer_id: &str,
+    app: &AppHandle,
+    cancellation: Option<&AtomicBool>,
+    attempt_started: &AtomicBool,
+) -> Result<(), String> {
+    let temp_path = remote_temp_path(destination_path, transfer_id);
+    if let Err(error) = stream_upload_file(
+        handle,
+        local_path,
+        &temp_path,
+        transfer_id,
+        app,
+        cancellation,
+        attempt_started,
+    )
+    .await
+    {
+        remove_remote_temp_file(handle, &temp_path).await;
+        return Err(error);
+    }
+    if cancellation.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        remove_remote_temp_file(handle, &temp_path).await;
+        return Err("上传已取消".to_string());
+    }
+    emit_upload_phase(app, transfer_id, "committing");
+    if let Err(error) = commit_remote_temp_file(handle, &temp_path, destination_path).await {
+        remove_remote_temp_file(handle, &temp_path).await;
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -1408,15 +1989,84 @@ async fn write_remote_file(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let handle = {
-        let terminals = state.remote_terminals.lock().await;
-        terminals
-            .get(&terminal_id)
-            .map(|session| Arc::clone(&session.handle))
-            .ok_or_else(|| format!("terminal is not connected: {terminal_id}"))?
+    // Use the dedicated transfer connection so editor saves do not starve the shell.
+    let handle = connect_russh_transfer_session(&app, terminal_id, &state).await?;
+    let transfer_id = Uuid::new_v4().to_string();
+    let attempt_started = AtomicBool::new(false);
+    match write_remote_file_atomic(&handle, &path, content.as_bytes(), &app, &transfer_id, None, &attempt_started).await {
+        Ok(()) => Ok(()),
+        Err(error) if !attempt_started.load(Ordering::SeqCst) => {
+            invalidate_transfer_handle(&state, terminal_id).await;
+            let handle = interactive_remote_handle(&state, terminal_id).await?;
+            write_remote_file_atomic(&handle, &path, content.as_bytes(), &app, &transfer_id, None, &attempt_started).await
+                .map_err(|retry_err| format!("{error}; 重试失败: {retry_err}"))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn register_transfer_cancellation(state: &AppState, transfer_id: &str) -> Arc<AtomicBool> {
+    let mut cancellations = state.transfer_cancellations.lock().await;
+    let entry = cancellations
+        .entry(transfer_id.to_string())
+        .or_insert_with(|| TransferCancellationEntry {
+            signal: Arc::new(AtomicBool::new(false)),
+            registered: false,
+        });
+    entry.registered = true;
+    Arc::clone(&entry.signal)
+}
+
+async fn finish_transfer_cancellation(
+    state: &AppState,
+    transfer_id: &str,
+    cancellation: &Arc<AtomicBool>,
+) {
+    let mut cancellations = state.transfer_cancellations.lock().await;
+    if cancellations
+        .get(transfer_id)
+        .is_some_and(|current| Arc::ptr_eq(&current.signal, cancellation))
+    {
+        cancellations.remove(transfer_id);
+    }
+}
+
+async fn discard_unregistered_cancellation(
+    state: &AppState,
+    transfer_id: &str,
+    cancellation: &Arc<AtomicBool>,
+) {
+    let mut cancellations = state.transfer_cancellations.lock().await;
+    if cancellations.get(transfer_id).is_some_and(|current| {
+        !current.registered && Arc::ptr_eq(&current.signal, cancellation)
+    }) {
+        cancellations.remove(transfer_id);
+    }
+}
+
+#[tauri::command]
+async fn cancel_transfer(
+    transfer_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let cancellation = {
+        let mut cancellations = state.transfer_cancellations.lock().await;
+        let entry = cancellations
+            .entry(transfer_id.clone())
+            .or_insert_with(|| TransferCancellationEntry {
+                signal: Arc::new(AtomicBool::new(true)),
+                registered: false,
+            });
+        Arc::clone(&entry.signal)
     };
-    // No progress tracking for editor saves — use a dummy transfer_id.
-    write_remote_file_content(&handle, &path, content.as_bytes(), &app, "editor-save").await
+    cancellation.store(true, Ordering::SeqCst);
+
+    let cleanup_state = Arc::clone(state.inner());
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        discard_unregistered_cancellation(&cleanup_state, &transfer_id, &cancellation).await;
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -1429,29 +2079,68 @@ async fn upload_file(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    // Decode base64 content.
-    let content = base64_decode(&content_base64)
-        .map_err(|e| format!("Base64 解码失败：{e}"))?;
-
-    // Build destination path.
-    let dest_path = if dest_dir.ends_with('/') {
-        format!("{dest_dir}{file_name}")
-    } else {
-        format!("{dest_dir}/{file_name}")
-    };
-
-    if let Some(tid) = terminal_id {
-        // Remote upload uses a dedicated SSH connection so transfer exec
-        // channels cannot close or starve the interactive terminal channel.
-        let handle = connect_russh_transfer_session(&app, tid, &**state).await?;
-        write_remote_file_content(&handle, &dest_path, &content, &app, &transfer_id).await?;
-    } else {
-        // Local upload: write bytes directly.
-        let dest = PathBuf::from(&dest_path);
-        fs::write(&dest, &content).map_err(|error| format!("写入本地文件失败：{error}"))?;
+    let cancellation = register_transfer_cancellation(&state, &transfer_id).await;
+    let result = async {
+        if cancellation.load(Ordering::SeqCst) {
+            return Err("上传已取消".to_string());
+        }
+        if file_name.contains('/') || file_name.contains('\\') || file_name == "." || file_name == ".." {
+            return Err("文件名不能包含路径分隔符或相对路径组件".to_string());
+        }
+        let content = base64_decode(&content_base64)
+            .map_err(|e| format!("Base64 解码失败：{e}"))?;
+        let dest_path = if dest_dir.ends_with('/') {
+            format!("{dest_dir}{file_name}")
+        } else {
+            format!("{dest_dir}/{file_name}")
+        };
+        if let Some(tid) = terminal_id {
+            let attempt_started = AtomicBool::new(false);
+            let handle = connect_russh_transfer_session(&app, tid, &state).await?;
+            if let Err(error) = write_remote_file_atomic(
+                &handle,
+                &dest_path,
+                &content,
+                &app,
+                &transfer_id,
+                Some(&cancellation),
+                &attempt_started,
+            )
+            .await
+            {
+                if attempt_started.load(Ordering::SeqCst) {
+                    return Err(error);
+                }
+                invalidate_transfer_handle(&state, tid).await;
+                if cancellation.load(Ordering::SeqCst) {
+                    return Err("上传已取消".to_string());
+                }
+                let handle = interactive_remote_handle(&state, tid).await?;
+                write_remote_file_atomic(
+                    &handle,
+                    &dest_path,
+                    &content,
+                    &app,
+                    &transfer_id,
+                    Some(&cancellation),
+                    &attempt_started,
+                )
+                .await
+                .map_err(|retry_err| format!("{error}; 重试失败: {retry_err}"))?;
+            }
+        } else {
+            if cancellation.load(Ordering::SeqCst) {
+                return Err("上传已取消".to_string());
+            }
+            let dest = PathBuf::from(&dest_path);
+            fs::write(&dest, &content).map_err(|error| format!("写入本地文件失败：{error}"))?;
+        }
+        Ok(dest_path.clone())
     }
+    .await;
 
-    Ok(dest_path)
+    finish_transfer_cancellation(&state, &transfer_id, &cancellation).await;
+    result
 }
 
 /// Stream-upload a local file to a remote directory by reading the file in
@@ -1471,8 +2160,11 @@ async fn upload_local_file(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let handle = connect_russh_transfer_session(&app, terminal_id, &**state).await?;
-
+    let cancellation = register_transfer_cancellation(&state, &transfer_id).await;
+    let result = async {
+    if cancellation.load(Ordering::SeqCst) {
+        return Err("上传已取消".to_string());
+    }
     let local = PathBuf::from(&local_path);
     let local_file_name = local
         .file_name()
@@ -1486,10 +2178,13 @@ async fn upload_local_file(
         return Err("远程文件名不能包含路径分隔符".to_string());
     }
 
+    // Ensure the local path exists and is a regular file before streaming.
     let metadata = tokio::fs::metadata(&local)
         .await
         .map_err(|e| format!("读取文件信息失败：{e}"))?;
-    let _total = metadata.len() as usize;
+    if !metadata.is_file() {
+        return Err("只能上传普通文件".to_string());
+    }
 
     let dest_path = if dest_dir.ends_with('/') {
         format!("{dest_dir}{file_name}")
@@ -1497,9 +2192,45 @@ async fn upload_local_file(
         format!("{dest_dir}/{file_name}")
     };
 
-    stream_upload_file(&handle, &local, &dest_path, &transfer_id, &app).await?;
+    let attempt_started = AtomicBool::new(false);
+    let handle = connect_russh_transfer_session(&app, terminal_id, &state).await?;
+        if let Err(error) = stream_upload_file_atomic(
+            &handle,
+            &local,
+            &dest_path,
+            &transfer_id,
+            &app,
+            Some(&cancellation),
+            &attempt_started,
+        )
+        .await
+        {
+            if attempt_started.load(Ordering::SeqCst) {
+                return Err(error);
+            }
+            invalidate_transfer_handle(&state, terminal_id).await;
+            if cancellation.load(Ordering::SeqCst) {
+                return Err("上传已取消".to_string());
+            }
+            let handle = connect_russh_transfer_session(&app, terminal_id, &state).await?;
+            stream_upload_file_atomic(
+                &handle,
+                &local,
+                &dest_path,
+                &transfer_id,
+                &app,
+                Some(&cancellation),
+                &attempt_started,
+            )
+            .await
+            .map_err(|retry_err| format!("{error}; 重试失败: {retry_err}"))?;
+        }
+        Ok(dest_path.clone())
+    }
+    .await;
 
-    Ok(dest_path)
+    finish_transfer_cancellation(&state, &transfer_id, &cancellation).await;
+    result
 }
 
 /// Recursively upload a local directory to a remote server via SFTP/SSH.
@@ -1546,7 +2277,7 @@ fn recommended_upload_concurrency(state: &AppState) -> usize {
 /// worker pool matches local load.
 #[tauri::command]
 fn get_upload_concurrency(state: State<'_, Arc<AppState>>) -> usize {
-    recommended_upload_concurrency(&**state)
+    recommended_upload_concurrency(&state)
 }
 
 #[tauri::command]
@@ -1554,10 +2285,14 @@ async fn upload_directory(
     terminal_id: Uuid,
     local_dir: String,
     dest_dir: String,
+    transfer_id: String,
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    let handle = connect_russh_transfer_session(&app, terminal_id, &**state).await?;
+    let cancellation = register_transfer_cancellation(&state, &transfer_id).await;
+
+    let result = async {
+    let handle = connect_russh_transfer_session(&app, terminal_id, &state).await?;
 
     let local_root = PathBuf::from(&local_dir);
     let dir_name = local_root
@@ -1575,7 +2310,7 @@ async fn upload_directory(
     // Create the root directory on remote
     let quoted_root = shell_quote(&remote_root);
     let (_, stderr, code) = exec_remote_command_full(&handle, &format!("mkdir -p {quoted_root}")).await?;
-    if code != 0 {
+    if code != Some(0) {
         return Err(format!("创建远程目录失败: {}", String::from_utf8_lossy(&stderr)));
     }
 
@@ -1592,6 +2327,9 @@ async fn upload_directory(
     let mut dir_stack: Vec<(PathBuf, String)> = vec![(local_root.clone(), remote_root.clone())];
 
     while let Some((local_path, remote_path)) = dir_stack.pop() {
+        if cancellation.load(Ordering::SeqCst) {
+            return Err("上传已取消".to_string());
+        }
         let entries = std::fs::read_dir(&local_path)
             .map_err(|e| format!("读取本地目录失败：{e}"))?;
 
@@ -1605,7 +2343,7 @@ async fn upload_directory(
                 // Create remote subdirectory
                 let quoted = shell_quote(&remote_entry_path);
                 let (_, stderr, code) = exec_remote_command_full(&handle, &format!("mkdir -p {quoted}")).await?;
-                if code != 0 {
+                if code != Some(0) {
                     failed_items.push(format!("目录 {entry_name}: {}", String::from_utf8_lossy(&stderr)));
                     continue;
                 }
@@ -1621,17 +2359,15 @@ async fn upload_directory(
         }
     }
 
-    // Upload all collected files concurrently with a bounded number of parallel
-    // SSH channels. Each file reuses `stream_upload_file` (one channel-open +
-    // exec + eof + wait per file); concurrency overlaps the latency so that N
-    // small files don't each pay a full round-trip sequentially.
-    // Keep one exec channel active on the transfer connection for compatibility
-    // with servers configured with MaxSessions=1 or strict channel policies.
-    let concurrency = 1;
+    // Bounded concurrency on one reused transfer connection.
+    let concurrency = recommended_upload_concurrency(&state).max(1);
     let semaphore = std::sync::Arc::new(Semaphore::new(concurrency));
     let mut tasks = Vec::with_capacity(file_jobs.len());
 
     for (local_path, remote_entry_path) in file_jobs {
+        if cancellation.load(Ordering::SeqCst) {
+            return Err("上传已取消".to_string());
+        }
         let permit = semaphore
             .clone()
             .acquire_owned()
@@ -1639,10 +2375,21 @@ async fn upload_directory(
             .map_err(|e| format!("信号量获取失败：{e}"))?;
         let handle = std::sync::Arc::clone(&handle);
         let app = app.clone();
-        let transfer_id = Uuid::new_v4().to_string();
+        let cancellation = Arc::clone(&cancellation);
+        let child_transfer_id = Uuid::new_v4().to_string();
         let task = tokio::spawn(async move {
             let _permit = permit;
-            stream_upload_file(&handle, &local_path, &remote_entry_path, &transfer_id, &app).await
+            let attempt_started = AtomicBool::new(false);
+            stream_upload_file_atomic(
+                &handle,
+                &local_path,
+                &remote_entry_path,
+                &child_transfer_id,
+                &app,
+                Some(&cancellation),
+                &attempt_started,
+            )
+            .await
         });
         tasks.push(task);
     }
@@ -1682,6 +2429,11 @@ async fn upload_directory(
         "total_bytes": total_bytes,
         "failed_items": failed_items,
     }))
+    }
+    .await;
+
+    finish_transfer_cancellation(&state, &transfer_id, &cancellation).await;
+    result
 }
 
 /// Delete a file or directory (local or remote).
@@ -1701,7 +2453,7 @@ async fn delete_path(
         };
         let quoted = shell_quote(&path);
         let (_, stderr, code) = exec_remote_command_full(&handle, &format!("rm -rf {quoted}")).await?;
-        if code != 0 {
+        if code != Some(0) {
             return Err(format!("删除失败: {}", String::from_utf8_lossy(&stderr)));
         }
     } else {
@@ -1732,7 +2484,7 @@ async fn create_file(
         };
         let quoted = shell_quote(&path);
         let (_, stderr, code) = exec_remote_command_full(&handle, &format!("touch {quoted}")).await?;
-        if code != 0 {
+        if code != Some(0) {
             return Err(format!("创建文件失败: {}", String::from_utf8_lossy(&stderr)));
         }
     } else {
@@ -1762,13 +2514,53 @@ async fn create_directory(
         };
         let quoted = shell_quote(&path);
         let (_, stderr, code) = exec_remote_command_full(&handle, &format!("mkdir -p {quoted}")).await?;
-        if code != 0 {
+        if code != Some(0) {
             return Err(format!("创建目录失败: {}", String::from_utf8_lossy(&stderr)));
         }
     } else {
         fs::create_dir_all(&path).map_err(|e| format!("创建目录失败：{e}"))?;
     }
     Ok(())
+}
+
+fn destination_path(
+    source: &str,
+    dest_dir: &str,
+    dest_name: Option<String>,
+    remote: bool,
+) -> Result<String, String> {
+    if remote {
+        let file_name = dest_name.unwrap_or_else(|| {
+            source
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(source)
+                .to_string()
+        });
+        if file_name.is_empty() {
+            return Err("无法确定源文件名".to_string());
+        }
+        return Ok(if dest_dir.ends_with('/') {
+            format!("{dest_dir}{file_name}")
+        } else {
+            format!("{dest_dir}/{file_name}")
+        });
+    }
+
+    let file_name = match dest_name {
+        Some(name) if !name.trim().is_empty() => PathBuf::from(name),
+        Some(_) => return Err("目标名称不能为空".to_string()),
+        None => Path::new(source)
+            .file_name()
+            .map(PathBuf::from)
+            .ok_or_else(|| "无法确定源文件名".to_string())?,
+    };
+    if file_name.components().count() != 1 {
+        return Err("目标名称不能包含路径分隔符".to_string());
+    }
+
+    Ok(format_path(PathBuf::from(dest_dir).join(file_name)))
 }
 
 /// Copy a file or directory into a destination directory.
@@ -1781,12 +2573,7 @@ async fn copy_path(
     dest_name: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let file_name = dest_name.unwrap_or_else(|| source.rsplit('/').next().unwrap_or(&source).to_string());
-    let dest = if dest_dir.ends_with('/') {
-        format!("{dest_dir}{file_name}")
-    } else {
-        format!("{dest_dir}/{file_name}")
-    };
+    let dest = destination_path(&source, &dest_dir, dest_name, terminal_id.is_some())?;
 
     // Nothing to do if source and destination are identical.
     if source == dest {
@@ -1804,7 +2591,7 @@ async fn copy_path(
         let sq = shell_quote(&source);
         let dq = shell_quote(&dest);
         let (_, stderr, code) = exec_remote_command_full(&handle, &format!("cp -r {sq} {dq}")).await?;
-        if code != 0 {
+        if code != Some(0) {
             return Err(format!("复制失败: {}", String::from_utf8_lossy(&stderr)));
         }
     } else {
@@ -1829,12 +2616,7 @@ async fn move_path(
     dest_name: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let file_name = dest_name.unwrap_or_else(|| source.rsplit('/').next().unwrap_or(&source).to_string());
-    let dest = if dest_dir.ends_with('/') {
-        format!("{dest_dir}{file_name}")
-    } else {
-        format!("{dest_dir}/{file_name}")
-    };
+    let dest = destination_path(&source, &dest_dir, dest_name, terminal_id.is_some())?;
 
     // Nothing to do if source and destination are identical (e.g. renaming
     // a file to its own name, or moving it into the directory it already lives in).
@@ -1853,7 +2635,7 @@ async fn move_path(
         let sq = shell_quote(&source);
         let dq = shell_quote(&dest);
         let (_, stderr, code) = exec_remote_command_full(&handle, &format!("mv {sq} {dq}")).await?;
-        if code != 0 {
+        if code != Some(0) {
             return Err(format!("移动失败: {}", String::from_utf8_lossy(&stderr)));
         }
     } else {
@@ -1881,7 +2663,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 /// Simple base64 encoder (avoids adding the base64 crate dependency).
 fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
@@ -1921,7 +2703,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     if filtered.is_empty() {
         return Ok(Vec::new());
     }
-    if filtered.len() % 4 != 0 {
+    if !filtered.len().is_multiple_of(4) {
         return Err(format!("无效的 base64 长度: {}", filtered.len()));
     }
     let mut out = Vec::with_capacity(filtered.len() / 4 * 3);
@@ -2012,25 +2794,90 @@ async fn read_file_as_data_url(
 async fn download_remote_file(
     terminal_id: Uuid,
     remote_path: String,
-    local_dir: String,
+    transfer_id: String,
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let handle = {
-        let terminals = state.remote_terminals.lock().await;
-        terminals
-            .get(&terminal_id)
-            .map(|session| Arc::clone(&session.handle))
-            .ok_or_else(|| format!("terminal is not connected: {terminal_id}"))?
-    };
+    let cancellation = register_transfer_cancellation(&state, &transfer_id).await;
+    let result = async {
+    const DOWNLOAD_LIMIT: u64 = 512 * 1024 * 1024; // 512 MB safety cap
+    let local_dir = default_download_directory()?;
 
-    let quoted = shell_quote(&remote_path);
-    let bytes = exec_remote_command(&handle, &format!("cat {quoted} 2>/dev/null")).await?;
+    async fn download_once(
+        handle: &SharedRemoteHandle,
+        remote_path: &str,
+        local_dir: &Path,
+        cancellation: &AtomicBool,
+    ) -> Result<String, String> {
+        let quoted = shell_quote(remote_path);
 
-    let file_name = remote_path.rsplit('/').next().unwrap_or("download");
-    let local_path = PathBuf::from(&local_dir).join(file_name);
-    fs::write(&local_path, &bytes)
-        .map_err(|e| format!("写入本地文件失败：{e}"))?;
-    Ok(local_path.to_string_lossy().to_string())
+        // Portable size probe (GNU stat / BSD stat / wc fallback).
+        let size_cmd = format!(
+            "stat -c %s {quoted} 2>/dev/null || stat -f %z {quoted} 2>/dev/null || wc -c < {quoted} 2>/dev/null || echo 0"
+        );
+        let (size_out, size_stderr, size_code) = exec_remote_command_full(handle, &size_cmd).await?;
+        if size_code != Some(0) {
+            return Err(format!(
+                "读取远程文件大小失败（退出码 {size_code:?}）: {}",
+                String::from_utf8_lossy(&size_stderr).trim()
+            ));
+        }
+        let size: u64 = String::from_utf8_lossy(&size_out)
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if size > DOWNLOAD_LIMIT {
+            return Err(format!(
+                "文件过大（{} 字节），下载上限 {} 字节",
+                size, DOWNLOAD_LIMIT
+            ));
+        }
+
+        if cancellation.load(Ordering::SeqCst) {
+            return Err("下载已取消".to_string());
+        }
+        let (bytes, stderr, code) = exec_remote_command_full_cancellable(
+            handle,
+            &format!("cat {quoted}"),
+            cancellation,
+        )
+        .await?;
+        if code != Some(0) {
+            let detail = String::from_utf8_lossy(&stderr);
+            return Err(format!("下载失败（退出码 {code:?}）: {}", detail.trim()));
+        }
+        if size > 0 && bytes.is_empty() {
+            return Err("下载失败：远端返回空内容".to_string());
+        }
+
+        if cancellation.load(Ordering::SeqCst) {
+            return Err("下载已取消".to_string());
+        }
+        let file_name = remote_path.rsplit('/').next().unwrap_or("download");
+        let local_path = write_unique_local_file(local_dir, file_name, &bytes)?;
+        Ok(local_path.to_string_lossy().to_string())
+    }
+
+    let handle = connect_russh_transfer_session(&app, terminal_id, &state).await?;
+    match download_once(&handle, &remote_path, &local_dir, &cancellation).await {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            invalidate_transfer_handle(&state, terminal_id).await;
+            if cancellation.load(Ordering::SeqCst) {
+                return Err("下载已取消".to_string());
+            }
+            let handle = connect_russh_transfer_session(&app, terminal_id, &state).await?;
+            download_once(&handle, &remote_path, &local_dir, &cancellation)
+                .await
+                .map_err(|retry_err| format!("{error}; 重试失败: {retry_err}"))
+        }
+    }
+    }
+    .await;
+
+    finish_transfer_cancellation(&state, &transfer_id, &cancellation).await;
+    result
 }
 
 /// Build the shell command for extracting an archive into a destination
@@ -2093,13 +2940,13 @@ async fn extract_archive(
                 .ok_or_else(|| format!("terminal is not connected: {tid}"))?
         };
         let (stdout, stderr, exit_code) = exec_remote_command_full(&handle, &cmd).await?;
-        if exit_code != 0 {
+        if exit_code != Some(0) {
             let detail = if !stderr.is_empty() {
                 String::from_utf8_lossy(&stderr).to_string()
             } else if !stdout.is_empty() {
                 String::from_utf8_lossy(&stdout).to_string()
             } else {
-                format!("退出码: {exit_code}")
+                format!("退出码: {exit_code:?}")
             };
             return Err(format!("远程解压失败: {detail}"));
         }
@@ -2250,11 +3097,11 @@ async fn create_archive(
         };
         let cmd = format!("rm -f {aq} && zip -r {aq} {q}");
         let (_stdout, stderr, exit_code) = exec_remote_command_full(&handle, &cmd).await?;
-        if exit_code != 0 {
+        if exit_code != Some(0) {
             let detail = if !stderr.is_empty() {
                 String::from_utf8_lossy(&stderr).to_string()
             } else {
-                format!("退出码: {exit_code}")
+                format!("退出码: {exit_code:?}")
             };
             return Err(format!("远程压缩失败: {detail}"));
         }
@@ -2390,7 +3237,7 @@ async fn get_process_list(
         // Output format: P \t pid \t name \t stat \t cpu_total% \t mem_bytes \t 0 \t 0
         let cmd = r#"nproc=$(nproc 2>/dev/null||echo 1);mem_total=$(awk "/^MemTotal/{print \$2*1024}" /proc/meminfo 2>/dev/null||echo 0);ps aux --sort=-%cpu 2>/dev/null | head -50 | awk -v nc="$nproc" -v mt="$mem_total" "BEGIN{OFS=\"\t\"}NR>1{pid=\$2;cpu=\$3;mem=\$4;stat=substr(\$8,1,1);cmd=\$11;for(i=12;i<=NF;i++)cmd=cmd FS \$i;if(length(cmd)>30)cmd=substr(cmd,1,30);printf \"P\t%d\t%s\t%s\t%.1f\t%d\t0\t0\n\",pid,cmd,stat,cpu/nc,int(mem*mt/100)}" && echo END_PROCESS_LIST"#;
         let (stdout, stderr, code) = exec_remote_command_full(&handle, cmd).await?;
-        if code != 0 {
+        if code != Some(0) {
             return Err(format!("获取进程列表失败: {}", String::from_utf8_lossy(&stderr)));
         }
 
@@ -2588,7 +3435,7 @@ echo "procs=$PROCS"
 "#;
 
         let (stdout, stderr, code) = exec_remote_command_full(&handle, cmd).await?;
-        if code != 0 {
+        if code != Some(0) {
             return Err(format!("获取系统监控数据失败: {}", String::from_utf8_lossy(&stderr)));
         }
 
@@ -2596,7 +3443,7 @@ echo "procs=$PROCS"
         let mut lines = output.lines().peekable();
 
         // Find the MONITOR_RESULT marker
-        while let Some(line) = lines.next() {
+        for line in lines.by_ref() {
             if line.trim() == "MONITOR_RESULT" { break; }
         }
 
@@ -2962,9 +3809,22 @@ async fn connect_session(
         }
     };
 
-    // Insert under the new terminal_id.
-    let mut terminals = state.remote_terminals.lock().await;
-    terminals.insert(terminal_id, remote_session);
+    let closed = Arc::clone(&remote_session.closed);
+    let close_notification = Arc::clone(&remote_session.close_notification);
+    let cleanup_state = Arc::clone(state.inner());
+    {
+        let mut terminals = state.remote_terminals.lock().await;
+        terminals.insert(terminal_id, remote_session);
+    }
+    tokio::spawn(async move {
+        if !closed.load(Ordering::SeqCst) {
+            close_notification.notified().await;
+        }
+        let removed = cleanup_state.remote_terminals.lock().await.remove(&terminal_id);
+        if removed.is_some() {
+            invalidate_transfer_handle(&cleanup_state, terminal_id).await;
+        }
+    });
 
     Ok(TerminalEvent {
         session_id: terminal_id,
@@ -2978,11 +3838,15 @@ async fn disconnect_session(
     terminal_id: Uuid,
     state: State<'_, Arc<AppState>>,
 ) -> Result<TerminalEvent, String> {
-    let mut terminals = state.remote_terminals.lock().await;
-    if let Some(session) = terminals.remove(&terminal_id) {
+    let session = {
+        let mut terminals = state.remote_terminals.lock().await;
+        terminals.remove(&terminal_id)
+    };
+    if let Some(session) = session {
         session.closed.store(true, Ordering::SeqCst);
         let _ = session.control.send(RemoteTerminalCommand::Close).await;
     }
+    invalidate_transfer_handle(&state, terminal_id).await;
 
     Ok(TerminalEvent {
         session_id: terminal_id,
@@ -2996,13 +3860,15 @@ async fn terminal_write(
     request: TerminalWriteRequest,
     state: State<'_, Arc<AppState>>,
 ) -> Result<TerminalEvent, String> {
-    let mut terminals = state.remote_terminals.lock().await;
-    let session = terminals
-        .get_mut(&request.terminal_id)
-        .ok_or_else(|| format!("terminal is not connected: {}", request.terminal_id))?;
+    let control = {
+        let terminals = state.remote_terminals.lock().await;
+        terminals
+            .get(&request.terminal_id)
+            .map(|session| session.control.clone())
+            .ok_or_else(|| format!("terminal is not connected: {}", request.terminal_id))?
+    };
 
-    session
-        .control
+    control
         .send(RemoteTerminalCommand::Write(request.data))
         .await
         .map_err(|error| format!("terminal write failed: {error}"))?;
@@ -3019,13 +3885,15 @@ async fn terminal_resize(
     request: TerminalResizeRequest,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let mut terminals = state.remote_terminals.lock().await;
-    let session = terminals
-        .get_mut(&request.terminal_id)
-        .ok_or_else(|| format!("terminal is not connected: {}", request.terminal_id))?;
+    let control = {
+        let terminals = state.remote_terminals.lock().await;
+        terminals
+            .get(&request.terminal_id)
+            .map(|session| session.control.clone())
+            .ok_or_else(|| format!("terminal is not connected: {}", request.terminal_id))?
+    };
 
-    session
-        .control
+    control
         .send(RemoteTerminalCommand::Resize {
             cols: request.cols.max(1),
             rows: request.rows.max(1),
@@ -3067,6 +3935,8 @@ fn main() {
         sessions: Mutex::new(SessionCatalog::new(load_initial_sessions())),
         local_terminals: Mutex::new(HashMap::new()),
         remote_terminals: Mutex::new(HashMap::new()),
+        transfer_handles: Mutex::new(HashMap::new()),
+        transfer_cancellations: Mutex::new(HashMap::new()),
         local_sys_monitor: std::sync::Mutex::new(None),
     });
 
@@ -3136,6 +4006,7 @@ fn main() {
             write_remote_file,
             upload_file,
             upload_local_file,
+            cancel_transfer,
             upload_directory,
             read_file_as_data_url,
             download_remote_file,
@@ -3154,4 +4025,86 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run PandaTerm");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drive_enumeration_includes_both_boundaries() {
+        let letters: Vec<char> = windows_drive_letters().collect();
+        assert_eq!(letters.len(), 26);
+        assert_eq!(letters.first(), Some(&'A'));
+        assert_eq!(letters.last(), Some(&'Z'));
+    }
+
+    #[test]
+    fn remote_temp_path_sanitizes_transfer_id() {
+        assert_eq!(
+            remote_temp_path("/tmp/report.txt", "job/42:unsafe"),
+            "/tmp/report.txt.pandaterm-job42unsafe.part"
+        );
+    }
+
+    #[test]
+    fn upload_completion_accepts_marker_without_exit_status() {
+        assert!(validate_remote_upload_completion(None, true).is_ok());
+        assert!(validate_remote_upload_completion(Some(0), true).is_ok());
+        assert!(validate_remote_upload_completion(None, false).is_err());
+        assert!(validate_remote_upload_completion(Some(1), true).is_err());
+    }
+
+    #[test]
+    fn download_destination_avoids_overwriting_existing_file() {
+        let directory = std::env::temp_dir().join(format!("pandaterm-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("create test directory");
+        fs::write(directory.join("report.txt"), b"existing").expect("create existing file");
+
+        let destination = write_unique_local_file(&directory, "report.txt", b"new")
+            .expect("write unique destination");
+        assert_eq!(destination, directory.join("report (1).txt"));
+        assert_eq!(fs::read(destination).expect("read downloaded file"), b"new");
+
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn concurrent_download_writes_reserve_distinct_paths() {
+        let directory = Arc::new(
+            std::env::temp_dir().join(format!("pandaterm-test-{}", Uuid::new_v4())),
+        );
+        fs::create_dir_all(directory.as_ref()).expect("create test directory");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let writers = [b"first".as_slice(), b"second".as_slice()].map(|content| {
+            let directory = Arc::clone(&directory);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                write_unique_local_file(directory.as_ref(), "report.txt", content)
+                    .expect("write unique download")
+            })
+        });
+        let [first, second] = writers.map(|writer| writer.join().expect("join download writer"));
+
+        assert_ne!(first, second);
+        assert_eq!(fs::read(&first).expect("read first download").len(), 5);
+        assert_eq!(fs::read(&second).expect("read second download").len(), 6);
+
+        fs::remove_dir_all(directory.as_ref()).expect("remove test directory");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn local_destination_uses_windows_path_components() {
+        let destination = destination_path(
+            r"C:\source\report.txt",
+            r"D:\downloads",
+            None,
+            false,
+        )
+        .expect("resolve Windows destination");
+        assert_eq!(destination, r"D:\downloads\report.txt");
+    }
 }

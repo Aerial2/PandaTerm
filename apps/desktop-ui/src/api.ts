@@ -260,6 +260,10 @@ export async function uploadFile(fileName: string, content: Uint8Array, destDir:
   });
 }
 
+export async function cancelTransfer(transferId: string): Promise<void> {
+  await invoke('cancel_transfer', { transferId });
+}
+
 /// Stream-upload a local file to a remote directory. The Rust backend reads
 /// the file in chunks and pipes it through SSH, so we avoid base64-encoding
 /// large files on the JS side (which blocks the UI and freezes progress).
@@ -290,11 +294,12 @@ export type UploadDirectoryResult = {
 
 /// Recursively upload a local directory to a remote server.
 /// Creates directory structure on remote and uploads all files.
-export async function uploadDirectory(localDir: string, destDir: string, terminalId: string): Promise<UploadDirectoryResult> {
+export async function uploadDirectory(localDir: string, destDir: string, terminalId: string, transferId: string): Promise<UploadDirectoryResult> {
   return await invoke<UploadDirectoryResult>('upload_directory', {
     terminalId,
     localDir,
     destDir,
+    transferId,
   });
 }
 
@@ -305,8 +310,8 @@ export async function readFileAsDataUrl(path: string, terminalId?: string | null
   });
 }
 
-export async function downloadRemoteFile(terminalId: string, remotePath: string, localDir: string): Promise<string> {
-  return await invoke<string>('download_remote_file', { terminalId, remotePath, localDir });
+export async function downloadRemoteFile(terminalId: string, remotePath: string, transferId: string): Promise<string> {
+  return await invoke<string>('download_remote_file', { terminalId, remotePath, transferId });
 }
 
 export async function extractArchive(archivePath: string, terminalId?: string | null): Promise<string> {

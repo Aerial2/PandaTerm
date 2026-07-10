@@ -56,6 +56,7 @@ import {
   writeRemoteFile,
   uploadFile,
   uploadLocalFile,
+  cancelTransfer,
   uploadDirectory,
   readFileAsDataUrl,
   downloadRemoteFile,
@@ -451,6 +452,13 @@ function collectTerminalLayoutTabIds(node?: TerminalLayoutNode): string[] {
   return [...collectTerminalLayoutTabIds(node.first), ...collectTerminalLayoutTabIds(node.second)];
 }
 
+function terminalLayoutContainsSplit(node: TerminalLayoutNode, splitId: string): boolean {
+  if (node.type === 'leaf') return false;
+  return node.id === splitId
+    || terminalLayoutContainsSplit(node.first, splitId)
+    || terminalLayoutContainsSplit(node.second, splitId);
+}
+
 function clampSplitRatio(value: number) {
   return Math.min(TERMINAL_SPLIT_RATIO_MAX, Math.max(TERMINAL_SPLIT_RATIO_MIN, value));
 }
@@ -605,8 +613,10 @@ export function App() {
 
   const [monitorData, setMonitorData] = useState<SystemMonitorData | null>(null);
   const [isLoadingMonitor, setIsLoadingMonitor] = useState(false);
+  const monitorRequestGenerationRef = useRef(0);
   const [processList, setProcessList] = useState<ProcessInfo[]>([]);
   const [isLoadingProcesses, setIsLoadingProcesses] = useState(false);
+  const processRequestGenerationRef = useRef(0);
   const [processSortKey, setProcessSortKey] = useState<'cpu' | 'memory' | 'name'>('cpu');
   const [processSearch, setProcessSearch] = useState('');
   const [currentPath, setCurrentPath] = useState('');
@@ -627,7 +637,7 @@ export function App() {
   const [sortKey, setSortKey] = useState<ResourceSortKey>('name');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
   const [resourceBottomTab, setResourceBottomTab] = useState<ResourceBottomTab>('transfer');
-  const [resourceBottomPanelHeight, setResourceBottomPanelHeight] = useState(148);
+  const [resourceBottomPanelHeight, setResourceBottomPanelHeight] = useState(180);
   const resourceBottomPanelRef = useRef<HTMLDivElement | null>(null);
   const resourceBottomDragRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const [transferRecords, setTransferRecords] = useState<TransferRecord[]>([]);
@@ -671,6 +681,7 @@ export function App() {
   const folderInputRef = useRef<HTMLInputElement | null>(null);
   const pathEditInputRef = useRef<HTMLInputElement | null>(null);
   const uploadAbortRefs = useRef<Map<string, AbortController>>(new Map());
+  const editorSaveGenerationRef = useRef<Map<string, number>>(new Map());
   const localIpCacheRef = useRef<string | null>(null);
   const [openingConnection, setOpeningConnection] = useState<{ session: Session; startedAt: number; seconds: number } | null>(null);
   const [statusMessage, setStatusMessage] = useState('当前上下文：本地系统');
@@ -695,6 +706,7 @@ export function App() {
   const terminalSplitResizeRef = useRef<TerminalSplitResizeCandidate | null>(null);
   const paneTabElRefs = useRef<Map<string, HTMLElement>>(new Map());
   const tabsRef = useRef<WorkspaceTab[]>([]);
+  const cancelledConnectionTabIdsRef = useRef<Set<string>>(new Set());
   // Track which terminal_ids have been started on the backend to avoid double-start
   const startedTerminalsRef = useRef<Set<string>>(new Set());
   // Map backend terminal_id → tab id, set immediately when startLocalTerminal resolves.
@@ -706,6 +718,7 @@ export function App() {
   // Per-pane navigation history: each terminal pane keeps its own back/forward
   // stack so switching between local and remote panes restores the right trail.
   const navHistoryRef = useRef<Map<string, { history: string[]; index: number }>>(new Map());
+  const directoryLoadGenerationRef = useRef(0);
 
   function getTerminalViewportSize(tabId: string) {
     const host = terminalHostsRef.current.get(tabId);
@@ -978,9 +991,13 @@ export function App() {
     if (abortCtrl) {
       abortCtrl.abort();
       uploadAbortRefs.current.delete(id);
+      void cancelTransfer(id).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        addLogEntry('error', `取消传输失败：${message}`);
+      });
     }
     updateTransferRecord(id, { status: 'cancelled', message: '已取消' });
-    addLogEntry('warn', `上传已取消`);
+    addLogEntry('warn', '传输已取消');
   }
 
   function disposeTerminalRuntime(tab: WorkspaceTab) {
@@ -1091,6 +1108,13 @@ export function App() {
   // (back/forward/pane-switch).
   async function loadResourceDirectory(path?: string | null, recordHistory = true): Promise<void> {
     const tab = activePaneTabRef.current;
+    const paneKey = tab?.id ?? '__local__';
+    const requestGeneration = ++directoryLoadGenerationRef.current;
+    const isCurrentRequest = () => {
+      const currentTab = activePaneTabRef.current;
+      return directoryLoadGenerationRef.current === requestGeneration
+        && (currentTab?.id ?? '__local__') === paneKey;
+    };
     const local = isLocalResourceTab(tab);
     setIsLoadingFiles(true);
     setFileListError('');
@@ -1103,6 +1127,15 @@ export function App() {
       if (!listing) {
         throw new Error('远程终端尚未连接，无法浏览文件');
       }
+      if (local && !localIpCacheRef.current) {
+        try {
+          localIpCacheRef.current = await getLocalIpv4();
+        } catch {
+          localIpCacheRef.current = '127.0.0.1';
+        }
+      }
+      if (!isCurrentRequest()) return;
+
       const nextFiles = listing.entries.map(toResourceFile);
       setCurrentPath(listing.path);
       setPathInput(listing.path);
@@ -1115,20 +1148,12 @@ export function App() {
       setMediaViewer(null);
       setMediaError('');
       if (local) {
-        if (!localIpCacheRef.current) {
-          try {
-            localIpCacheRef.current = await getLocalIpv4();
-          } catch {
-            localIpCacheRef.current = '127.0.0.1';
-          }
-        }
-        setStatusMessage(localIpCacheRef.current);
+        setStatusMessage(localIpCacheRef.current || '127.0.0.1');
       } else {
         setStatusMessage(tab?.session.host ?? '');
       }
 
       // Update per-pane navigation history.
-      const paneKey = tab?.id ?? '__local__';
       const entry = navHistoryRef.current.get(paneKey);
       if (recordHistory) {
         if (entry) {
@@ -1149,11 +1174,12 @@ export function App() {
         syncNavButtons([], -1);
       }
     } catch (error) {
+      if (!isCurrentRequest()) return;
       const message = error instanceof Error ? error.message : String(error);
       setFileListError(message);
       setStatusMessage(`读取目录失败：${message}`);
     } finally {
-      setIsLoadingFiles(false);
+      if (isCurrentRequest()) setIsLoadingFiles(false);
     }
   }
 
@@ -1349,6 +1375,9 @@ export function App() {
   async function closeTab(tab: WorkspaceTab) {
     const relatedTabIds = [tab.id, ...tabs.filter((item) => item.parentTabId === tab.id).map((item) => item.id)];
     for (const relatedTab of tabs.filter((item) => relatedTabIds.includes(item.id))) {
+      if (relatedTab.kind === 'terminal' && relatedTab.status === 'connecting' && !relatedTab.terminalId) {
+        cancelledConnectionTabIdsRef.current.add(relatedTab.id);
+      }
       disposeTerminalRuntime({ ...relatedTab, closedByUser: true, status: 'closed' });
     }
 
@@ -1415,6 +1444,11 @@ export function App() {
         setOpeningConnection({ session, startedAt: Date.now(), seconds: 0 });
         const event = await connectSession(session.id);
         const terminalId = event.session_id;
+        if (cancelledConnectionTabIdsRef.current.delete(nextTab.id)) {
+          await disconnectSession(terminalId).catch(() => {});
+          setOpeningConnection(null);
+          return;
+        }
         setTabs((current) =>
           current.map((item) =>
             item.id === nextTab.id
@@ -1434,6 +1468,10 @@ export function App() {
           setStatusMessage(`SSH 已建立，等待远程终端输出：${session.name}`);
         }
       } catch (error) {
+        if (cancelledConnectionTabIdsRef.current.delete(nextTab.id)) {
+          setOpeningConnection(null);
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         setOpeningConnection(null);
         setTabs((current) =>
@@ -1477,7 +1515,12 @@ export function App() {
     }
 
     const paneTab = tabsRef.current.find((item) => item.id === paneId);
-    if (paneTab) disposeTerminalRuntime({ ...paneTab, closedByUser: true, status: 'closed' });
+    if (paneTab) {
+      if (paneTab.status === 'connecting' && !paneTab.terminalId) {
+        cancelledConnectionTabIdsRef.current.add(paneTab.id);
+      }
+      disposeTerminalRuntime({ ...paneTab, closedByUser: true, status: 'closed' });
+    }
 
     setTabs((current) => current
       .filter((item) => item.id !== paneId)
@@ -1502,6 +1545,11 @@ export function App() {
       const event = await connectSession(session.id);
       // The backend returns a terminal_id in event.session_id
       const terminalId = event.session_id;
+      if (cancelledConnectionTabIdsRef.current.delete(tabId)) {
+        await disconnectSession(terminalId).catch(() => {});
+        setOpeningConnection(null);
+        return;
+      }
       setTabs((current) =>
         current.map((item) =>
           item.id === tabId
@@ -1521,6 +1569,10 @@ export function App() {
         setStatusMessage(`SSH 已建立，等待远程终端输出：${session.name}`);
       }
     } catch (error) {
+      if (cancelledConnectionTabIdsRef.current.delete(tabId)) {
+        setOpeningConnection(null);
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       setOpeningConnection(null);
       setTabs((current) =>
@@ -1783,6 +1835,13 @@ export function App() {
           syncSize();
           if (tabId === activePaneIdRef.current) terminal.focus();
           void startLocalTerminal(localTerminalProfile.cwd || null, terminal.cols, terminal.rows).then((profile) => {
+            if (cancelledConnectionTabIdsRef.current.delete(terminalTab.id)) {
+              startedTerminalsRef.current.delete(terminalTab.id);
+              pendingOutputRef.current.delete(profile.terminal_id);
+              terminalIdToTabIdRef.current.delete(profile.terminal_id);
+              void stopLocalTerminal(profile.terminal_id).catch(() => {});
+              return;
+            }
             terminalIdToTabIdRef.current.set(profile.terminal_id, terminalTab.id);
             const pending = pendingOutputRef.current.get(profile.terminal_id);
             if (pending) {
@@ -1808,6 +1867,10 @@ export function App() {
             startedTerminalsRef.current.add(profile.terminal_id);
             scheduleTerminalSettledFit(terminalTab.id);
           }).catch((error) => {
+            if (cancelledConnectionTabIdsRef.current.delete(terminalTab.id)) {
+              startedTerminalsRef.current.delete(terminalTab.id);
+              return;
+            }
             const message = error instanceof Error ? error.message : String(error);
             setTabs((current) =>
               current.map((item) =>
@@ -1990,6 +2053,7 @@ export function App() {
   }
 
   function closeEditorTab(id: string) {
+    editorSaveGenerationRef.current.delete(id);
     setEditorTabs((current) => {
       const next = current.filter((t) => t.id !== id);
       if (activeEditorTabId === id) {
@@ -2011,17 +2075,21 @@ export function App() {
   async function saveEditorFile(id: string) {
     const tab = editorTabs.find((t) => t.id === id);
     if (!tab || tab.content === tab.originalContent) return;
+    const generation = (editorSaveGenerationRef.current.get(id) ?? 0) + 1;
+    editorSaveGenerationRef.current.set(id, generation);
     try {
       if (tab.isRemote && tab.terminalId) {
         await writeRemoteFile(tab.terminalId, tab.path, tab.content);
       } else {
         await writeLocalFile(tab.path, tab.content);
       }
+      if (editorSaveGenerationRef.current.get(id) !== generation) return;
       setEditorTabs((current) => current.map((t) =>
         t.id === id ? { ...t, originalContent: tab.content } : t,
       ));
       setStatusMessage(`已保存：${tab.path}`);
     } catch (error) {
+      if (editorSaveGenerationRef.current.get(id) !== generation) return;
       const message = error instanceof Error ? error.message : String(error);
       setStatusMessage(`保存失败：${message}`);
     }
@@ -2038,6 +2106,7 @@ export function App() {
   async function uploadFiles(fileList: File[], localPaths?: string[], relativePaths?: string[]) {
     if (fileList.length === 0) return;
     const tab = activePaneTabRef.current;
+    const sourcePaneKey = tab?.id ?? '__local__';
     const local = isLocalResourceTab(tab);
     const destDir = currentPath || (local ? '.' : '~');
     const targetLabel = local ? '本地' : `远程 ${tab?.session.name ?? ''}`;
@@ -2096,22 +2165,37 @@ export function App() {
 
       // One shared progress listener for all concurrent uploads. It maps each
       // event's transfer_id back to its transfer record and updates progress.
-      const speedTrackers = new Map<string, { lastEventTime: number; lastEventTransferred: number }>();
-      const progressUnlisten = await listen<{ transfer_id: string; transferred: number; total: number }>(
+      const speedTrackers = new Map<string, { startTime: number }>();
+      const progressUnlisten = await listen<{
+        transfer_id: string;
+        phase: 'transferring' | 'verifying' | 'committing';
+        transferred?: number;
+        total?: number;
+      }>(
         'upload-progress',
         (event) => {
-          const { transfer_id, transferred, total } = event.payload;
+          const { transfer_id, phase } = event.payload;
+          if (phase === 'verifying' || phase === 'committing') {
+            updateTransferRecord(transfer_id, (prev) => ({
+              progress: 100,
+              transferred: prev.size,
+              speed: 0,
+              message: phase === 'verifying'
+                ? '数据已发送，等待远程确认...'
+                : '远程确认完成，正在提交文件...',
+            }));
+            return;
+          }
+
+          const transferred = event.payload.transferred ?? 0;
+          const total = event.payload.total ?? 0;
           const tracker = speedTrackers.get(transfer_id);
-          const now = Date.now();
-          const db = transferred - (tracker?.lastEventTransferred ?? 0);
-          const dt = tracker ? (now - tracker.lastEventTime) / 1000 : 0;
-          const instSpeed = dt > 0 ? db / dt : 0;
-          speedTrackers.set(transfer_id, { lastEventTime: now, lastEventTransferred: transferred });
+          const elapsed = tracker ? (Date.now() - tracker.startTime) / 1000 : 0;
+          const measuredSpeed = elapsed > 0 ? transferred / elapsed : 0;
           updateTransferRecord(transfer_id, (prev) => {
             const progress = total > 0 ? Math.min((transferred / total) * 100, 100) : 0;
-            const smoothed = prev.speed > 0 ? prev.speed * 0.5 + instSpeed * 0.5 : instSpeed;
             const sizePatch = prev.size === 0 && total > 0 ? { size: total } : {};
-            return { progress, transferred, speed: smoothed, message: '正在传输...', ...sizePatch };
+            return { progress, transferred, speed: measuredSpeed, message: '正在传输...', ...sizePatch };
           });
         },
       );
@@ -2167,7 +2251,7 @@ export function App() {
         const abortCtrl = new AbortController();
         uploadAbortRefs.current.set(recordId, abortCtrl);
         const startTime = Date.now();
-        speedTrackers.set(recordId, { lastEventTime: startTime, lastEventTransferred: 0 });
+        speedTrackers.set(recordId, { startTime });
         try {
           if (abortCtrl.signal.aborted) throw new DOMException('已取消', 'AbortError');
           if (useStreamUpload) {
@@ -2230,7 +2314,9 @@ export function App() {
       progressUnlisten();
       if (uploaded > 0) {
         setStatusMessage(`已上传 ${uploaded} 个文件到 ${targetLabel}：${destDir}${skipped > 0 ? `，跳过 ${skipped} 个` : ''}`);
-        await loadResourceDirectory(destDir, false);
+        if ((activePaneTabRef.current?.id ?? '__local__') === sourcePaneKey && currentPathRef.current === destDir) {
+          await loadResourceDirectory(destDir, false);
+        }
       } else if (skipped > 0) {
         setStatusMessage(`已跳过 ${skipped} 个文件`);
       }
@@ -2455,28 +2541,55 @@ export function App() {
 
   /// Upload a local directory to remote via the upload_directory command.
   async function handleDirectoryUpload(localPath: string, terminalId: string) {
+    const sourcePaneKey = activePaneTabRef.current?.id ?? '__local__';
     const destDir = currentPath || '~';
     const dirName = localPath.split(/[/\\]/).pop() || '';
     setIsUploading(true);
     addLogEntry('info', `开始上传目录 ${dirName} 到远程：${destDir}`);
     setStatusMessage(`正在上传目录 ${dirName}...`);
+    const recordId = addTransferRecord({
+      fileName: dirName,
+      direction: 'upload',
+      target: destDir,
+      size: 0,
+      status: 'uploading',
+      message: '目录上传中...',
+    });
+    const abortCtrl = new AbortController();
+    uploadAbortRefs.current.set(recordId, abortCtrl);
 
     try {
-      const result = await uploadDirectory(localPath, destDir, terminalId);
+      const result = await uploadDirectory(localPath, destDir, terminalId, recordId);
       const msg = result.failed_items.length > 0
         ? `目录上传完成：${result.files_uploaded} 个文件，${result.dirs_created} 个目录${result.failed_items.length > 0 ? `，${result.failed_items.length} 个失败` : ''}`
         : `目录上传完成：${result.files_uploaded} 个文件，${result.dirs_created} 个目录`;
+      updateTransferRecord(recordId, {
+        status: result.failed_items.length > 0 ? 'failed' : 'success',
+        progress: 100,
+        transferred: result.total_bytes,
+        size: result.total_bytes,
+        message: result.failed_items.length > 0 ? '部分失败' : '已完成',
+      });
       addLogEntry(result.failed_items.length > 0 ? 'warn' : 'info', msg);
       if (result.failed_items.length > 0) {
         addLogEntry('error', `失败项：${result.failed_items.join('; ')}`);
       }
       setStatusMessage(msg);
-      await loadResourceDirectory(destDir, false);
+      if ((activePaneTabRef.current?.id ?? '__local__') === sourcePaneKey) {
+        await loadResourceDirectory(destDir, false);
+      }
     } catch (error) {
+      if (abortCtrl.signal.aborted) {
+        updateTransferRecord(recordId, { status: 'cancelled', message: '已取消' });
+        setStatusMessage(`目录上传已取消：${dirName}`);
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
+      updateTransferRecord(recordId, { status: 'failed', message });
       addLogEntry('error', `目录上传失败：${message}`);
       setStatusMessage(`目录上传失败：${message}`);
     } finally {
+      uploadAbortRefs.current.delete(recordId);
       setIsUploading(false);
     }
   }
@@ -2505,46 +2618,37 @@ export function App() {
       setStatusMessage('仅支持下载远程文件到本地');
       return;
     }
-    const localDir = currentPathRef.current || '.';
-    addLogEntry('info', `开始下载：${file.name} → ${localDir}`);
+    addLogEntry('info', `开始下载：${file.name} → 系统下载目录`);
     const recordId = addTransferRecord({
       fileName: file.name,
       direction: 'download',
-      target: localDir,
+      target: '系统下载目录',
       size: file.sizeBytes,
       status: 'uploading',
-      message: '下载中...',
+      message: '正在接收数据...',
     });
+    const abortCtrl = new AbortController();
+    uploadAbortRefs.current.set(recordId, abortCtrl);
     const startTime = Date.now();
-    const progressTimer = setInterval(() => {
-      updateTransferRecord(recordId, (prev) => {
-        const elapsed = (Date.now() - startTime) / 1000;
-        if (prev.progress >= 85) {
-          const transferredAt85 = Math.floor(0.85 * file.sizeBytes);
-          const realSpeed = elapsed > 0 ? transferredAt85 / elapsed : 0;
-          return { speed: realSpeed, message: '正在接收数据...' };
-        }
-        const inc = Math.random() * 2 + 1;
-        const newProgress = Math.min(prev.progress + inc, 85);
-        const newTransferred = Math.floor((newProgress / 100) * file.sizeBytes);
-        const realSpeed = elapsed > 0 ? newTransferred / elapsed : 0;
-        return { progress: newProgress, transferred: newTransferred, speed: realSpeed };
-      });
-    }, 300);
     try {
-      const savedPath = await downloadRemoteFile(tab.terminalId, file.path, localDir);
-      clearInterval(progressTimer);
+      const savedPath = await downloadRemoteFile(tab.terminalId, file.path, recordId);
       const elapsed = (Date.now() - startTime) / 1000;
       const avgSpeed = elapsed > 0 ? file.sizeBytes / elapsed : 0;
-      updateTransferRecord(recordId, { status: 'success', progress: 100, transferred: file.sizeBytes, speed: avgSpeed, message: '已完成' });
+      updateTransferRecord(recordId, { status: 'success', progress: 100, transferred: file.sizeBytes, speed: avgSpeed, message: '已完成', target: savedPath });
       addLogEntry('info', `下载完成：${file.name} → ${savedPath} (${formatFileSize(file.sizeBytes)})`);
       setStatusMessage(`已下载到：${savedPath}`);
     } catch (error) {
-      clearInterval(progressTimer);
+      if (abortCtrl.signal.aborted) {
+        updateTransferRecord(recordId, { status: 'cancelled', message: '已取消' });
+        setStatusMessage(`下载已取消：${file.name}`);
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       updateTransferRecord(recordId, { status: 'failed', message });
       addLogEntry('error', `下载失败：${file.name} - ${message}`);
       setStatusMessage(`下载失败：${message}`);
+    } finally {
+      uploadAbortRefs.current.delete(recordId);
     }
   }
 
@@ -2788,6 +2892,28 @@ export function App() {
     setStatusMessage(`已剪切 ${files.length} 个项目`);
   }
 
+  function resourceBaseName(path: string): string {
+    const trimmed = path.replace(/[\\/]+$/, '');
+    return trimmed.split(/[\\/]/).pop() ?? trimmed;
+  }
+
+  function resourceParentPath(path: string, local: boolean): string {
+    const trimmed = path.replace(/[\\/]+$/, '');
+    const lastSeparator = local
+      ? Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+      : trimmed.lastIndexOf('/');
+    if (lastSeparator < 0) return local ? '.' : '~';
+    return trimmed.substring(0, lastSeparator) || (local ? '.' : '/');
+  }
+
+  function joinResourcePath(directory: string, name: string, local: boolean): string {
+    if (!directory || directory === '.') return name;
+    const separator = local && directory.includes('\\') ? '\\' : '/';
+    return directory.endsWith('/') || directory.endsWith('\\')
+      ? `${directory}${name}`
+      : `${directory}${separator}${name}`;
+  }
+
   /** Generate a non-conflicting destination name.
    *  If `baseName` already exists in `existingNames`, try baseName (1), baseName (2), …
    *  For files with extensions, the suffix goes before the extension:
@@ -2819,27 +2945,36 @@ export function App() {
     if (!clipboard || clipboard.paths.length === 0) return;
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
+    const targetTerminalId = local ? null : tab?.terminalId ?? null;
+    if (!local && !targetTerminalId) {
+      setStatusMessage('粘贴失败：目标远程会话尚未连接');
+      return;
+    }
+    if (clipboard.terminalId !== targetTerminalId) {
+      setStatusMessage('暂不支持跨本地与远程会话直接粘贴');
+      return;
+    }
     const destDir = currentPathRef.current || (local ? '.' : '~');
     // Build a set of existing file names in the destination directory.
     const existingNames = new Set(resourceFilesRef.current.map((f) => f.name));
     setStatusMessage(`正在粘贴 ${clipboard.paths.length} 个项目...`);
     try {
       for (const srcPath of clipboard.paths) {
-        const srcName = srcPath.substring(srcPath.lastIndexOf('/') + 1);
+        const srcName = resourceBaseName(srcPath);
         // When cutting within the same directory (source parent == destDir),
         // this is a no-op — skip it.
-        const srcParent = srcPath.substring(0, srcPath.lastIndexOf('/'));
+        const srcParent = resourceParentPath(srcPath, local);
         if (clipboard.operation === 'cut' && srcParent === destDir) {
           addLogEntry('info', `剪切跳过：${srcName} 已在目标目录中`);
           continue;
         }
         const destName = generateUniqueName(srcName, existingNames);
         if (clipboard.operation === 'copy') {
-          await copyPath(srcPath, destDir, clipboard.terminalId, destName === srcName ? undefined : destName);
-          addLogEntry('info', `已复制：${srcPath} → ${destDir}/${destName}`);
+          await copyPath(srcPath, destDir, targetTerminalId, destName === srcName ? undefined : destName);
+          addLogEntry('info', `已复制：${srcPath} → ${joinResourcePath(destDir, destName, local)}`);
         } else {
-          await movePath(srcPath, destDir, clipboard.terminalId, destName === srcName ? undefined : destName);
-          addLogEntry('info', `已移动：${srcPath} → ${destDir}/${destName}`);
+          await movePath(srcPath, destDir, targetTerminalId, destName === srcName ? undefined : destName);
+          addLogEntry('info', `已移动：${srcPath} → ${joinResourcePath(destDir, destName, local)}`);
         }
         // Register the new name so subsequent items in the same batch also avoid it.
         existingNames.add(destName);
@@ -2868,8 +3003,7 @@ export function App() {
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
     const baseDir = currentPathRef.current || (local ? '.' : '~');
-    const sep = baseDir.endsWith('/') ? '' : '/';
-    const fullPath = `${baseDir}${sep}${newItemName.trim()}`;
+    const fullPath = joinResourcePath(baseDir, newItemName.trim(), local);
     setStatusMessage(`正在创建：${newItemName.trim()}...`);
     try {
       if (newItemDialog.type === 'file') {
@@ -2896,17 +3030,17 @@ export function App() {
   async function handleRename() {
     if (!renameDialog || !renameValue.trim()) return;
     const newName = renameValue.trim();
-    const currentName = renameDialog.split('/').pop() ?? renameDialog;
+    const currentName = resourceBaseName(renameDialog);
     if (newName === currentName) {
       setRenameDialog(null);
       return;
     }
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
-    const parent = renameDialog.substring(0, renameDialog.lastIndexOf('/'));
+    const parent = currentPathRef.current || resourceParentPath(renameDialog, local);
     setStatusMessage(`正在重命名：${newName}...`);
     try {
-      await movePath(renameDialog, parent, local ? null : tab?.terminalId ?? null);
+      await movePath(renameDialog, parent, local ? null : tab?.terminalId ?? null, newName);
       setStatusMessage(`已重命名为：${newName}`);
       addLogEntry('info', `已重命名：${newName}`);
       setRenameDialog(null);
@@ -2943,60 +3077,93 @@ export function App() {
     };
   }, [terminalContextMenu]);
 
-  // Auto-refresh system monitor data every 5 seconds when panel is open
+  // Poll serially so a slow SSH sample cannot overlap with the next request.
   useEffect(() => {
     if (leftActivity !== 'monitor') return;
-    const interval = window.setInterval(() => void refreshMonitorData(), 1000);
-    return () => window.clearInterval(interval);
+    let cancelled = false;
+    let timeoutId: number | null = null;
+    const poll = async () => {
+      await refreshMonitorData();
+      if (!cancelled) timeoutId = window.setTimeout(() => void poll(), 1000);
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      monitorRequestGenerationRef.current++;
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+    };
   }, [leftActivity]);
 
-  // Auto-refresh process list every 3 seconds when panel is open
   useEffect(() => {
     if (leftActivity !== 'processes') return;
-    const interval = window.setInterval(() => void refreshProcessList(), 3000);
-    return () => window.clearInterval(interval);
+    let cancelled = false;
+    let timeoutId: number | null = null;
+    const poll = async () => {
+      await refreshProcessList();
+      if (!cancelled) timeoutId = window.setTimeout(() => void poll(), 3000);
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      processRequestGenerationRef.current++;
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+    };
   }, [leftActivity]);
 
   function toggleLeftActivity(panel: 'files' | 'monitor' | 'processes') {
     // VSCode 风格：再次点击已激活的图标则收起侧边栏
-    const nextPanel = leftActivity === panel ? null : panel;
-    setLeftActivity(nextPanel);
-    if (nextPanel === 'monitor') {
-      void refreshMonitorData();
-    } else if (nextPanel === 'processes') {
-      void refreshProcessList();
-    }
+    setLeftActivity(leftActivity === panel ? null : panel);
   }
 
   async function refreshMonitorData() {
+    const generation = ++monitorRequestGenerationRef.current;
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
     const terminalId = local ? null : tab?.terminalId ?? null;
+    const isCurrentTarget = () => {
+      const currentTab = activePaneTabRef.current;
+      const currentTerminalId = isLocalResourceTab(currentTab) ? null : currentTab?.terminalId ?? null;
+      return generation === monitorRequestGenerationRef.current && terminalId === currentTerminalId;
+    };
     setIsLoadingMonitor(true);
     try {
       const data = await getSystemMonitor(terminalId);
-      setMonitorData(data);
+      if (isCurrentTarget()) {
+        setMonitorData(data);
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setStatusMessage(`获取系统监控数据失败：${message}`);
+      if (isCurrentTarget()) {
+        const message = error instanceof Error ? error.message : String(error);
+        setStatusMessage(`获取系统监控数据失败：${message}`);
+      }
     } finally {
-      setIsLoadingMonitor(false);
+      if (isCurrentTarget()) setIsLoadingMonitor(false);
     }
   }
 
   async function refreshProcessList() {
+    const generation = ++processRequestGenerationRef.current;
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
     const terminalId = local ? null : tab?.terminalId ?? null;
+    const isCurrentTarget = () => {
+      const currentTab = activePaneTabRef.current;
+      const currentTerminalId = isLocalResourceTab(currentTab) ? null : currentTab?.terminalId ?? null;
+      return generation === processRequestGenerationRef.current && terminalId === currentTerminalId;
+    };
     setIsLoadingProcesses(true);
     try {
       const data = await getProcessList(terminalId);
-      setProcessList(data);
+      if (isCurrentTarget()) {
+        setProcessList(data);
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setStatusMessage(`获取进程列表失败：${message}`);
+      if (isCurrentTarget()) {
+        const message = error instanceof Error ? error.message : String(error);
+        setStatusMessage(`获取进程列表失败：${message}`);
+      }
     } finally {
-      setIsLoadingProcesses(false);
+      if (isCurrentTarget()) setIsLoadingProcesses(false);
     }
   }
 
@@ -3353,7 +3520,7 @@ export function App() {
       const ownerTab = tabsRef.current.find((tab) =>
         tab.kind === 'terminal'
         && !tab.parentTabId
-        && collectTerminalLayoutTabIds(tab.layout ?? createDefaultTerminalLayout(tab.id)).includes(splitId),
+        && terminalLayoutContainsSplit(tab.layout ?? createDefaultTerminalLayout(tab.id), splitId),
       );
       if (!ownerTab) return;
       setTabs((current) => current.map((item) => {
@@ -4088,6 +4255,7 @@ export function App() {
                         <thead>
                           <tr>
                             <th className="transfer-th-index">序号</th>
+                            <th className="transfer-th-direction">类型</th>
                             <th className="transfer-th-name">文件名称</th>
                             <th className="transfer-th-size">文件大小</th>
                             <th className="transfer-th-speed">速度</th>
@@ -4099,10 +4267,14 @@ export function App() {
                           {transferRecords.map((record, idx) => (
                               <tr key={record.id} className={`transfer-row ${record.status}`}>
                                 <td className="transfer-td-index">{idx + 1}</td>
+                                <td className="transfer-td-direction">
+                                  <span className={`transfer-direction ${record.direction}`}>
+                                    {record.direction === 'download' ? '下载' : record.direction === 'open' ? '打开' : '上传'}
+                                  </span>
+                                </td>
                                 <td className="transfer-td-name">
                                   <div className="transfer-name-cell">
                                     <span className="transfer-filename" title={record.fileName}>
-                                      {record.direction === 'download' ? <Download size={12} className="transfer-dir-icon" /> : record.direction === 'open' ? <FileText size={12} className="transfer-dir-icon" /> : <Upload size={12} className="transfer-dir-icon" />}
                                       {record.fileName}
                                     </span>
                                     {record.status === 'uploading' && (
@@ -4127,7 +4299,7 @@ export function App() {
                                   )}
                                 </td>
                                 <td className="transfer-td-speed">
-                                  {record.status === 'uploading' && record.progress >= 0 ? (
+                                  {record.status === 'uploading' && record.progress >= 0 && record.speed > 0 ? (
                                     <span className="transfer-speed-active">{formatSpeed(record.speed)}</span>
                                   ) : record.status === 'uploading' ? (
                                     <span className="transfer-speed-none">-</span>

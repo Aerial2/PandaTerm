@@ -1149,6 +1149,7 @@ button:disabled {
 }
 
 .transfer-th-index { width: 44px; text-align: center; }
+.transfer-th-direction { width: 64px; text-align: center; }
 .transfer-th-name { min-width: 0; }
 .transfer-th-size { width: 130px; }
 .transfer-th-speed { width: 90px; }
@@ -1175,6 +1176,28 @@ button:disabled {
   color: var(--text-muted);
   font-size: 11px;
 }
+
+.transfer-td-direction {
+  text-align: center;
+  white-space: nowrap;
+}
+
+.transfer-direction {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 1.2;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.transfer-direction.upload { color: var(--accent-blue); }
+.transfer-direction.download { color: var(--accent-green); }
+.transfer-direction.open { color: var(--text-muted); }
 
 .transfer-td-size {
   color: var(--text-secondary);
@@ -1218,18 +1241,6 @@ button:disabled {
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }
-
-.transfer-dir-icon {
-  display: inline-block;
-  vertical-align: -2px;
-  margin-right: 5px;
-  color: var(--text-muted);
-  flex-shrink: 0;
-}
-
-.transfer-row.uploading .transfer-dir-icon { color: var(--accent-blue); }
-.transfer-row.success .transfer-dir-icon { color: var(--accent-green); }
-.transfer-row.failed .transfer-dir-icon { color: var(--accent-red); }
 
 .transfer-status-msg {
   font-size: 10px;
