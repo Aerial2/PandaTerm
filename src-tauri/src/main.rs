@@ -149,9 +149,12 @@ struct AiProviderConfigStore {
     version: u8,
     base_url: String,
     model: String,
-    /// 可选模型列表（同步 + 自定义）；同步时不会清空未出现在远端的自定义项
+    /// 可选模型目录（同步 + 自定义）；同步时不会清空未出现在远端的自定义项
     #[serde(default)]
     models: Vec<String>,
+    /// 出现在聊天模型列表中的已选模型（子集）；缺省迁移为全部 models
+    #[serde(default)]
+    enabled_models: Vec<String>,
     use_api_key: bool,
     api_key_secret_id: Option<String>,
 }
@@ -163,6 +166,7 @@ impl Default for AiProviderConfigStore {
             base_url: DEFAULT_AI_BASE_URL.to_string(),
             model: DEFAULT_AI_MODEL.to_string(),
             models: vec![DEFAULT_AI_MODEL.to_string()],
+            enabled_models: vec![DEFAULT_AI_MODEL.to_string()],
             use_api_key: true,
             api_key_secret_id: None,
         }
@@ -174,8 +178,11 @@ struct AiProviderConfig {
     base_url: String,
     model: String,
     models: Vec<String>,
+    enabled_models: Vec<String>,
     use_api_key: bool,
     api_key_configured: bool,
+    /// 本地桌面设置可回填展示；仅来自本机 vault 解密结果
+    api_key: Option<String>,
     error: Option<String>,
 }
 
@@ -185,6 +192,8 @@ struct SaveAiProviderConfigRequest {
     model: String,
     #[serde(default)]
     models: Option<Vec<String>>,
+    #[serde(default)]
+    enabled_models: Option<Vec<String>>,
     use_api_key: bool,
     api_key: Option<String>,
 }
@@ -611,6 +620,8 @@ fn load_ai_config() -> Result<AiProviderConfigStore, String> {
     validate_ai_base_url(&config.base_url)?;
     config.model = validate_ai_model(&config.model)?;
     config.models = normalize_ai_models(&config.models, &config.model)?;
+    config.enabled_models =
+        normalize_enabled_ai_models(&config.models, &config.enabled_models, &config.model)?;
     Ok(config)
 }
 
@@ -4703,6 +4714,37 @@ fn normalize_ai_models(models: &[String], selected: &str) -> Result<Vec<String>,
     Ok(normalized)
 }
 
+/// 规范化“聊天可见”模型：必须是 models 子集，且包含当前 model。
+/// 旧配置无 enabled_models 时默认启用全部 models（保持既有行为）。
+fn normalize_enabled_ai_models(
+    models: &[String],
+    enabled: &[String],
+    selected: &str,
+) -> Result<Vec<String>, String> {
+    let catalog: HashSet<&str> = models.iter().map(String::as_str).collect();
+    let selected = validate_ai_model(selected)?;
+    if !catalog.contains(selected.as_str()) {
+        return Err("当前模型不在模型目录中".to_string());
+    }
+
+    let mut normalized = Vec::new();
+    let source = if enabled.is_empty() {
+        models
+    } else {
+        enabled
+    };
+    for model in source {
+        let model = validate_ai_model(model)?;
+        if catalog.contains(model.as_str()) && !normalized.iter().any(|item| item == &model) {
+            normalized.push(model);
+        }
+    }
+    if !normalized.iter().any(|item| item == &selected) {
+        normalized.insert(0, selected);
+    }
+    Ok(normalized)
+}
+
 /// 同步合并：远端 id 命中本地则覆盖该条目；未命中的本地自定义保留
 fn merge_ai_models(existing: &[String], synced: &[String]) -> Result<Vec<String>, String> {
     let mut synced_normalized = Vec::new();
@@ -4786,15 +4828,31 @@ fn ai_models_url(base_url: &str) -> Result<Url, String> {
     ai_resource_url(base_url, "models")
 }
 
-fn ai_config_snapshot(config: &AiProviderConfigStore, error: Option<String>) -> AiProviderConfig {
+fn ai_config_snapshot(
+    config: &AiProviderConfigStore,
+    api_key: Option<String>,
+    error: Option<String>,
+) -> AiProviderConfig {
     AiProviderConfig {
         base_url: config.base_url.clone(),
         model: config.model.clone(),
         models: config.models.clone(),
+        enabled_models: config.enabled_models.clone(),
         use_api_key: config.use_api_key,
         api_key_configured: config.api_key_secret_id.is_some(),
+        api_key,
         error,
     }
+}
+
+fn resolve_ai_api_key(
+    credentials: &CredentialVaultState,
+    secret_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(secret_id) = secret_id else {
+        return Ok(None);
+    };
+    Ok(Some(resolve_credential(credentials, secret_id)?))
 }
 
 fn parse_openai_model_ids(body: &str) -> Result<Vec<String>, String> {
@@ -4882,7 +4940,16 @@ async fn get_ai_provider_config(
 ) -> Result<AiProviderConfig, String> {
     let config = state.ai_config.lock().await.clone();
     let error = state.ai_config_error.lock().await.clone();
-    Ok(ai_config_snapshot(&config, error))
+    let credentials = state.credentials.lock().await;
+    // 解密失败不阻塞配置读取；仅无法回填明文，由前端提示重启
+    let api_key = match resolve_ai_api_key(&credentials, config.api_key_secret_id.as_deref()) {
+        Ok(key) => key,
+        Err(reveal_error) => {
+            eprintln!("[AI] reveal api key failed: {reveal_error}");
+            None
+        }
+    };
+    Ok(ai_config_snapshot(&config, api_key, error))
 }
 
 #[tauri::command]
@@ -4904,6 +4971,14 @@ async fn save_ai_provider_config(
         request.models.as_deref().unwrap_or(&current.models),
         &model,
     )?;
+    let enabled_models = normalize_enabled_ai_models(
+        &models,
+        request
+            .enabled_models
+            .as_deref()
+            .unwrap_or(&current.enabled_models),
+        &model,
+    )?;
 
     let mut credentials = state.credentials.lock().await;
     let next_secret_id = if let Some(key) = supplied_key.as_deref() {
@@ -4919,6 +4994,7 @@ async fn save_ai_provider_config(
         base_url,
         model,
         models,
+        enabled_models,
         use_api_key: request.use_api_key,
         api_key_secret_id: next_secret_id,
     };
@@ -4936,8 +5012,13 @@ async fn save_ai_provider_config(
             eprintln!("[Credential] obsolete AI API key cleanup deferred: {error}");
         }
     }
+    let api_key = if let Some(key) = supplied_key {
+        Some(key.trim().to_string())
+    } else {
+        resolve_ai_api_key(&credentials, next.api_key_secret_id.as_deref())?
+    };
     *state.ai_config.lock().await = next.clone();
-    Ok(ai_config_snapshot(&next, None))
+    Ok(ai_config_snapshot(&next, api_key, None))
 }
 
 #[tauri::command]
@@ -5002,17 +5083,22 @@ async fn sync_ai_provider_models(
     }
     let synced = parse_openai_model_ids(&body)?;
     let models = normalize_ai_models(&merge_ai_models(&current.models, &synced)?, &current.model)?;
+    // 同步后仅保留仍存在的已选模型；当前 model 始终保留
+    let enabled_models =
+        normalize_enabled_ai_models(&models, &current.enabled_models, &current.model)?;
     let next = AiProviderConfigStore {
         version: AI_CONFIG_VERSION,
         base_url: current.base_url,
         model: current.model,
         models,
+        enabled_models,
         use_api_key: current.use_api_key,
         api_key_secret_id: current.api_key_secret_id,
     };
     save_ai_config(&next)?;
     *state.ai_config.lock().await = next.clone();
-    Ok(ai_config_snapshot(&next, None))
+    let revealed = api_key.as_ref().map(|key| key.as_str().to_string());
+    Ok(ai_config_snapshot(&next, revealed, None))
 }
 
 #[tauri::command]
@@ -6208,6 +6294,31 @@ mod tests {
                 "gpt-4o".to_string(),
                 "o1-mini".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn normalize_enabled_ai_models_defaults_to_all_and_keeps_selected() {
+        let models = vec![
+            "gpt-4o-mini".to_string(),
+            "gpt-5.6-terra".to_string(),
+            "o1-mini".to_string(),
+        ];
+        // 旧配置：enabled 为空 → 启用全部
+        let all = normalize_enabled_ai_models(&models, &[], "gpt-5.6-terra")
+            .expect("default enable all");
+        assert_eq!(all, models);
+
+        // 仅保留仍存在的已选项，并强制包含当前 model
+        let enabled = normalize_enabled_ai_models(
+            &models,
+            &["o1-mini".to_string(), "gone".to_string()],
+            "gpt-5.6-terra",
+        )
+        .expect("normalize enabled");
+        assert_eq!(
+            enabled,
+            vec!["o1-mini".to_string(), "gpt-5.6-terra".to_string()]
         );
     }
 

@@ -14,6 +14,8 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  Eye,
+  EyeOff,
   File,
   FileText,
   FolderOpen,
@@ -407,6 +409,36 @@ const AI_REQUEST_MESSAGE_CHAR_LIMIT = 30_000;
 const AI_REQUEST_TRUNCATION_MARKER = '\n\n[...该消息中间内容已裁剪...]\n\n';
 const AI_AGENT_MAX_CONTINUATIONS = 8;
 const AI_AGENT_RESULT_LABEL_PREFIX = 'Agent ';
+
+/** 从供应商配置解析 models / enabled_models（enabled 为空时默认全部可见） */
+function resolveAiModelCatalog(config: Pick<AiProviderConfig, 'model' | 'models' | 'enabled_models'>) {
+  const model = config.model.trim();
+  const models = Array.from(new Set(
+    (config.models?.length ? config.models : [model])
+      .map((item) => item.trim())
+      .filter(Boolean),
+  ));
+  if (model && !models.includes(model)) models.unshift(model);
+
+  const enabledSource = config.enabled_models?.length ? config.enabled_models : models;
+  const enabled_models = Array.from(new Set(
+    enabledSource.map((item) => item.trim()).filter((item) => models.includes(item)),
+  ));
+  if (model && models.includes(model) && !enabled_models.includes(model)) {
+    enabled_models.unshift(model);
+  }
+  if (enabled_models.length === 0 && models[0]) enabled_models.push(models[0]);
+
+  return { model: model || models[0] || '', models, enabled_models };
+}
+
+/** 聊天下拉：仅 enabled；当前 model 始终兜底出现 */
+function resolveAiChatModelOptions(config: Pick<AiProviderConfig, 'model' | 'models' | 'enabled_models'>) {
+  const catalog = resolveAiModelCatalog(config);
+  const options = catalog.enabled_models.filter((item) => catalog.models.includes(item));
+  if (catalog.model && !options.includes(catalog.model)) options.unshift(catalog.model);
+  return options.length > 0 ? options : catalog.models;
+}
 
 function aiAgentContinuationCount(messages: AiMessage[]): number {
   let count = 0;
@@ -867,6 +899,7 @@ export function App() {
     base_url: 'https://api.openai.com/v1',
     model: 'gpt-4o-mini',
     models: ['gpt-4o-mini'] as string[],
+    enabled_models: ['gpt-4o-mini'] as string[],
     use_api_key: true,
   });
   const [isAiSettingsOpen, setIsAiSettingsOpen] = useState(false);
@@ -874,16 +907,19 @@ export function App() {
   const [isAiConfigSaving, setIsAiConfigSaving] = useState(false);
   const [isAiModelsSyncing, setIsAiModelsSyncing] = useState(false);
   const [aiConfigError, setAiConfigError] = useState('');
+  const [isAiApiKeyVisible, setIsAiApiKeyVisible] = useState(false);
+  /** 设置弹窗内 API Key 草稿（可回填展示；关闭后清空） */
+  const [aiApiKeyDraft, setAiApiKeyDraft] = useState('');
   const aiApiKeyInputRef = useRef<HTMLInputElement | null>(null);
+  const isAiSettingsOpenRef = useRef(false);
+  isAiSettingsOpenRef.current = isAiSettingsOpen;
+  const aiConfigRefreshGenerationRef = useRef(0);
   const [pendingAiContexts, setPendingAiContexts] = useState<AiContextItem[]>([]);
   const [isAiHistoryOpen, setIsAiHistoryOpen] = useState(false);
   const [isAiMentionOpen, setIsAiMentionOpen] = useState(false);
   /** 输入区模式/模型菜单：Cursor 风格自定义下拉 */
   const [aiComposerMenu, setAiComposerMenu] = useState<null | 'mode' | 'model'>(null);
   const [aiComposerMenuAnchor, setAiComposerMenuAnchor] = useState<FloatingMenuAnchor | null>(null);
-  /** 设置弹窗内模型下拉 */
-  const [isAiSettingsModelMenuOpen, setIsAiSettingsModelMenuOpen] = useState(false);
-  const [aiSettingsModelMenuAnchor, setAiSettingsModelMenuAnchor] = useState<FloatingMenuAnchor | null>(null);
   const [aiConversationError, setAiConversationError] = useState('');
   const aiConversationsLoadedRef = useRef(false);
   const aiMessagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -984,34 +1020,10 @@ export function App() {
     };
   }, [aiComposerMenu]);
 
-  // AI 设置弹窗模型下拉：点击外部或 Esc 关闭
-  useEffect(() => {
-    if (!isAiSettingsModelMenuOpen) return;
-    const onPointerDown = (event: MouseEvent) => {
-      const target = event.target as HTMLElement;
-      if (!target.closest('.ai-settings-model-menu') && !target.closest('.ai-settings-model-popover')) {
-        setIsAiSettingsModelMenuOpen(false);
-        setAiSettingsModelMenuAnchor(null);
-      }
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setIsAiSettingsModelMenuOpen(false);
-        setAiSettingsModelMenuAnchor(null);
-      }
-    };
-    window.addEventListener('mousedown', onPointerDown);
-    window.addEventListener('keydown', onKeyDown);
-    return () => {
-      window.removeEventListener('mousedown', onPointerDown);
-      window.removeEventListener('keydown', onKeyDown);
-    };
-  }, [isAiSettingsModelMenuOpen]);
-
   useEffect(() => {
     if (isAiSettingsOpen) return;
-    setIsAiSettingsModelMenuOpen(false);
-    setAiSettingsModelMenuAnchor(null);
+    setIsAiApiKeyVisible(false);
+    setAiApiKeyDraft('');
   }, [isAiSettingsOpen]);
 
   const [pendingPaneTabId, setPendingPaneTabId] = useState<string | null>(null);
@@ -3742,67 +3754,144 @@ export function App() {
     setLeftActivity(leftActivity === panel ? null : panel);
   }
 
-  async function refreshAiProviderConfig() {
+  async function refreshAiProviderConfig(options?: { fillApiKey?: boolean }) {
+    const generation = ++aiConfigRefreshGenerationRef.current;
     setIsAiConfigLoading(true);
     setAiConfigError('');
     try {
       const config = await getAiProviderConfig();
-      setAiProviderConfig(config);
+      if (generation !== aiConfigRefreshGenerationRef.current) return;
+      const catalog = resolveAiModelCatalog(config);
+      // 明文密钥只放进设置草稿，不长期挂在 provider 状态上
+      setAiProviderConfig({
+        base_url: config.base_url,
+        model: catalog.model,
+        models: catalog.models,
+        enabled_models: catalog.enabled_models,
+        use_api_key: config.use_api_key,
+        api_key_configured: config.api_key_configured,
+        api_key: null,
+        error: config.error,
+      });
       setAiConfigDraft({
         base_url: config.base_url,
-        model: config.model,
-        models: config.models?.length ? config.models : [config.model],
+        model: catalog.model,
+        models: catalog.models,
+        enabled_models: catalog.enabled_models,
         use_api_key: config.use_api_key,
       });
+      // 设置弹窗打开期间始终回填；避免并发 refresh 不带 fill 时错过密钥
+      const shouldFillApiKey = Boolean(options?.fillApiKey || isAiSettingsOpenRef.current);
+      if (shouldFillApiKey) {
+        const revealed = config.api_key?.trim() ?? '';
+        setAiApiKeyDraft(revealed);
+        if (config.api_key_configured && !revealed && !config.error) {
+          setAiConfigError('已配置密钥，但当前进程未能解密回填。请完全重启 PandaTerm 后再打开设置。');
+        }
+      }
       if (config.error) setAiConfigError(config.error);
     } catch (error) {
+      if (generation !== aiConfigRefreshGenerationRef.current) return;
       setAiConfigError(error instanceof Error ? error.message : String(error));
     } finally {
-      setIsAiConfigLoading(false);
+      if (generation === aiConfigRefreshGenerationRef.current) {
+        setIsAiConfigLoading(false);
+      }
     }
   }
 
   function openAiSettings() {
     if (aiProviderConfig) {
+      const catalog = resolveAiModelCatalog(aiProviderConfig);
       setAiConfigDraft({
         base_url: aiProviderConfig.base_url,
-        model: aiProviderConfig.model,
-        models: aiProviderConfig.models?.length ? aiProviderConfig.models : [aiProviderConfig.model],
+        model: catalog.model,
+        models: catalog.models,
+        enabled_models: catalog.enabled_models,
         use_api_key: aiProviderConfig.use_api_key,
       });
-    } else {
-      void refreshAiProviderConfig();
     }
     setAiConfigError(aiProviderConfig?.error ?? '');
     setIsAiSettingsOpen(true);
+    isAiSettingsOpenRef.current = true;
+    // 打开时重新拉取，确保 vault 中的密钥可回填
+    void refreshAiProviderConfig({ fillApiKey: true });
+  }
+
+  function applyAiProviderConfigState(config: AiProviderConfig) {
+    const catalog = resolveAiModelCatalog(config);
+    setAiProviderConfig({
+      base_url: config.base_url,
+      model: catalog.model,
+      models: catalog.models,
+      enabled_models: catalog.enabled_models,
+      use_api_key: config.use_api_key,
+      api_key_configured: config.api_key_configured,
+      api_key: null,
+      error: config.error,
+    });
+    setAiConfigDraft({
+      base_url: config.base_url,
+      model: catalog.model,
+      models: catalog.models,
+      enabled_models: catalog.enabled_models,
+      use_api_key: config.use_api_key,
+    });
+    return catalog;
+  }
+
+  /** 设置当前模型（自动加入聊天可见列表） */
+  function setAiDraftCurrentModel(model: string) {
+    const nextModel = model.trim();
+    if (!nextModel) return;
+    setAiConfigDraft((current) => {
+      const models = current.models.includes(nextModel)
+        ? current.models
+        : [...current.models, nextModel];
+      const enabled_models = current.enabled_models.includes(nextModel)
+        ? current.enabled_models
+        : [...current.enabled_models, nextModel];
+      return { ...current, model: nextModel, models, enabled_models };
+    });
+  }
+
+  /** 切换模型是否出现在聊天下拉；当前模型不可取消 */
+  function toggleAiDraftEnabledModel(model: string) {
+    const target = model.trim();
+    if (!target) return;
+    setAiConfigDraft((current) => {
+      if (!current.models.includes(target)) return current;
+      const isEnabled = current.enabled_models.includes(target);
+      if (isEnabled) {
+        if (target === current.model || current.enabled_models.length <= 1) return current;
+        return {
+          ...current,
+          enabled_models: current.enabled_models.filter((item) => item !== target),
+        };
+      }
+      return {
+        ...current,
+        enabled_models: [...current.enabled_models, target],
+      };
+    });
   }
 
   async function submitAiProviderConfig() {
     if (isAiConfigSaving) return;
-    const apiKeyInput = aiApiKeyInputRef.current;
-    const apiKey = apiKeyInput?.value ?? '';
-    if (apiKeyInput) apiKeyInput.value = '';
+    const apiKey = aiApiKeyDraft;
     setIsAiConfigSaving(true);
     setAiConfigError('');
     try {
-      const selectedModel = aiConfigDraft.model.trim();
-      const models = Array.from(new Set([
-        ...aiConfigDraft.models,
-        selectedModel,
-      ].map((item) => item.trim()).filter(Boolean)));
+      const catalog = resolveAiModelCatalog(aiConfigDraft);
       const config = await saveAiProviderConfig({
         base_url: aiConfigDraft.base_url,
-        model: selectedModel,
-        models,
+        model: catalog.model,
+        models: catalog.models,
+        enabled_models: catalog.enabled_models,
         use_api_key: aiConfigDraft.use_api_key,
       }, apiKey);
-      setAiProviderConfig(config);
-      setAiConfigDraft({
-        base_url: config.base_url,
-        model: config.model,
-        models: config.models?.length ? config.models : [config.model],
-        use_api_key: config.use_api_key,
-      });
+      applyAiProviderConfigState(config);
+      setAiApiKeyDraft('');
       setIsAiSettingsOpen(false);
     } catch (error) {
       setAiConfigError(error instanceof Error ? error.message : String(error));
@@ -3813,8 +3902,7 @@ export function App() {
 
   async function syncAiModelsFromProvider() {
     if (isAiModelsSyncing || isAiConfigSaving) return;
-    const apiKeyInput = aiApiKeyInputRef.current;
-    const apiKey = apiKeyInput?.value ?? '';
+    const apiKey = aiApiKeyDraft;
     setIsAiModelsSyncing(true);
     setAiConfigError('');
     try {
@@ -3823,13 +3911,33 @@ export function App() {
         use_api_key: aiConfigDraft.use_api_key,
         api_key: apiKey || null,
       });
-      setAiProviderConfig(config);
-      setAiConfigDraft((current) => ({
-        ...current,
-        models: config.models?.length ? config.models : [current.model || config.model],
-        // 当前选中若仍存在则保留，否则落到配置里的当前模型
-        model: (config.models ?? []).includes(current.model) ? current.model : config.model,
-      }));
+      const catalog = resolveAiModelCatalog(config);
+      setAiProviderConfig({
+        base_url: config.base_url,
+        model: catalog.model,
+        models: catalog.models,
+        enabled_models: catalog.enabled_models,
+        use_api_key: config.use_api_key,
+        api_key_configured: config.api_key_configured,
+        api_key: null,
+        error: config.error,
+      });
+      setAiConfigDraft((current) => {
+        // 同步后保留草稿当前选中（若仍存在），并采用后端规范化后的 enabled
+        const preferredModel = catalog.models.includes(current.model) ? current.model : catalog.model;
+        const next = resolveAiModelCatalog({
+          model: preferredModel,
+          models: catalog.models,
+          enabled_models: catalog.enabled_models,
+        });
+        return {
+          ...current,
+          models: next.models,
+          enabled_models: next.enabled_models,
+          model: next.model,
+        };
+      });
+      if (config.api_key) setAiApiKeyDraft(config.api_key);
     } catch (error) {
       setAiConfigError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -3843,23 +3951,19 @@ export function App() {
     if (nextModel === aiProviderConfig.model) return;
     setAiConfigError('');
     try {
-      const models = Array.from(new Set([
-        ...(aiProviderConfig.models ?? []),
-        nextModel,
-      ].map((item) => item.trim()).filter(Boolean)));
+      const catalog = resolveAiModelCatalog({
+        model: nextModel,
+        models: aiProviderConfig.models,
+        enabled_models: aiProviderConfig.enabled_models,
+      });
       const config = await saveAiProviderConfig({
         base_url: aiProviderConfig.base_url,
-        model: nextModel,
-        models,
+        model: catalog.model,
+        models: catalog.models,
+        enabled_models: catalog.enabled_models,
         use_api_key: aiProviderConfig.use_api_key,
       });
-      setAiProviderConfig(config);
-      setAiConfigDraft({
-        base_url: config.base_url,
-        model: config.model,
-        models: config.models?.length ? config.models : [config.model],
-        use_api_key: config.use_api_key,
-      });
+      applyAiProviderConfigState(config);
     } catch (error) {
       setAiConfigError(error instanceof Error ? error.message : String(error));
     }
@@ -6125,10 +6229,9 @@ export function App() {
                     {(() => {
                       const currentMode = activeAiConversation?.mode ?? 'agent';
                       const currentModeOption = AI_MODE_OPTIONS.find((item) => item.value === currentMode);
-                      const modelOptions = Array.from(new Set([
-                        ...(aiProviderConfig?.models ?? []),
-                        aiProviderConfig?.model ?? '',
-                      ].map((item) => item.trim()).filter(Boolean)));
+                      const modelOptions = aiProviderConfig
+                        ? resolveAiChatModelOptions(aiProviderConfig)
+                        : [];
                       const toggleComposerMenu = (menu: 'mode' | 'model', trigger: HTMLButtonElement) => {
                         if (aiComposerMenu === menu) {
                           setAiComposerMenu(null);
@@ -6736,156 +6839,199 @@ export function App() {
       )}
 
       {isAiSettingsOpen && (
-        <div className="dialog-backdrop" onMouseDown={() => { if (!isAiConfigSaving && !isAiModelsSyncing) setIsAiSettingsOpen(false); }}>
+        <div
+          className="ai-settings-backdrop"
+          onMouseDown={() => {
+            if (!isAiConfigSaving && !isAiModelsSyncing) setIsAiSettingsOpen(false);
+          }}
+        >
           <form
-            className="dialog-card ai-settings-dialog"
+            className="ai-settings-panel"
             onMouseDown={(event) => event.stopPropagation()}
             onSubmit={(event) => {
               event.preventDefault();
               void submitAiProviderConfig();
             }}
           >
-            <h3>AI 供应商设置</h3>
-            <p className="dialog-message">
-              支持 OpenAI Chat Completions 兼容接口。可同步 /models 列表，自定义模型不会被清空。
-            </p>
-            <label className="ai-settings-field">
-              <span>Base URL</span>
-              <input
-                autoFocus
-                className="dialog-input"
-                value={aiConfigDraft.base_url}
-                placeholder="https://api.openai.com/v1"
-                spellCheck={false}
-                disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
-                onChange={(event) => setAiConfigDraft((current) => ({ ...current, base_url: event.target.value }))}
-              />
-              <small>可填写域名或完整 Base URL，后端会补齐 /chat/completions 与 /models。</small>
-            </label>
-            <div className="ai-settings-field">
-              <span>模型</span>
-              <div className="ai-settings-model-row">
-                {(() => {
-                  const modelChoices = Array.from(new Set([
-                    ...aiConfigDraft.models,
-                    aiConfigDraft.model.trim(),
-                  ].filter(Boolean)));
-                  const displayModel = aiConfigDraft.model.trim() || '选择模型';
-                  const disabled = isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error) || modelChoices.length === 0;
-                  return (
-                    <div className="ai-settings-model-menu">
+            <header className="ai-settings-header">
+              <div className="ai-settings-header-text">
+                <h3>Models</h3>
+                <p>OpenAI-compatible · Chat Completions</p>
+              </div>
+              <button
+                type="button"
+                className="ai-settings-close"
+                aria-label="关闭"
+                disabled={isAiConfigSaving || isAiModelsSyncing}
+                onClick={() => setIsAiSettingsOpen(false)}
+              >
+                <X size={16} />
+              </button>
+            </header>
+
+            <div className="ai-settings-body">
+              <section className="ai-settings-section">
+                <div className="ai-settings-section-title">API</div>
+
+                <label className="ai-settings-row">
+                  <div className="ai-settings-row-copy">
+                    <span>Override OpenAI Base URL</span>
+                    <em>填写域名或完整 Base URL，后端会补齐 /chat/completions 与 /models</em>
+                  </div>
+                  <input
+                    autoFocus
+                    className="ai-settings-input"
+                    value={aiConfigDraft.base_url}
+                    placeholder="https://api.openai.com/v1"
+                    spellCheck={false}
+                    disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                    onChange={(event) => setAiConfigDraft((current) => ({ ...current, base_url: event.target.value }))}
+                  />
+                </label>
+
+                <div className="ai-settings-divider" />
+
+                <div className="ai-settings-row ai-settings-row-toggle">
+                  <div className="ai-settings-row-copy">
+                    <span>API Key</span>
+                    <em>使用 Bearer 认证；密钥仅保存在本地，不会进入前端状态</em>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={aiConfigDraft.use_api_key}
+                    className={`ai-settings-switch${aiConfigDraft.use_api_key ? ' on' : ''}`}
+                    disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                    onClick={() => setAiConfigDraft((current) => ({ ...current, use_api_key: !current.use_api_key }))}
+                  >
+                    <i />
+                  </button>
+                </div>
+
+                {aiConfigDraft.use_api_key && (
+                  <label className="ai-settings-row compact">
+                    <div className="ai-settings-secret">
+                      <input
+                        ref={aiApiKeyInputRef}
+                        type={isAiApiKeyVisible ? 'text' : 'password'}
+                        className="ai-settings-input"
+                        value={aiApiKeyDraft}
+                        placeholder={aiProviderConfig?.api_key_configured && !aiApiKeyDraft ? '已配置，但当前无法解密回填' : 'sk-...'}
+                        autoComplete="off"
+                        spellCheck={false}
+                        disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                        onChange={(event) => setAiApiKeyDraft(event.target.value)}
+                      />
                       <button
                         type="button"
-                        className={`ai-settings-model-trigger${isAiSettingsModelMenuOpen ? ' open' : ''}`}
-                        aria-haspopup="listbox"
-                        aria-expanded={isAiSettingsModelMenuOpen}
-                        disabled={disabled}
-                        onClick={(event) => {
-                          if (isAiSettingsModelMenuOpen) {
-                            setIsAiSettingsModelMenuOpen(false);
-                            setAiSettingsModelMenuAnchor(null);
-                            return;
-                          }
-                          setAiSettingsModelMenuAnchor(measureFloatingMenuAnchor(event.currentTarget));
-                          setIsAiSettingsModelMenuOpen(true);
-                        }}
+                        className="ai-settings-secret-toggle"
+                        aria-label={isAiApiKeyVisible ? '隐藏密钥' : '显示密钥'}
+                        title={isAiApiKeyVisible ? '隐藏密钥' : '显示密钥'}
+                        disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                        onClick={() => setIsAiApiKeyVisible((current) => !current)}
                       >
-                        <span>{displayModel}{aiConfigDraft.model.trim() && !aiConfigDraft.models.includes(aiConfigDraft.model) ? '（自定义）' : ''}</span>
-                        <ChevronDown size={14} aria-hidden />
+                        {isAiApiKeyVisible
+                          ? <EyeOff size={15} aria-hidden />
+                          : <Eye size={15} aria-hidden />}
                       </button>
-                      {isAiSettingsModelMenuOpen && aiSettingsModelMenuAnchor && createPortal(
-                        <div
-                          className="ai-settings-model-popover"
-                          role="listbox"
-                          aria-label="选择模型"
-                          style={{
-                            left: clampFloatingMenuLeft(aiSettingsModelMenuAnchor.left, aiSettingsModelMenuAnchor.width),
-                            top: Math.min(aiSettingsModelMenuAnchor.bottom + 6, window.innerHeight - 220),
-                            width: Math.max(aiSettingsModelMenuAnchor.width, 220),
-                          }}
-                        >
-                          {modelChoices.length === 0 ? (
-                            <div className="ai-settings-model-empty">暂无模型</div>
-                          ) : modelChoices.map((model) => {
-                            const selected = model === aiConfigDraft.model;
-                            const custom = !aiConfigDraft.models.includes(model);
-                            return (
+                    </div>
+                  </label>
+                )}
+              </section>
+
+              <section className="ai-settings-section">
+                <div className="ai-settings-section-title-row">
+                  <div className="ai-settings-section-title">Model</div>
+                  <button
+                    type="button"
+                    className="ai-settings-ghost-btn"
+                    title="从供应商同步 /models"
+                    disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error) || !aiConfigDraft.base_url.trim()}
+                    onClick={() => void syncAiModelsFromProvider()}
+                  >
+                    <RefreshCw size={14} className={isAiModelsSyncing ? 'spin' : undefined} aria-hidden />
+                    <span>{isAiModelsSyncing ? '同步中' : '同步'}</span>
+                  </button>
+                </div>
+
+                <div className="ai-settings-model-list-block">
+                  <div className="ai-settings-row-copy">
+                    <span>模型列表</span>
+                    <em>右侧胶囊控制聊天下拉可见；点击名称设为当前模型</em>
+                  </div>
+                  {(() => {
+                    const catalog = resolveAiModelCatalog(aiConfigDraft);
+                    const disabled = isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error);
+                    if (catalog.models.length === 0) {
+                      return <div className="ai-settings-model-empty">暂无模型，请先同步</div>;
+                    }
+                    return (
+                      <div className="ai-settings-model-list" role="listbox" aria-label="模型列表">
+                        {catalog.models.map((model) => {
+                          const isCurrent = model === catalog.model;
+                          const isEnabled = catalog.enabled_models.includes(model);
+                          const canDisable = isEnabled && !isCurrent && catalog.enabled_models.length > 1;
+                          return (
+                            <div
+                              key={model}
+                              className={`ai-settings-model-row${isCurrent ? ' current' : ''}${isEnabled ? ' enabled' : ''}`}
+                              role="option"
+                              aria-selected={isCurrent}
+                            >
                               <button
                                 type="button"
-                                key={model}
-                                role="option"
-                                aria-selected={selected}
-                                className={selected ? 'active' : undefined}
-                                onClick={() => {
-                                  setAiConfigDraft((current) => ({ ...current, model }));
-                                  setIsAiSettingsModelMenuOpen(false);
-                                  setAiSettingsModelMenuAnchor(null);
-                                }}
+                                className="ai-settings-model-name"
+                                disabled={disabled}
+                                title={isCurrent ? '当前模型' : '设为当前模型'}
+                                onClick={() => setAiDraftCurrentModel(model)}
                               >
-                                <span>{model}{custom ? '（自定义）' : ''}</span>
-                                {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
+                                <span>{model}</span>
+                                {isCurrent ? <em>当前</em> : null}
                               </button>
-                            );
-                          })}
-                        </div>,
-                        document.body,
-                      )}
-                    </div>
-                  );
-                })()}
-                <button
-                  type="button"
-                  className="dialog-btn"
-                  disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error) || !aiConfigDraft.base_url.trim()}
-                  onClick={() => void syncAiModelsFromProvider()}
-                >
-                  {isAiModelsSyncing ? '同步中...' : '同步模型'}
-                </button>
-              </div>
-              <input
-                className="dialog-input"
-                value={aiConfigDraft.model}
-                placeholder="gpt-4o-mini 或自定义模型名"
-                spellCheck={false}
-                disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
-                onChange={(event) => setAiConfigDraft((current) => ({ ...current, model: event.target.value }))}
-              />
-              <small>可从列表选择，也可手写自定义模型；同步时同名会覆盖，其它自定义项保留。</small>
+                              <button
+                                type="button"
+                                className={`ai-settings-model-capsule${isEnabled ? ' on' : ''}`}
+                                disabled={disabled || (isEnabled && !canDisable)}
+                                aria-pressed={isEnabled}
+                                title={
+                                  isEnabled
+                                    ? (isCurrent ? '当前模型始终可见' : '从聊天列表移除')
+                                    : '加入聊天列表'
+                                }
+                                onClick={() => toggleAiDraftEnabledModel(model)}
+                              >
+                                {isEnabled ? <Check size={12} strokeWidth={2.6} aria-hidden /> : null}
+                                <span>{isEnabled ? '已选' : '可选'}</span>
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </section>
+
+              {aiConfigError && <p className="ai-settings-error">{aiConfigError}</p>}
             </div>
-            <label className="ai-settings-checkbox">
-              <input
-                type="checkbox"
-                checked={aiConfigDraft.use_api_key}
-                disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
-                onChange={(event) => setAiConfigDraft((current) => ({ ...current, use_api_key: event.target.checked }))}
-              />
-              <span>使用 Bearer API Key</span>
-            </label>
-            {aiConfigDraft.use_api_key && (
-              <label className="ai-settings-field">
-                <span>API Key</span>
-                <input
-                  ref={aiApiKeyInputRef}
-                  type="password"
-                  className="dialog-input"
-                  placeholder={aiProviderConfig?.api_key_configured ? '已配置，留空保持不变' : '输入 API Key'}
-                  autoComplete="off"
-                  disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
-                />
-                <small>密钥仅提交到本地后端保存，不会出现在前端状态中。</small>
-              </label>
-            )}
-            {aiConfigError && <p className="ai-settings-error">{aiConfigError}</p>}
-            <div className="dialog-actions">
-              <button type="button" className="dialog-btn" disabled={isAiConfigSaving || isAiModelsSyncing} onClick={() => setIsAiSettingsOpen(false)}>取消</button>
+
+            <footer className="ai-settings-footer">
+              <button
+                type="button"
+                className="ai-settings-btn"
+                disabled={isAiConfigSaving || isAiModelsSyncing}
+                onClick={() => setIsAiSettingsOpen(false)}
+              >
+                取消
+              </button>
               <button
                 type="submit"
-                className="dialog-btn primary"
+                className="ai-settings-btn primary"
                 disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error) || !aiConfigDraft.base_url.trim() || !aiConfigDraft.model.trim()}
               >
-                {isAiConfigSaving ? '保存中...' : '保存'}
+                {isAiConfigSaving ? '保存中…' : '保存'}
               </button>
-            </div>
+            </footer>
           </form>
         </div>
       )}

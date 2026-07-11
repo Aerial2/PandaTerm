@@ -233,8 +233,12 @@ export type AiProviderConfig = {
   base_url: string;
   model: string;
   models: string[];
+  /** 聊天模型列表中可见的已选模型 */
+  enabled_models: string[];
   use_api_key: boolean;
   api_key_configured: boolean;
+  /** 本机 vault 解密后的密钥；仅用于设置页回填展示 */
+  api_key?: string | null;
   error?: string | null;
 };
 
@@ -301,7 +305,10 @@ export async function getAiProviderConfig(): Promise<AiProviderConfig> {
 }
 
 export async function saveAiProviderConfig(
-  config: Pick<AiProviderConfig, 'base_url' | 'model' | 'use_api_key'> & { models?: string[] },
+  config: Pick<AiProviderConfig, 'base_url' | 'model' | 'use_api_key'> & {
+    models?: string[];
+    enabled_models?: string[];
+  },
   apiKey?: string | null,
 ): Promise<AiProviderConfig> {
   return await invoke<AiProviderConfig>('save_ai_provider_config', {
@@ -309,6 +316,7 @@ export async function saveAiProviderConfig(
       base_url: config.base_url,
       model: config.model,
       models: config.models ?? null,
+      enabled_models: config.enabled_models ?? null,
       use_api_key: config.use_api_key,
       api_key: apiKey || null,
     },
