@@ -5238,6 +5238,17 @@ async fn call_mcp_tool(
 }
 
 #[tauri::command]
+fn list_mcp_import_candidates() -> Vec<mcp::McpImportCandidate> {
+    mcp::list_mcp_import_candidates()
+}
+
+/// 从 Cursor / Claude 风格 mcp.json 解析服务器列表（不落盘；前端合并到草稿）。
+#[tauri::command]
+fn import_mcp_servers_from_path(path: String) -> Result<mcp::McpImportPreview, String> {
+    mcp::import_mcp_servers_from_path(&path)
+}
+
+#[tauri::command]
 async fn ai_chat(
     request: AiChatRequest,
     state: State<'_, Arc<AppState>>,
@@ -6215,6 +6226,8 @@ fn main() {
             reconnect_mcp_server,
             list_mcp_tools,
             call_mcp_tool,
+            list_mcp_import_candidates,
+            import_mcp_servers_from_path,
             ai_chat,
             ai_chat_stream,
             stop_ai_chat,

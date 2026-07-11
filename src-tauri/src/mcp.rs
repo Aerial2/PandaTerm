@@ -187,6 +187,25 @@ pub struct CallMcpToolResult {
     pub is_error: bool,
 }
 
+/// 可导入的外部 MCP 配置候选（Cursor 全局等）
+#[derive(Debug, Clone, Serialize)]
+pub struct McpImportCandidate {
+    pub id: String,
+    pub label: String,
+    pub path: String,
+    pub exists: bool,
+    pub server_count: Option<usize>,
+    pub error: Option<String>,
+}
+
+/// 从路径导入后的预览（不落盘；由前端合并到草稿）
+#[derive(Debug, Clone, Serialize)]
+pub struct McpImportPreview {
+    pub path: String,
+    pub servers: Vec<McpServerConfig>,
+    pub server_count: usize,
+}
+
 // ── Runtime ─────────────────────────────────────────────────────────────
 
 struct PendingRequest {
@@ -239,23 +258,20 @@ pub fn mcp_config_path(data_dir: &Path) -> PathBuf {
     data_dir.join("mcp.json")
 }
 
-pub fn load_mcp_config(path: &Path) -> Result<McpConfigStore, String> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(McpConfigStore::default());
-        }
-        Err(error) => return Err(format!("MCP 配置读取失败：{error}")),
-    };
-    // Prefer our store shape; fall back to Cursor mcpServers map.
-    if let Ok(mut store) = serde_json::from_str::<McpConfigStore>(&content) {
+/// 解析 MCP 配置正文：优先 PandaTerm store 形态，再回退 Cursor `{ "mcpServers": … }`。
+pub fn parse_mcp_config_content(content: &str) -> Result<McpConfigStore, String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(McpConfigStore::default());
+    }
+    if let Ok(mut store) = serde_json::from_str::<McpConfigStore>(trimmed) {
         if store.version != MCP_CONFIG_VERSION {
             return Err(format!("不支持的 MCP 配置版本：{}", store.version));
         }
         store.servers = normalize_mcp_servers(store.servers)?;
         return Ok(store);
     }
-    if let Ok(cursor) = serde_json::from_str::<CursorMcpFile>(&content) {
+    if let Ok(cursor) = serde_json::from_str::<CursorMcpFile>(trimmed) {
         let servers = cursor
             .mcp_servers
             .into_iter()
@@ -267,7 +283,24 @@ pub fn load_mcp_config(path: &Path) -> Result<McpConfigStore, String> {
             servers,
         });
     }
-    Err("MCP 配置已损坏，已拒绝覆盖原文件".to_string())
+    Err("无法识别的 MCP 配置（需要 PandaTerm store 或 Cursor mcpServers）".to_string())
+}
+
+pub fn load_mcp_config(path: &Path) -> Result<McpConfigStore, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(McpConfigStore::default());
+        }
+        Err(error) => return Err(format!("MCP 配置读取失败：{error}")),
+    };
+    parse_mcp_config_content(&content).map_err(|error| {
+        if error.contains("无法识别") {
+            "MCP 配置已损坏，已拒绝覆盖原文件".to_string()
+        } else {
+            error
+        }
+    })
 }
 
 pub fn save_mcp_config(path: &Path, store: &McpConfigStore) -> Result<(), String> {
@@ -460,6 +493,159 @@ fn validate_mcp_server_id(value: &str) -> Result<String, String> {
         return Err("MCP 服务器 id 仅允许字母、数字、.-_".to_string());
     }
     Ok(id.to_string())
+}
+
+/// 常见 Cursor / Claude Desktop 全局 MCP 配置路径（仅探测，不写文件）。
+pub fn list_mcp_import_candidates() -> Vec<McpImportCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut push = |id: &str, label: &str, path: PathBuf| {
+        let path_str = path.to_string_lossy().into_owned();
+        if !seen.insert(path_str.clone()) {
+            return;
+        }
+        let (exists, server_count, error) = if path.is_file() {
+            match std::fs::read_to_string(&path)
+                .map_err(|e| format!("读取失败：{e}"))
+                .and_then(|content| parse_mcp_config_content(&content))
+            {
+                Ok(store) => (true, Some(store.servers.len()), None),
+                Err(err) => (true, None, Some(err)),
+            }
+        } else {
+            (false, None, None)
+        };
+        candidates.push(McpImportCandidate {
+            id: id.to_string(),
+            label: label.to_string(),
+            path: path_str,
+            exists,
+            server_count,
+            error,
+        });
+    };
+
+    if let Some(home) = dirs_home_dir() {
+        push(
+            "cursor-global",
+            "Cursor 全局 (~/.cursor/mcp.json)",
+            home.join(".cursor").join("mcp.json"),
+        );
+        push(
+            "claude-desktop",
+            "Claude Desktop",
+            home
+                .join("AppData")
+                .join("Roaming")
+                .join("Claude")
+                .join("claude_desktop_config.json"),
+        );
+        // macOS Claude Desktop
+        push(
+            "claude-desktop-macos",
+            "Claude Desktop (macOS)",
+            home
+                .join("Library")
+                .join("Application Support")
+                .join("Claude")
+                .join("claude_desktop_config.json"),
+        );
+        // Linux Claude
+        push(
+            "claude-desktop-linux",
+            "Claude Desktop (Linux)",
+            home
+                .join(".config")
+                .join("Claude")
+                .join("claude_desktop_config.json"),
+        );
+    }
+
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let appdata = PathBuf::from(appdata);
+        push(
+            "cursor-appdata",
+            "Cursor AppData",
+            appdata.join("Cursor").join("User").join("globalStorage").join("mcp.json"),
+        );
+        push(
+            "claude-desktop-appdata",
+            "Claude Desktop (APPDATA)",
+            appdata.join("Claude").join("claude_desktop_config.json"),
+        );
+    }
+
+    candidates
+}
+
+fn dirs_home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+/// 从任意路径读取并解析 MCP 服务器列表（Cursor / PandaTerm / Claude desktop 形态）。
+pub fn import_mcp_servers_from_path(path: &str) -> Result<McpImportPreview, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("导入路径不能为空".to_string());
+    }
+    if path.chars().count() > 1_024 {
+        return Err("导入路径过长".to_string());
+    }
+    let path_buf = PathBuf::from(path);
+    if !path_buf.is_file() {
+        return Err(format!("文件不存在：{path}"));
+    }
+    let content = std::fs::read_to_string(&path_buf)
+        .map_err(|error| format!("MCP 配置读取失败：{error}"))?;
+    // Claude Desktop 使用 mcpServers 字段，与 Cursor 相同；也兼容我们的 store。
+    let store = parse_mcp_config_content(&content)?;
+    if store.servers.is_empty() {
+        return Err("该文件中没有可导入的 MCP 服务器".to_string());
+    }
+    Ok(McpImportPreview {
+        path: path_buf.to_string_lossy().into_owned(),
+        server_count: store.servers.len(),
+        servers: store.servers,
+    })
+}
+
+/// 合并导入服务器到现有列表：同 id 覆盖配置；新 id 追加；总数不超过上限。
+pub fn merge_mcp_server_imports(
+    existing: Vec<McpServerConfig>,
+    imported: Vec<McpServerConfig>,
+) -> Result<(Vec<McpServerConfig>, usize, usize), String> {
+    if imported.is_empty() {
+        return Ok((existing, 0, 0));
+    }
+    let mut by_id: HashMap<String, McpServerConfig> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for server in existing {
+        if !by_id.contains_key(&server.id) {
+            order.push(server.id.clone());
+        }
+        by_id.insert(server.id.clone(), server);
+    }
+    let mut added = 0usize;
+    let mut updated = 0usize;
+    for server in imported {
+        if by_id.contains_key(&server.id) {
+            updated += 1;
+            by_id.insert(server.id.clone(), server);
+        } else {
+            added += 1;
+            order.push(server.id.clone());
+            by_id.insert(server.id.clone(), server);
+        }
+    }
+    let merged = order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect::<Vec<_>>();
+    let normalized = normalize_mcp_servers(merged)?;
+    Ok((normalized, added, updated))
 }
 
 pub fn transport_label(transport: &McpTransport) -> &'static str {
@@ -1204,6 +1390,56 @@ mod tests {
         );
         assert!(matches!(remote.transport, McpTransport::Sse));
         assert!(remote.url.starts_with("https://"));
+
+        let store = parse_mcp_config_content(raw).expect("parse content");
+        assert_eq!(store.servers.len(), 2);
+    }
+
+    #[test]
+    fn merge_import_overwrites_same_id() {
+        let existing = vec![McpServerConfig {
+            id: "memory".into(),
+            name: "Old".into(),
+            transport: McpTransport::Stdio,
+            command: "old".into(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            url: String::new(),
+            headers: HashMap::new(),
+            enabled: false,
+        }];
+        let imported = vec![McpServerConfig {
+            id: "memory".into(),
+            name: "memory".into(),
+            transport: McpTransport::Stdio,
+            command: "npx".into(),
+            args: vec!["-y".into()],
+            env: HashMap::new(),
+            cwd: None,
+            url: String::new(),
+            headers: HashMap::new(),
+            enabled: true,
+        }, McpServerConfig {
+            id: "fs".into(),
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "npx".into(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            url: String::new(),
+            headers: HashMap::new(),
+            enabled: false,
+        }];
+        let (merged, added, updated) =
+            merge_mcp_server_imports(existing, imported).expect("merge");
+        assert_eq!(added, 1);
+        assert_eq!(updated, 1);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].command, "npx");
+        assert_eq!(merged[0].name, "memory");
+        assert_eq!(merged[1].id, "fs");
     }
 
     #[test]

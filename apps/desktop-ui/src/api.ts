@@ -412,6 +412,31 @@ export async function callMcpTool(request: {
   return await invoke<CallMcpToolResult>('call_mcp_tool', { request });
 }
 
+export type McpImportCandidate = {
+  id: string;
+  label: string;
+  path: string;
+  exists: boolean;
+  server_count?: number | null;
+  error?: string | null;
+};
+
+export type McpImportPreview = {
+  path: string;
+  servers: McpServerConfig[];
+  server_count: number;
+};
+
+/** 探测 Cursor / Claude 等常见 MCP 配置路径 */
+export async function listMcpImportCandidates(): Promise<McpImportCandidate[]> {
+  return await invoke<McpImportCandidate[]>('list_mcp_import_candidates');
+}
+
+/** 从路径解析 MCP 服务器（不落盘） */
+export async function importMcpServersFromPath(path: string): Promise<McpImportPreview> {
+  return await invoke<McpImportPreview>('import_mcp_servers_from_path', { path });
+}
+
 export async function sendAiChat(messages: AiChatMessage[]): Promise<AiChatResponse> {
   return await invoke<AiChatResponse>('ai_chat', { request: { messages } });
 }

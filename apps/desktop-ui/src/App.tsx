@@ -65,6 +65,8 @@ import {
   reconnectMcpServer,
   listMcpTools,
   callMcpTool,
+  listMcpImportCandidates,
+  importMcpServersFromPath,
   streamAiChat,
   stopAiChat,
   listAiConversations,
@@ -74,6 +76,7 @@ import {
   type ProcessInfo,
   type McpServerConfig,
   type McpConfigSnapshot,
+  type McpImportCandidate,
   type McpTransport,
   listLocalDirectory,
   listRemoteDirectory,
@@ -493,6 +496,45 @@ function isMcpServersDraftDirty(
   if (draft.length !== savedIds.size) return true;
   if (draft.some((server) => !savedIds.has(server.id))) return true;
   return draft.some((server) => isMcpServerDraftDirty(server, snapshot));
+}
+
+/** 将导入服务器合并进草稿：同 id 覆盖，新 id 追加 */
+function mergeMcpServerImports(
+  existing: McpServerConfig[],
+  imported: McpServerConfig[],
+): { next: McpServerConfig[]; added: number; updated: number } {
+  const byId = new Map(existing.map((server) => [server.id, server]));
+  const order = existing.map((server) => server.id);
+  let added = 0;
+  let updated = 0;
+  for (const raw of imported) {
+    const id = (raw.id || '').trim();
+    if (!id) continue;
+    const nextServer: McpServerConfig = {
+      id,
+      name: (raw.name || id).trim(),
+      transport: (raw.transport as McpTransport) || 'stdio',
+      command: raw.command ?? '',
+      args: Array.isArray(raw.args) ? raw.args : [],
+      env: raw.env ?? {},
+      cwd: raw.cwd ?? null,
+      url: raw.url ?? '',
+      headers: raw.headers ?? {},
+      enabled: Boolean(raw.enabled),
+    };
+    if (byId.has(id)) {
+      updated += 1;
+    } else {
+      added += 1;
+      order.push(id);
+    }
+    byId.set(id, nextServer);
+  }
+  return {
+    next: order.map((id) => byId.get(id)!).filter(Boolean),
+    added,
+    updated,
+  };
 }
 
 /** Models 草稿是否相对已保存供应商配置有变化（含待写入 API Key） */
@@ -1138,9 +1180,15 @@ export function App() {
   const [isMcpSaving, setIsMcpSaving] = useState(false);
   const [mcpBusyServerId, setMcpBusyServerId] = useState<string | null>(null);
   const [mcpError, setMcpError] = useState('');
+  const [mcpNotice, setMcpNotice] = useState('');
   const [expandedMcpServerId, setExpandedMcpServerId] = useState<string | null>(null);
   /** MCP 服务器列表过滤 */
   const [mcpServerListQuery, setMcpServerListQuery] = useState('');
+  /** Cursor mcp.json 导入面板 */
+  const [mcpImportOpen, setMcpImportOpen] = useState(false);
+  const [mcpImportCandidates, setMcpImportCandidates] = useState<McpImportCandidate[]>([]);
+  const [mcpImportPath, setMcpImportPath] = useState('');
+  const [isMcpImporting, setIsMcpImporting] = useState(false);
   const mcpRefreshGenerationRef = useRef(0);
   const [pendingAiContexts, setPendingAiContexts] = useState<AiContextItem[]>([]);
   const [isAiHistoryOpen, setIsAiHistoryOpen] = useState(false);
@@ -1254,6 +1302,11 @@ export function App() {
     setAiApiKeyDraft('');
     setAiModelListQuery('');
     setMcpServerListQuery('');
+    setMcpImportOpen(false);
+    setMcpImportCandidates([]);
+    setMcpImportPath('');
+    setIsMcpImporting(false);
+    setMcpNotice('');
   }, [isAiSettingsOpen]);
 
   // Esc 关闭 AI 设置（有其它对话框或保存中时不关；有脏草稿时确认）
@@ -4360,6 +4413,54 @@ export function App() {
       case 'disabled': return '已禁用';
       case 'disconnected': return '未连接';
       default: return status || '未知';
+    }
+  }
+
+  async function openMcpImportPanel() {
+    if (isMcpLoading || isMcpSaving || isMcpImporting) return;
+    if (mcpImportOpen) {
+      setMcpImportOpen(false);
+      return;
+    }
+    setMcpImportOpen(true);
+    setMcpError('');
+    setMcpNotice('');
+    try {
+      const candidates = await listMcpImportCandidates();
+      setMcpImportCandidates(candidates);
+      const preferred = candidates.find((item) => item.exists && !item.error)
+        ?? candidates.find((item) => item.exists);
+      if (preferred && !mcpImportPath.trim()) {
+        setMcpImportPath(preferred.path);
+      }
+    } catch (error) {
+      setMcpError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function importMcpFromPath(path: string) {
+    const target = path.trim();
+    if (!target || isMcpImporting || isMcpSaving) return;
+    setIsMcpImporting(true);
+    setMcpError('');
+    setMcpNotice('');
+    try {
+      const preview = await importMcpServersFromPath(target);
+      const { next, added, updated } = mergeMcpServerImports(mcpServersDraft, preview.servers);
+      if (added === 0 && updated === 0) {
+        setMcpError('没有可合并的 MCP 服务器');
+        return;
+      }
+      setMcpServersDraft(next);
+      setExpandedMcpServerId(preview.servers[0]?.id ?? null);
+      setMcpImportOpen(false);
+      setMcpNotice(
+        `已导入 ${preview.server_count} 个服务器（新增 ${added} · 覆盖 ${updated}）。请检查后点击 Save MCP。`,
+      );
+    } catch (error) {
+      setMcpError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsMcpImporting(false);
     }
   }
 
@@ -7723,7 +7824,7 @@ export function App() {
         <div
           className="ai-settings-backdrop"
           onMouseDown={() => {
-            if (!isAiConfigSaving && !isAiModelsSyncing && !isMcpSaving) setIsAiSettingsOpen(false);
+            if (!isAiConfigSaving && !isAiModelsSyncing && !isMcpSaving) requestCloseAiSettings();
           }}
         >
           <div
@@ -7785,7 +7886,7 @@ export function App() {
                   className="ai-settings-close"
                   aria-label="关闭"
                   disabled={isAiConfigSaving || isAiModelsSyncing || isMcpSaving}
-                  onClick={() => setIsAiSettingsOpen(false)}
+                  onClick={() => requestCloseAiSettings()}
                 >
                   <X size={16} />
                 </button>
@@ -8000,16 +8101,28 @@ export function App() {
                       type="button"
                       className="ai-settings-btn"
                       disabled={isAiConfigSaving || isAiModelsSyncing}
-                      onClick={() => setIsAiSettingsOpen(false)}
+                      onClick={() => requestCloseAiSettings()}
                     >
                       Cancel
                     </button>
                     <button
                       type="submit"
                       className="ai-settings-btn primary"
-                      disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error) || !aiConfigDraft.base_url.trim() || !aiConfigDraft.model.trim()}
+                      disabled={
+                        isAiConfigLoading
+                        || isAiConfigSaving
+                        || isAiModelsSyncing
+                        || Boolean(aiProviderConfig?.error)
+                        || !aiConfigDraft.base_url.trim()
+                        || !aiConfigDraft.model.trim()
+                        || !isAiConfigDraftDirty(aiConfigDraft, aiApiKeyDraft, aiProviderConfig)
+                      }
                     >
-                      {isAiConfigSaving ? 'Saving…' : 'Save'}
+                      {isAiConfigSaving
+                        ? 'Saving…'
+                        : isAiConfigDraftDirty(aiConfigDraft, aiApiKeyDraft, aiProviderConfig)
+                          ? 'Save'
+                          : 'Saved'}
                     </button>
                   </footer>
                 </form>
@@ -8023,7 +8136,7 @@ export function App() {
                           <button
                             type="button"
                             className="ai-settings-ghost-btn"
-                            disabled={isMcpLoading || isMcpSaving}
+                            disabled={isMcpLoading || isMcpSaving || isMcpImporting}
                             onClick={() => void refreshMcpConfig()}
                           >
                             <RefreshCw size={14} className={isMcpLoading ? 'spin' : undefined} aria-hidden />
@@ -8031,8 +8144,17 @@ export function App() {
                           </button>
                           <button
                             type="button"
+                            className={`ai-settings-ghost-btn${mcpImportOpen ? ' active' : ''}`}
+                            disabled={isMcpLoading || isMcpSaving || isMcpImporting}
+                            onClick={() => void openMcpImportPanel()}
+                          >
+                            <Download size={14} aria-hidden />
+                            <span>Import</span>
+                          </button>
+                          <button
+                            type="button"
                             className="ai-settings-ghost-btn primary-ghost"
-                            disabled={isMcpLoading || isMcpSaving}
+                            disabled={isMcpLoading || isMcpSaving || isMcpImporting}
                             onClick={() => {
                               const server = createEmptyMcpServer();
                               setMcpServersDraft((current) => [...current, server]);
@@ -8044,6 +8166,86 @@ export function App() {
                           </button>
                         </div>
                       </div>
+                      {mcpSnapshot?.config_path ? (
+                        <div className="ai-settings-mcp-path" title={mcpSnapshot.config_path}>
+                          <span>Config</span>
+                          <code>{mcpSnapshot.config_path}</code>
+                          <button
+                            type="button"
+                            className="ai-settings-ghost-btn"
+                            title="Copy path"
+                            onClick={() => {
+                              void navigator.clipboard?.writeText(mcpSnapshot.config_path || '').catch(() => {});
+                            }}
+                          >
+                            <Clipboard size={13} aria-hidden />
+                            <span>Copy</span>
+                          </button>
+                        </div>
+                      ) : null}
+
+                      {mcpImportOpen && (
+                        <div className="ai-settings-mcp-import">
+                          <div className="ai-settings-mcp-import-title">
+                            Import Cursor / Claude MCP config
+                            <em>merge into draft · not saved until Save MCP</em>
+                          </div>
+                          <div className="ai-settings-mcp-import-path-row">
+                            <input
+                              className="ai-settings-input"
+                              value={mcpImportPath}
+                              placeholder="Path to mcp.json"
+                              spellCheck={false}
+                              disabled={isMcpImporting || isMcpSaving}
+                              onChange={(event) => setMcpImportPath(event.target.value)}
+                              onKeyDown={(event) => {
+                                if (event.key === 'Enter') {
+                                  event.preventDefault();
+                                  void importMcpFromPath(mcpImportPath);
+                                }
+                              }}
+                            />
+                            <button
+                              type="button"
+                              className="ai-settings-ghost-btn primary-ghost"
+                              disabled={isMcpImporting || isMcpSaving || !mcpImportPath.trim()}
+                              onClick={() => void importMcpFromPath(mcpImportPath)}
+                            >
+                              <Download size={14} aria-hidden />
+                              <span>{isMcpImporting ? 'Importing…' : 'Import path'}</span>
+                            </button>
+                          </div>
+                          <div className="ai-settings-mcp-import-candidates">
+                            {mcpImportCandidates.length === 0 ? (
+                              <div className="ai-settings-model-empty">No candidate paths discovered.</div>
+                            ) : (
+                              mcpImportCandidates.map((candidate) => (
+                                <button
+                                  key={candidate.id}
+                                  type="button"
+                                  className={`ai-settings-mcp-import-candidate${candidate.exists ? ' ready' : ''}${candidate.error ? ' error' : ''}`}
+                                  disabled={!candidate.exists || Boolean(candidate.error) || isMcpImporting || isMcpSaving}
+                                  title={candidate.error || candidate.path}
+                                  onClick={() => {
+                                    setMcpImportPath(candidate.path);
+                                    void importMcpFromPath(candidate.path);
+                                  }}
+                                >
+                                  <strong>{candidate.label}</strong>
+                                  <code>{candidate.path}</code>
+                                  <span>
+                                    {!candidate.exists
+                                      ? 'missing'
+                                      : candidate.error
+                                        ? 'invalid'
+                                        : `${candidate.server_count ?? 0} servers`}
+                                  </span>
+                                </button>
+                              ))
+                            )}
+                          </div>
+                        </div>
+                      )}
 
                       <div className="ai-settings-mcp-list-block">
                         {mcpServersDraft.length > 0 && (
@@ -8169,7 +8371,7 @@ export function App() {
                                           />
                                         </label>
                                         <label className="ai-settings-field ai-settings-field-full">
-                                          <span>Transport <em>stdio only</em></span>
+                                          <span>Transport <em>stdio runtime · remote config only</em></span>
                                           <select
                                             className="ai-settings-input"
                                             value={server.transport}
@@ -8179,8 +8381,8 @@ export function App() {
                                             })}
                                           >
                                             <option value="stdio">stdio</option>
-                                            <option value="sse" disabled>sse (coming soon)</option>
-                                            <option value="streamable-http" disabled>streamable-http (coming soon)</option>
+                                            <option value="sse">sse (config only)</option>
+                                            <option value="streamable-http">streamable-http (config only)</option>
                                           </select>
                                         </label>
 
@@ -8247,17 +8449,44 @@ export function App() {
                                             </label>
                                           </>
                                         ) : (
-                                          <label className="ai-settings-field ai-settings-field-full">
-                                            <span>URL</span>
-                                            <input
-                                              className="ai-settings-input"
-                                              value={server.url}
-                                              placeholder="https://example.com/mcp"
-                                              spellCheck={false}
-                                              disabled={isMcpSaving || busy}
-                                              onChange={(event) => updateMcpServerDraft(server.id, { url: event.target.value })}
-                                            />
-                                          </label>
+                                          <>
+                                            <label className="ai-settings-field ai-settings-field-full">
+                                              <span>URL <em>http(s) · connect later</em></span>
+                                              <input
+                                                className="ai-settings-input"
+                                                value={server.url}
+                                                placeholder="https://example.com/mcp"
+                                                spellCheck={false}
+                                                disabled={isMcpSaving || busy}
+                                                onChange={(event) => updateMcpServerDraft(server.id, { url: event.target.value })}
+                                              />
+                                            </label>
+                                            <label className="ai-settings-field ai-settings-field-full">
+                                              <span>Headers <em>KEY=VALUE per line</em></span>
+                                              <textarea
+                                                className="ai-settings-textarea"
+                                                rows={3}
+                                                value={Object.entries(server.headers ?? {}).map(([key, value]) => `${key}=${value}`).join('\n')}
+                                                placeholder="Authorization=Bearer …"
+                                                spellCheck={false}
+                                                disabled={isMcpSaving || busy}
+                                                onChange={(event) => {
+                                                  const headers: Record<string, string> = {};
+                                                  for (const line of event.target.value.split(/\r?\n/)) {
+                                                    const trimmed = line.trim();
+                                                    if (!trimmed) continue;
+                                                    const eq = trimmed.indexOf('=');
+                                                    if (eq <= 0) continue;
+                                                    headers[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1);
+                                                  }
+                                                  updateMcpServerDraft(server.id, { headers });
+                                                }}
+                                              />
+                                            </label>
+                                            <p className="ai-settings-mcp-remote-note">
+                                              Remote transport is stored for Cursor-compatible configs. Runtime connect is stdio-only for now.
+                                            </p>
+                                          </>
                                         )}
                                       </div>
 
@@ -8308,6 +8537,7 @@ export function App() {
                       </div>
                     </section>
 
+                    {mcpNotice && <p className="ai-settings-mcp-notice">{mcpNotice}</p>}
                     {mcpError && <p className="ai-settings-error">{mcpError}</p>}
                   </div>
 
@@ -8316,7 +8546,7 @@ export function App() {
                       type="button"
                       className="ai-settings-btn"
                       disabled={isMcpSaving}
-                      onClick={() => setIsAiSettingsOpen(false)}
+                      onClick={() => requestCloseAiSettings()}
                     >
                       Cancel
                     </button>
