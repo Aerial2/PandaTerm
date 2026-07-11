@@ -73,7 +73,7 @@ export function parseAiTerminalResponse(content: string): ParsedAiTerminalRespon
       actions.push({
         summary: parsed.summary.trim().slice(0, 500),
         contextSource: parsed.context_source.trim(),
-        command: parsed.command.trim(),
+        command: normalizeTerminalCommand(parsed.command.trim()),
         timeoutMs: Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, requestedTimeout)),
       });
     } catch (error) {
@@ -92,9 +92,45 @@ export function terminalCommandIdentity(command: string): string {
   return command.replace(/\r\n/g, '\n').trim();
 }
 
+/**
+ * 把 AI 常见「漏空格重定向」拆开，而不是直接拒掉。
+ *
+ * 例：
+ * - `nginx -T2>/dev/null` → `nginx -T 2>/dev/null`
+ * - `cat /www/1.txt2>/dev/null` → `cat /www/1.txt 2>/dev/null`  （此前误报 t2>）
+ * - `test -f a.txt2>&1` → `test -f a.txt 2>&1`
+ * - `echo hello>file` → `echo hello >file`
+ *
+ * 保留合法：`2>/dev/null`、`1>&2`、`&>file`、空白后的 `>file`
+ */
+export function normalizeTerminalCommand(command: string): string {
+  return command
+    // 短选项与 fd 粘连：-T2> → -T 2>
+    .replace(/(^|[\s;|&])-([A-Za-z])([12]>{1,2})/g, '$1-$2 $3')
+    // 路径/词与 fd 粘连：txt2>/dev/null → txt 2>/dev/null；txt2>&1 → txt 2>&1
+    .replace(/([^\s;|&<>])([12]>{1,2})/g, '$1 $2')
+    // 普通重定向粘连：hello>file → hello >file（不碰 2> / &>）
+    .replace(/([^\s;|&<>12])(>{1,2})(?!&)/g, '$1 $2');
+}
+
+/**
+ * 规范化后仍存在的「词与重定向粘连」才拒绝。
+ * 另：拦下协议泄漏形态 `T2>`（前后是空白/分隔符，不是 -T 选项）。
+ */
 export function suspiciousShellRedirection(command: string): string | null {
-  const match = command.match(/\S(?:2>|1>|>>|>)(?=\S)/u);
-  return match ? match[0] : null;
+  const toolLeak = command.match(/(?:^|[\s;|&])(T\d+>)/);
+  if (toolLeak?.[1]) return toolLeak[1];
+
+  const normalized = normalizeTerminalCommand(command);
+  const pattern = /[^\s12](?:[12]?>|>>)(?=\S)/gu;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(normalized)) !== null) {
+    const index = match.index;
+    if (normalized[index] === '&') continue;
+    if (index > 0 && normalized[index - 1] === '-' && /[A-Za-z]/u.test(normalized[index] ?? '')) continue;
+    return match[0];
+  }
+  return null;
 }
 
 export function isHighRiskTerminalCommand(command: string): boolean {

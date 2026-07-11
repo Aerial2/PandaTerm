@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -149,6 +149,9 @@ struct AiProviderConfigStore {
     version: u8,
     base_url: String,
     model: String,
+    /// 可选模型列表（同步 + 自定义）；同步时不会清空未出现在远端的自定义项
+    #[serde(default)]
+    models: Vec<String>,
     use_api_key: bool,
     api_key_secret_id: Option<String>,
 }
@@ -159,6 +162,7 @@ impl Default for AiProviderConfigStore {
             version: AI_CONFIG_VERSION,
             base_url: DEFAULT_AI_BASE_URL.to_string(),
             model: DEFAULT_AI_MODEL.to_string(),
+            models: vec![DEFAULT_AI_MODEL.to_string()],
             use_api_key: true,
             api_key_secret_id: None,
         }
@@ -169,6 +173,7 @@ impl Default for AiProviderConfigStore {
 struct AiProviderConfig {
     base_url: String,
     model: String,
+    models: Vec<String>,
     use_api_key: bool,
     api_key_configured: bool,
     error: Option<String>,
@@ -178,7 +183,17 @@ struct AiProviderConfig {
 struct SaveAiProviderConfigRequest {
     base_url: String,
     model: String,
+    #[serde(default)]
+    models: Option<Vec<String>>,
     use_api_key: bool,
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SyncAiModelsRequest {
+    /// 可选：用草稿 Base URL 拉列表；缺省用已保存配置
+    base_url: Option<String>,
+    use_api_key: Option<bool>,
     api_key: Option<String>,
 }
 
@@ -588,13 +603,14 @@ fn load_ai_config() -> Result<AiProviderConfigStore, String> {
         }
         Err(error) => return Err(format!("AI 供应商配置读取失败：{error}")),
     };
-    let config: AiProviderConfigStore = serde_json::from_str(&content)
+    let mut config: AiProviderConfigStore = serde_json::from_str(&content)
         .map_err(|error| format!("AI 供应商配置已损坏，已拒绝覆盖原文件：{error}"))?;
     if config.version != AI_CONFIG_VERSION {
         return Err(format!("不支持的 AI 供应商配置版本：{}", config.version));
     }
     validate_ai_base_url(&config.base_url)?;
-    validate_ai_model(&config.model)?;
+    config.model = validate_ai_model(&config.model)?;
+    config.models = normalize_ai_models(&config.models, &config.model)?;
     Ok(config)
 }
 
@@ -4663,6 +4679,65 @@ fn validate_ai_model(model: &str) -> Result<String, String> {
     Ok(model.to_string())
 }
 
+const MAX_AI_MODELS: usize = 500;
+
+/// 校验模型列表，并保证当前选中模型一定在列表中
+fn normalize_ai_models(models: &[String], selected: &str) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::new();
+    for model in models {
+        let model = validate_ai_model(model)?;
+        if !normalized.iter().any(|item| item == &model) {
+            normalized.push(model);
+        }
+        if normalized.len() > MAX_AI_MODELS {
+            return Err(format!("模型列表不能超过 {MAX_AI_MODELS} 个"));
+        }
+    }
+    let selected = validate_ai_model(selected)?;
+    if !normalized.iter().any(|item| item == &selected) {
+        if normalized.len() >= MAX_AI_MODELS {
+            return Err(format!("模型列表不能超过 {MAX_AI_MODELS} 个"));
+        }
+        normalized.insert(0, selected);
+    }
+    Ok(normalized)
+}
+
+/// 同步合并：远端 id 命中本地则覆盖该条目；未命中的本地自定义保留
+fn merge_ai_models(existing: &[String], synced: &[String]) -> Result<Vec<String>, String> {
+    let mut synced_normalized = Vec::new();
+    for model in synced {
+        let model = validate_ai_model(model)?;
+        if !synced_normalized.iter().any(|item| item == &model) {
+            synced_normalized.push(model);
+        }
+    }
+    let synced_set: HashSet<&str> = synced_normalized.iter().map(String::as_str).collect();
+    let mut merged = Vec::new();
+    for model in existing {
+        let model = validate_ai_model(model)?;
+        if synced_set.contains(model.as_str()) {
+            // 同名自定义被远端覆盖：仅在首次遇到时放入远端规范名
+            if !merged.iter().any(|item| item == &model) {
+                merged.push(model);
+            }
+            continue;
+        }
+        if !merged.iter().any(|item| item == &model) {
+            merged.push(model);
+        }
+    }
+    for model in synced_normalized {
+        if !merged.iter().any(|item| item == &model) {
+            merged.push(model);
+        }
+    }
+    if merged.len() > MAX_AI_MODELS {
+        merged.truncate(MAX_AI_MODELS);
+    }
+    Ok(merged)
+}
+
 fn validate_ai_base_url(base_url: &str) -> Result<Url, String> {
     let raw = base_url.trim();
     if raw.is_empty() {
@@ -4688,28 +4763,67 @@ fn validate_ai_base_url(base_url: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-fn ai_chat_completions_url(base_url: &str) -> Result<Url, String> {
+fn ai_resource_url(base_url: &str, resource: &str) -> Result<Url, String> {
     let mut url = validate_ai_base_url(base_url)?;
     let path = url.path().trim_end_matches('/');
-    let endpoint = if path.ends_with("/chat/completions") {
+    let resource = resource.trim_matches('/');
+    let endpoint = if path.ends_with(&format!("/{resource}")) || path == resource {
         path.to_string()
     } else if path.is_empty() {
-        "/chat/completions".to_string()
+        format!("/{resource}")
     } else {
-        format!("{path}/chat/completions")
+        format!("{path}/{resource}")
     };
     url.set_path(&endpoint);
     Ok(url)
+}
+
+fn ai_chat_completions_url(base_url: &str) -> Result<Url, String> {
+    ai_resource_url(base_url, "chat/completions")
+}
+
+fn ai_models_url(base_url: &str) -> Result<Url, String> {
+    ai_resource_url(base_url, "models")
 }
 
 fn ai_config_snapshot(config: &AiProviderConfigStore, error: Option<String>) -> AiProviderConfig {
     AiProviderConfig {
         base_url: config.base_url.clone(),
         model: config.model.clone(),
+        models: config.models.clone(),
         use_api_key: config.use_api_key,
         api_key_configured: config.api_key_secret_id.is_some(),
         error,
     }
+}
+
+fn parse_openai_model_ids(body: &str) -> Result<Vec<String>, String> {
+    let value: Value = serde_json::from_str(body)
+        .map_err(|error| format!("模型列表响应格式不兼容：{error}"))?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "模型列表响应缺少 data 数组".to_string())?;
+    let mut models = Vec::new();
+    for item in data {
+        let id = item
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| item.get("id").and_then(Value::as_str).map(str::to_string));
+        let Some(id) = id else {
+            continue;
+        };
+        if validate_ai_model(&id).is_ok() && !models.iter().any(|model| model == &id) {
+            models.push(id);
+        }
+        if models.len() >= MAX_AI_MODELS {
+            break;
+        }
+    }
+    if models.is_empty() {
+        return Err("模型列表为空".to_string());
+    }
+    Ok(models)
 }
 
 fn validate_ai_messages(messages: &[AiChatMessage]) -> Result<(), String> {
@@ -4786,6 +4900,10 @@ async fn save_ai_provider_config(
     if request.use_api_key && supplied_key.is_none() && current.api_key_secret_id.is_none() {
         return Err("启用 API Key 时必须输入密钥".to_string());
     }
+    let models = normalize_ai_models(
+        request.models.as_deref().unwrap_or(&current.models),
+        &model,
+    )?;
 
     let mut credentials = state.credentials.lock().await;
     let next_secret_id = if let Some(key) = supplied_key.as_deref() {
@@ -4800,6 +4918,7 @@ async fn save_ai_provider_config(
         version: AI_CONFIG_VERSION,
         base_url,
         model,
+        models,
         use_api_key: request.use_api_key,
         api_key_secret_id: next_secret_id,
     };
@@ -4817,6 +4936,81 @@ async fn save_ai_provider_config(
             eprintln!("[Credential] obsolete AI API key cleanup deferred: {error}");
         }
     }
+    *state.ai_config.lock().await = next.clone();
+    Ok(ai_config_snapshot(&next, None))
+}
+
+#[tauri::command]
+async fn sync_ai_provider_models(
+    request: SyncAiModelsRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<AiProviderConfig, String> {
+    if let Some(error) = state.ai_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let current = state.ai_config.lock().await.clone();
+    let base_url = validate_ai_base_url(
+        request
+            .base_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&current.base_url),
+    )?
+    .to_string();
+    let use_api_key = request.use_api_key.unwrap_or(current.use_api_key);
+    let supplied_key = request
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(ToString::to_string);
+    let api_key = if use_api_key {
+        if let Some(key) = supplied_key {
+            Some(Zeroizing::new(key))
+        } else {
+            let secret_id = current
+                .api_key_secret_id
+                .as_deref()
+                .ok_or_else(|| "尚未配置 AI API Key".to_string())?;
+            let credentials = state.credentials.lock().await;
+            Some(Zeroizing::new(resolve_credential(&credentials, secret_id)?))
+        }
+    } else {
+        None
+    };
+
+    let endpoint = ai_models_url(&base_url)?;
+    let mut builder = state.ai_http.get(endpoint);
+    if let Some(key) = api_key.as_deref() {
+        builder = builder.bearer_auth(key);
+    }
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| format!("同步模型列表失败：{error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("模型列表响应读取失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "模型列表返回 HTTP {}：{}",
+            status.as_u16(),
+            extract_provider_error(&body)
+        ));
+    }
+    let synced = parse_openai_model_ids(&body)?;
+    let models = normalize_ai_models(&merge_ai_models(&current.models, &synced)?, &current.model)?;
+    let next = AiProviderConfigStore {
+        version: AI_CONFIG_VERSION,
+        base_url: current.base_url,
+        model: current.model,
+        models,
+        use_api_key: current.use_api_key,
+        api_key_secret_id: current.api_key_secret_id,
+    };
+    save_ai_config(&next)?;
     *state.ai_config.lock().await = next.clone();
     Ok(ai_config_snapshot(&next, None))
 }
@@ -5774,6 +5968,7 @@ fn main() {
             set_credential_protection,
             get_ai_provider_config,
             save_ai_provider_config,
+            sync_ai_provider_models,
             ai_chat,
             ai_chat_stream,
             stop_ai_chat,
@@ -5976,6 +6171,12 @@ mod tests {
             "https://api.openai.com/v1/chat/completions"
         );
         assert_eq!(
+            ai_models_url("https://api.openai.com/v1")
+                .expect("build models endpoint")
+                .as_str(),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
             ai_chat_completions_url("gateway.example.com/openai/v1/")
                 .expect("build custom endpoint")
                 .as_str(),
@@ -5983,6 +6184,45 @@ mod tests {
         );
         assert!(ai_chat_completions_url("file:///tmp/model").is_err());
         assert!(ai_chat_completions_url("https://user:secret@example.com/v1").is_err());
+    }
+
+    #[test]
+    fn merge_ai_models_keeps_customs_and_overwrites_matches() {
+        let existing = vec![
+            "custom-a".to_string(),
+            "gpt-4o-mini".to_string(),
+            "custom-b".to_string(),
+        ];
+        let synced = vec![
+            "gpt-4o-mini".to_string(),
+            "gpt-4o".to_string(),
+            "o1-mini".to_string(),
+        ];
+        let merged = merge_ai_models(&existing, &synced).expect("merge models");
+        assert_eq!(
+            merged,
+            vec![
+                "custom-a".to_string(),
+                "gpt-4o-mini".to_string(),
+                "custom-b".to_string(),
+                "gpt-4o".to_string(),
+                "o1-mini".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_openai_model_ids_from_list_response() {
+        let body = r#"{"object":"list","data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"},"raw-string-model"]}"#;
+        let models = parse_openai_model_ids(body).expect("parse models");
+        assert_eq!(
+            models,
+            vec![
+                "gpt-4o".to_string(),
+                "gpt-4o-mini".to_string(),
+                "raw-string-model".to_string(),
+            ]
+        );
     }
 
     #[cfg(target_os = "windows")]

@@ -232,6 +232,7 @@ export async function setCredentialProtection(
 export type AiProviderConfig = {
   base_url: string;
   model: string;
+  models: string[];
   use_api_key: boolean;
   api_key_configured: boolean;
   error?: string | null;
@@ -300,11 +301,31 @@ export async function getAiProviderConfig(): Promise<AiProviderConfig> {
 }
 
 export async function saveAiProviderConfig(
-  config: Pick<AiProviderConfig, 'base_url' | 'model' | 'use_api_key'>,
+  config: Pick<AiProviderConfig, 'base_url' | 'model' | 'use_api_key'> & { models?: string[] },
   apiKey?: string | null,
 ): Promise<AiProviderConfig> {
   return await invoke<AiProviderConfig>('save_ai_provider_config', {
-    request: { ...config, api_key: apiKey || null },
+    request: {
+      base_url: config.base_url,
+      model: config.model,
+      models: config.models ?? null,
+      use_api_key: config.use_api_key,
+      api_key: apiKey || null,
+    },
+  });
+}
+
+export async function syncAiProviderModels(options?: {
+  base_url?: string | null;
+  use_api_key?: boolean | null;
+  api_key?: string | null;
+}): Promise<AiProviderConfig> {
+  return await invoke<AiProviderConfig>('sync_ai_provider_models', {
+    request: {
+      base_url: options?.base_url ?? null,
+      use_api_key: options?.use_api_key ?? null,
+      api_key: options?.api_key || null,
+    },
   });
 }
 
