@@ -235,6 +235,8 @@ export type AiProviderConfig = {
   models: string[];
   /** 聊天模型列表中可见的已选模型 */
   enabled_models: string[];
+  /** OpenAI-compatible reasoning_effort；none 表示请求不带该字段 */
+  reasoning_effort: string;
   use_api_key: boolean;
   api_key_configured: boolean;
   /** 本机 vault 解密后的密钥；仅用于设置页回填展示 */
@@ -308,6 +310,7 @@ export async function saveAiProviderConfig(
   config: Pick<AiProviderConfig, 'base_url' | 'model' | 'use_api_key'> & {
     models?: string[];
     enabled_models?: string[];
+    reasoning_effort?: string;
   },
   apiKey?: string | null,
 ): Promise<AiProviderConfig> {
@@ -317,6 +320,7 @@ export async function saveAiProviderConfig(
       model: config.model,
       models: config.models ?? null,
       enabled_models: config.enabled_models ?? null,
+      reasoning_effort: config.reasoning_effort ?? null,
       use_api_key: config.use_api_key,
       api_key: apiKey || null,
     },
@@ -335,6 +339,77 @@ export async function syncAiProviderModels(options?: {
       api_key: options?.api_key || null,
     },
   });
+}
+
+export type McpTransport = 'stdio' | 'sse' | 'streamable-http';
+
+export type McpToolInfo = {
+  name: string;
+  description: string;
+  input_schema?: unknown;
+};
+
+export type McpServerConfig = {
+  id: string;
+  name: string;
+  transport: McpTransport;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  cwd?: string | null;
+  url: string;
+  headers: Record<string, string>;
+  enabled: boolean;
+};
+
+export type McpServerSnapshot = McpServerConfig & {
+  status: string;
+  error?: string | null;
+  tools: McpToolInfo[];
+  tool_count: number;
+};
+
+export type McpConfigSnapshot = {
+  servers: McpServerSnapshot[];
+  error?: string | null;
+  config_path?: string | null;
+};
+
+export type CallMcpToolResult = {
+  content: string;
+  is_error: boolean;
+};
+
+export async function getMcpConfig(): Promise<McpConfigSnapshot> {
+  return await invoke<McpConfigSnapshot>('get_mcp_config');
+}
+
+export async function saveMcpConfig(servers: McpServerConfig[]): Promise<McpConfigSnapshot> {
+  return await invoke<McpConfigSnapshot>('save_mcp_config', {
+    request: { servers },
+  });
+}
+
+export async function reconnectMcpServer(serverId: string): Promise<McpConfigSnapshot> {
+  return await invoke<McpConfigSnapshot>('reconnect_mcp_server', { serverId });
+}
+
+export async function listMcpTools(): Promise<Array<{
+  server: string;
+  server_name: string;
+  tool: string;
+  description: string;
+  input_schema?: unknown;
+}>> {
+  return await invoke('list_mcp_tools');
+}
+
+export async function callMcpTool(request: {
+  server_id: string;
+  tool_name: string;
+  arguments?: Record<string, unknown> | null;
+}): Promise<CallMcpToolResult> {
+  return await invoke<CallMcpToolResult>('call_mcp_tool', { request });
 }
 
 export async function sendAiChat(messages: AiChatMessage[]): Promise<AiChatResponse> {

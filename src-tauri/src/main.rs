@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod mcp;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
@@ -56,6 +58,9 @@ struct AppState {
     ai_conversation_error: Mutex<Option<String>>,
     ai_generations: Mutex<HashMap<String, AiGenerationEntry>>,
     ai_http: Client,
+    mcp_config: Mutex<mcp::McpConfigStore>,
+    mcp_config_error: Mutex<Option<String>>,
+    mcp_runtime: Arc<mcp::McpRuntime>,
     local_terminals: Mutex<HashMap<Uuid, LocalTerminalSession>>,
     remote_terminals: Mutex<HashMap<Uuid, RemoteTerminalSession>>,
     /// Reused SSH handles for file transfer (keyed by interactive terminal id).
@@ -140,9 +145,15 @@ const AI_CONFIG_VERSION: u8 = 1;
 const AI_API_KEY_PREFIX: &str = "credential:ai:openai-compatible:api-key";
 const DEFAULT_AI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_AI_MODEL: &str = "gpt-4o-mini";
+/// 默认不发送 reasoning_effort，兼容非推理模型
+const DEFAULT_AI_REASONING_EFFORT: &str = "none";
 const MAX_AI_MESSAGES: usize = 100;
 const MAX_AI_MESSAGE_CHARS: usize = 32_000;
 const MAX_AI_TOTAL_CHARS: usize = 128_000;
+
+fn default_ai_reasoning_effort() -> String {
+    DEFAULT_AI_REASONING_EFFORT.to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AiProviderConfigStore {
@@ -155,6 +166,9 @@ struct AiProviderConfigStore {
     /// 出现在聊天模型列表中的已选模型（子集）；缺省迁移为全部 models
     #[serde(default)]
     enabled_models: Vec<String>,
+    /// OpenAI-compatible reasoning_effort；none 表示请求体不带该字段
+    #[serde(default = "default_ai_reasoning_effort")]
+    reasoning_effort: String,
     use_api_key: bool,
     api_key_secret_id: Option<String>,
 }
@@ -167,6 +181,7 @@ impl Default for AiProviderConfigStore {
             model: DEFAULT_AI_MODEL.to_string(),
             models: vec![DEFAULT_AI_MODEL.to_string()],
             enabled_models: vec![DEFAULT_AI_MODEL.to_string()],
+            reasoning_effort: DEFAULT_AI_REASONING_EFFORT.to_string(),
             use_api_key: true,
             api_key_secret_id: None,
         }
@@ -179,6 +194,7 @@ struct AiProviderConfig {
     model: String,
     models: Vec<String>,
     enabled_models: Vec<String>,
+    reasoning_effort: String,
     use_api_key: bool,
     api_key_configured: bool,
     /// 本地桌面设置可回填展示；仅来自本机 vault 解密结果
@@ -194,6 +210,8 @@ struct SaveAiProviderConfigRequest {
     models: Option<Vec<String>>,
     #[serde(default)]
     enabled_models: Option<Vec<String>>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
     use_api_key: bool,
     api_key: Option<String>,
 }
@@ -276,6 +294,8 @@ struct OpenAiChatStreamRequest<'a> {
     model: &'a str,
     messages: &'a [AiChatMessage],
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,6 +336,8 @@ struct AiChatResponse {
 struct OpenAiChatRequest<'a> {
     model: &'a str,
     messages: &'a [AiChatMessage],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -579,6 +601,10 @@ fn ai_conversations_path() -> Result<PathBuf, String> {
     Ok(pandaterm_data_dir()?.join("ai-conversations.json"))
 }
 
+fn mcp_config_file_path() -> Result<PathBuf, String> {
+    Ok(mcp::mcp_config_path(&pandaterm_data_dir()?))
+}
+
 fn load_ai_conversations() -> Result<AiConversationStore, String> {
     let path = ai_conversations_path()?;
     let content = match fs::read_to_string(&path) {
@@ -622,6 +648,7 @@ fn load_ai_config() -> Result<AiProviderConfigStore, String> {
     config.models = normalize_ai_models(&config.models, &config.model)?;
     config.enabled_models =
         normalize_enabled_ai_models(&config.models, &config.enabled_models, &config.model)?;
+    config.reasoning_effort = validate_ai_reasoning_effort(&config.reasoning_effort)?;
     Ok(config)
 }
 
@@ -4690,6 +4717,25 @@ fn validate_ai_model(model: &str) -> Result<String, String> {
     Ok(model.to_string())
 }
 
+/// OpenAI-compatible reasoning_effort；`none` 表示请求体不带该字段
+fn validate_ai_reasoning_effort(effort: &str) -> Result<String, String> {
+    let effort = effort.trim().to_ascii_lowercase();
+    match effort.as_str() {
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(effort),
+        _ => Err("推理强度无效，可选：none / minimal / low / medium / high / xhigh".to_string()),
+    }
+}
+
+/// 仅在非 none 时注入 chat completions 请求字段
+fn ai_request_reasoning_effort(effort: &str) -> Option<&str> {
+    let effort = effort.trim();
+    if effort.is_empty() || effort.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(effort)
+    }
+}
+
 const MAX_AI_MODELS: usize = 500;
 
 /// 校验模型列表，并保证当前选中模型一定在列表中
@@ -4838,6 +4884,7 @@ fn ai_config_snapshot(
         model: config.model.clone(),
         models: config.models.clone(),
         enabled_models: config.enabled_models.clone(),
+        reasoning_effort: config.reasoning_effort.clone(),
         use_api_key: config.use_api_key,
         api_key_configured: config.api_key_secret_id.is_some(),
         api_key,
@@ -4979,6 +5026,12 @@ async fn save_ai_provider_config(
             .unwrap_or(&current.enabled_models),
         &model,
     )?;
+    let reasoning_effort = validate_ai_reasoning_effort(
+        request
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or(&current.reasoning_effort),
+    )?;
 
     let mut credentials = state.credentials.lock().await;
     let next_secret_id = if let Some(key) = supplied_key.as_deref() {
@@ -4995,6 +5048,7 @@ async fn save_ai_provider_config(
         model,
         models,
         enabled_models,
+        reasoning_effort,
         use_api_key: request.use_api_key,
         api_key_secret_id: next_secret_id,
     };
@@ -5092,6 +5146,7 @@ async fn sync_ai_provider_models(
         model: current.model,
         models,
         enabled_models,
+        reasoning_effort: current.reasoning_effort,
         use_api_key: current.use_api_key,
         api_key_secret_id: current.api_key_secret_id,
     };
@@ -5099,6 +5154,87 @@ async fn sync_ai_provider_models(
     *state.ai_config.lock().await = next.clone();
     let revealed = api_key.as_ref().map(|key| key.as_str().to_string());
     Ok(ai_config_snapshot(&next, revealed, None))
+}
+
+#[tauri::command]
+async fn get_mcp_config(
+    state: State<'_, Arc<AppState>>,
+) -> Result<mcp::McpConfigSnapshot, String> {
+    let store = state.mcp_config.lock().await.clone();
+    let error = state.mcp_config_error.lock().await.clone();
+    let path = mcp_config_file_path()?
+        .to_string_lossy()
+        .into_owned();
+    Ok(state.mcp_runtime.snapshot(&store, error, path).await)
+}
+
+#[tauri::command]
+async fn save_mcp_config(
+    request: mcp::SaveMcpConfigRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<mcp::McpConfigSnapshot, String> {
+    if let Some(error) = state.mcp_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let servers = mcp::normalize_mcp_servers(request.servers)?;
+    let next = mcp::McpConfigStore {
+        version: mcp::MCP_CONFIG_VERSION,
+        servers,
+    };
+    let path = mcp_config_file_path()?;
+    mcp::save_mcp_config(&path, &next)?;
+    *state.mcp_config.lock().await = next.clone();
+    state.mcp_runtime.sync_enabled_servers(&next).await;
+    Ok(state
+        .mcp_runtime
+        .snapshot(&next, None, path.to_string_lossy().into_owned())
+        .await)
+}
+
+#[tauri::command]
+async fn reconnect_mcp_server(
+    server_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<mcp::McpConfigSnapshot, String> {
+    if let Some(error) = state.mcp_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let store = state.mcp_config.lock().await.clone();
+    let server = store
+        .servers
+        .iter()
+        .find(|item| item.id == server_id)
+        .ok_or_else(|| format!("未找到 MCP 服务器：{server_id}"))?
+        .clone();
+    // 连接失败仍返回快照，让 UI 展示 error 状态
+    let _ = state.mcp_runtime.connect_server(&server).await;
+    let path = mcp_config_file_path()?
+        .to_string_lossy()
+        .into_owned();
+    Ok(state.mcp_runtime.snapshot(&store, None, path).await)
+}
+
+#[tauri::command]
+async fn list_mcp_tools(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    if let Some(error) = state.mcp_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let store = state.mcp_config.lock().await.clone();
+    Ok(state.mcp_runtime.list_tools_catalog(&store).await)
+}
+
+#[tauri::command]
+async fn call_mcp_tool(
+    request: mcp::CallMcpToolRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<mcp::CallMcpToolResult, String> {
+    if let Some(error) = state.mcp_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let store = state.mcp_config.lock().await.clone();
+    state.mcp_runtime.call_tool(&store, request).await
 }
 
 #[tauri::command]
@@ -5126,6 +5262,7 @@ async fn ai_chat(
     let payload = OpenAiChatRequest {
         model: &config.model,
         messages: &request.messages,
+        reasoning_effort: ai_request_reasoning_effort(&config.reasoning_effort),
     };
     let mut builder = state.ai_http.post(endpoint).json(&payload);
     if let Some(key) = api_key.as_deref() {
@@ -5397,6 +5534,7 @@ async fn ai_chat_stream(
         model: &config.model,
         messages: &request.messages,
         stream: true,
+        reasoning_effort: ai_request_reasoning_effort(&config.reasoning_effort),
     };
     let mut builder = state.ai_http.post(endpoint).json(&payload);
     if let Some(key) = api_key.as_deref() {
@@ -5971,6 +6109,11 @@ fn main() {
         Ok(store) => (store, None),
         Err(error) => (AiConversationStore::default(), Some(error)),
     };
+    let (mcp_config, mcp_config_error) = match mcp_config_file_path().and_then(|path| mcp::load_mcp_config(&path)) {
+        Ok(store) => (store, None),
+        Err(error) => (mcp::McpConfigStore::default(), Some(error)),
+    };
+    let mcp_runtime = Arc::new(mcp::McpRuntime::default());
     let ai_http = Client::builder()
         .redirect(Policy::none())
         .timeout(Duration::from_secs(120))
@@ -5986,12 +6129,24 @@ fn main() {
         ai_conversation_error: Mutex::new(ai_conversation_error),
         ai_generations: Mutex::new(HashMap::new()),
         ai_http,
+        mcp_config: Mutex::new(mcp_config.clone()),
+        mcp_config_error: Mutex::new(mcp_config_error),
+        mcp_runtime: Arc::clone(&mcp_runtime),
         local_terminals: Mutex::new(HashMap::new()),
         remote_terminals: Mutex::new(HashMap::new()),
         transfer_handles: Mutex::new(HashMap::new()),
         transfer_cancellations: Mutex::new(HashMap::new()),
         local_sys_monitor: std::sync::Mutex::new(None),
     });
+
+    // 后台预连接已启用的 stdio MCP（不阻塞启动）
+    {
+        let runtime = Arc::clone(&mcp_runtime);
+        let store = mcp_config;
+        tauri::async_runtime::spawn(async move {
+            runtime.sync_enabled_servers(&store).await;
+        });
+    }
 
     tauri::Builder::default()
         .manage(state)
@@ -6055,6 +6210,11 @@ fn main() {
             get_ai_provider_config,
             save_ai_provider_config,
             sync_ai_provider_models,
+            get_mcp_config,
+            save_mcp_config,
+            reconnect_mcp_server,
+            list_mcp_tools,
+            call_mcp_tool,
             ai_chat,
             ai_chat_stream,
             stop_ai_chat,
@@ -6320,6 +6480,40 @@ mod tests {
             enabled,
             vec!["gpt-5.6-terra".to_string(), "o1-mini".to_string()]
         );
+    }
+
+    #[test]
+    fn validate_and_serialize_ai_reasoning_effort() {
+        assert_eq!(
+            validate_ai_reasoning_effort(" Medium ").expect("accept medium"),
+            "medium"
+        );
+        assert!(validate_ai_reasoning_effort("ultra").is_err());
+        assert_eq!(ai_request_reasoning_effort("none"), None);
+        assert_eq!(ai_request_reasoning_effort("high"), Some("high"));
+
+        let messages = [AiChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let with_effort = serde_json::to_value(OpenAiChatRequest {
+            model: "o3-mini",
+            messages: &messages,
+            reasoning_effort: Some("high"),
+        })
+        .expect("serialize with effort");
+        assert_eq!(
+            with_effort.get("reasoning_effort").and_then(Value::as_str),
+            Some("high")
+        );
+
+        let without_effort = serde_json::to_value(OpenAiChatRequest {
+            model: "gpt-4o-mini",
+            messages: &messages,
+            reasoning_effort: None,
+        })
+        .expect("serialize without effort");
+        assert!(without_effort.get("reasoning_effort").is_none());
     }
 
     #[test]
