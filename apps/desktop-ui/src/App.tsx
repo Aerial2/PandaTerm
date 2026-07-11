@@ -6957,7 +6957,7 @@ export function App() {
                 <div className="ai-settings-model-list-block">
                   <div className="ai-settings-row-copy">
                     <span>模型列表</span>
-                    <em>右侧胶囊控制聊天下拉可见；点击名称设为当前模型</em>
+                    <em>右侧开关控制聊天下拉可见；点击名称设为当前模型</em>
                   </div>
                   {(() => {
                     const catalog = resolveAiModelCatalog(aiConfigDraft);
@@ -6990,9 +6990,10 @@ export function App() {
                               </button>
                               <button
                                 type="button"
-                                className={`ai-settings-model-capsule${isEnabled ? ' on' : ''}`}
+                                role="switch"
+                                aria-checked={isEnabled}
+                                className={`ai-settings-switch${isEnabled ? ' on' : ''}`}
                                 disabled={disabled || (isEnabled && !canDisable)}
-                                aria-pressed={isEnabled}
                                 title={
                                   isEnabled
                                     ? (isCurrent ? '当前模型始终可见' : '从聊天列表移除')
@@ -7000,8 +7001,7 @@ export function App() {
                                 }
                                 onClick={() => toggleAiDraftEnabledModel(model)}
                               >
-                                {isEnabled ? <Check size={12} strokeWidth={2.6} aria-hidden /> : null}
-                                <span>{isEnabled ? '已选' : '可选'}</span>
+                                <i />
                               </button>
                             </div>
                           );

@@ -6309,7 +6309,7 @@ mod tests {
             .expect("default enable all");
         assert_eq!(all, models);
 
-        // 仅保留仍存在的已选项，并强制包含当前 model
+        // 仅保留仍存在的已选项，并强制包含当前 model（当前 model 前置）
         let enabled = normalize_enabled_ai_models(
             &models,
             &["o1-mini".to_string(), "gone".to_string()],
@@ -6318,7 +6318,7 @@ mod tests {
         .expect("normalize enabled");
         assert_eq!(
             enabled,
-            vec!["o1-mini".to_string(), "gpt-5.6-terra".to_string()]
+            vec!["gpt-5.6-terra".to_string(), "o1-mini".to_string()]
         );
     }
 
