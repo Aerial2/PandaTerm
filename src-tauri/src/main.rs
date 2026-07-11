@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -14,12 +15,15 @@ use panda_core::{TerminalEvent, TerminalEventKind};
 use panda_crypto::{protect_secret, unprotect_secret, ProtectedSecret, ProtectionMode, SecretError};
 use panda_session::{AuthType, ReconnectPolicy, Session, SessionCatalog};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use reqwest::{redirect::Policy, Client, Url};
 use russh::ChannelMsg;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 #[cfg(target_os = "windows")]
 #[link(name = "dwmapi")]
@@ -37,9 +41,21 @@ struct TransferCancellationEntry {
     registered: bool,
 }
 
+struct AiGenerationEntry {
+    signal: Arc<AtomicBool>,
+    notification: Arc<Notify>,
+}
+
 struct AppState {
     sessions: Mutex<SessionCatalog>,
+    session_store_error: Mutex<Option<String>>,
     credentials: Mutex<CredentialVaultState>,
+    ai_config: Mutex<AiProviderConfigStore>,
+    ai_config_error: Mutex<Option<String>>,
+    ai_conversations: Mutex<AiConversationStore>,
+    ai_conversation_error: Mutex<Option<String>>,
+    ai_generations: Mutex<HashMap<String, AiGenerationEntry>>,
+    ai_http: Client,
     local_terminals: Mutex<HashMap<Uuid, LocalTerminalSession>>,
     remote_terminals: Mutex<HashMap<Uuid, RemoteTerminalSession>>,
     /// Reused SSH handles for file transfer (keyed by interactive terminal id).
@@ -120,6 +136,180 @@ struct CredentialProtectionRequest {
     master_password: Option<String>,
 }
 
+const AI_CONFIG_VERSION: u8 = 1;
+const AI_API_KEY_PREFIX: &str = "credential:ai:openai-compatible:api-key";
+const DEFAULT_AI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_AI_MODEL: &str = "gpt-4o-mini";
+const MAX_AI_MESSAGES: usize = 100;
+const MAX_AI_MESSAGE_CHARS: usize = 32_000;
+const MAX_AI_TOTAL_CHARS: usize = 128_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiProviderConfigStore {
+    version: u8,
+    base_url: String,
+    model: String,
+    use_api_key: bool,
+    api_key_secret_id: Option<String>,
+}
+
+impl Default for AiProviderConfigStore {
+    fn default() -> Self {
+        Self {
+            version: AI_CONFIG_VERSION,
+            base_url: DEFAULT_AI_BASE_URL.to_string(),
+            model: DEFAULT_AI_MODEL.to_string(),
+            use_api_key: true,
+            api_key_secret_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AiProviderConfig {
+    base_url: String,
+    model: String,
+    use_api_key: bool,
+    api_key_configured: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SaveAiProviderConfigRequest {
+    base_url: String,
+    model: String,
+    use_api_key: bool,
+    api_key: Option<String>,
+}
+
+const AI_CONVERSATION_VERSION: u8 = 1;
+const AI_CHAT_STREAM_EVENT: &str = "ai-chat-stream";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiConversationStore {
+    version: u8,
+    conversations: Vec<AiConversation>,
+}
+
+impl Default for AiConversationStore {
+    fn default() -> Self {
+        Self {
+            version: AI_CONVERSATION_VERSION,
+            conversations: Vec::new(),
+        }
+    }
+}
+
+fn default_ai_conversation_mode() -> String {
+    "ask".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiConversation {
+    id: String,
+    title: String,
+    #[serde(default = "default_ai_conversation_mode")]
+    mode: String,
+    created_at: String,
+    updated_at: String,
+    messages: Vec<AiStoredMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiStoredMessage {
+    id: String,
+    role: String,
+    content: String,
+    contexts: Vec<AiStoredContext>,
+    created_at: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiStoredContext {
+    kind: String,
+    label: String,
+    source: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AiChatStreamRequest {
+    request_id: String,
+    messages: Vec<AiChatMessage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AiChatStreamEvent {
+    request_id: String,
+    kind: String,
+    delta: Option<String>,
+    model: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiChatStreamRequest<'a> {
+    model: &'a str,
+    messages: &'a [AiChatMessage],
+    stream: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChunk {
+    model: Option<String>,
+    choices: Vec<OpenAiStreamChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChoice {
+    delta: OpenAiStreamDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamDelta {
+    content: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AiChatRequest {
+    messages: Vec<AiChatMessage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AiChatResponse {
+    content: String,
+    model: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiChatRequest<'a> {
+    model: &'a str,
+    messages: &'a [AiChatMessage],
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChatResponse {
+    model: Option<String>,
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiResponseMessage {
+    content: Value,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct SaveSessionRequest {
     session: Session,
@@ -190,6 +380,22 @@ struct LocalTerminalProfile {
     banner: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct AiTerminalCommandRequest {
+    terminal_id: String,
+    is_remote: bool,
+    command: String,
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AiTerminalCommandResult {
+    output: String,
+    exit_code: Option<i32>,
+    truncated: bool,
+    timed_out: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalDirectoryEntry {
     name: String,
@@ -218,6 +424,10 @@ struct LocalFilePreview {
 const LOCAL_FILE_PREVIEW_LIMIT: u64 = 512 * 1024;
 const LOCAL_FILE_FULL_LIMIT: u64 = 50 * 1024 * 1024;
 const REMOTE_FILE_FULL_LIMIT: u64 = 50 * 1024 * 1024;
+const AI_TERMINAL_COMMAND_MAX_LENGTH: usize = 4_000;
+const AI_TERMINAL_OUTPUT_LIMIT: usize = 64 * 1024;
+const AI_TERMINAL_MIN_TIMEOUT_MS: u64 = 3_000;
+const AI_TERMINAL_MAX_TIMEOUT_MS: u64 = 30_000;
 const TERMINAL_OUTPUT_EVENT: &str = "terminal-output";
 
 const REMOTE_TERMINAL_READY_MARKER: &str = "__PANDATERM_REMOTE_READY__";
@@ -337,7 +547,65 @@ fn credential_vault_path() -> Result<PathBuf, String> {
     Ok(pandaterm_data_dir()?.join("credentials.json"))
 }
 
-fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
+fn ai_config_path() -> Result<PathBuf, String> {
+    Ok(pandaterm_data_dir()?.join("ai-provider.json"))
+}
+
+fn ai_conversations_path() -> Result<PathBuf, String> {
+    Ok(pandaterm_data_dir()?.join("ai-conversations.json"))
+}
+
+fn load_ai_conversations() -> Result<AiConversationStore, String> {
+    let path = ai_conversations_path()?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AiConversationStore::default());
+        }
+        Err(error) => return Err(format!("AI 会话记录读取失败：{error}")),
+    };
+    let store: AiConversationStore = serde_json::from_str(&content)
+        .map_err(|error| format!("AI 会话记录已损坏，已拒绝覆盖原文件：{error}"))?;
+    if store.version != AI_CONVERSATION_VERSION {
+        return Err(format!("不支持的 AI 会话记录版本：{}", store.version));
+    }
+    Ok(store)
+}
+
+fn save_ai_conversations(store: &AiConversationStore) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(store)
+        .map_err(|error| format!("AI 会话记录序列化失败：{error}"))?;
+    atomic_write_text(&ai_conversations_path()?, &content)
+        .map_err(|error| format!("AI 会话记录保存失败：{error}"))
+}
+
+fn load_ai_config() -> Result<AiProviderConfigStore, String> {
+    let path = ai_config_path()?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AiProviderConfigStore::default());
+        }
+        Err(error) => return Err(format!("AI 供应商配置读取失败：{error}")),
+    };
+    let config: AiProviderConfigStore = serde_json::from_str(&content)
+        .map_err(|error| format!("AI 供应商配置已损坏，已拒绝覆盖原文件：{error}"))?;
+    if config.version != AI_CONFIG_VERSION {
+        return Err(format!("不支持的 AI 供应商配置版本：{}", config.version));
+    }
+    validate_ai_base_url(&config.base_url)?;
+    validate_ai_model(&config.model)?;
+    Ok(config)
+}
+
+fn save_ai_config(config: &AiProviderConfigStore) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(config)
+        .map_err(|error| format!("AI 供应商配置序列化失败：{error}"))?;
+    atomic_write_text(&ai_config_path()?, &content)
+        .map_err(|error| format!("AI 供应商配置保存失败：{error}"))
+}
+
+fn atomic_write_bytes(path: &Path, content: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("无法定位文件目录：{}", path.display()))?;
@@ -354,7 +622,7 @@ fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
             .create_new(true)
             .open(&temporary)
             .map_err(|error| format!("临时文件创建失败：{error}"))?;
-        file.write_all(content.as_bytes())
+        file.write_all(content)
             .map_err(|error| format!("临时文件写入失败：{error}"))?;
         file.sync_all()
             .map_err(|error| format!("临时文件同步失败：{error}"))?;
@@ -366,6 +634,10 @@ fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
+    atomic_write_bytes(path, content.as_bytes())
 }
 
 #[cfg(windows)]
@@ -430,6 +702,9 @@ fn load_credential_vault() -> Result<CredentialVault, String> {
     if vault.version != CREDENTIAL_VAULT_VERSION {
         return Err(format!("不支持的凭据仓库版本：{}", vault.version));
     }
+    if vault.mode == ProtectionMode::MasterPassword && vault.verifier.is_none() {
+        return Err("凭据仓库已损坏：Master Password 校验数据缺失，已拒绝覆盖原文件".to_string());
+    }
     Ok(vault)
 }
 
@@ -445,6 +720,13 @@ fn save_credential_vault(vault: &CredentialVault) -> Result<(), String> {
 
 fn ensure_vault_available(state: &CredentialVaultState) -> Result<(), String> {
     match &state.load_error {
+        Some(error) => Err(error.clone()),
+        None => Ok(()),
+    }
+}
+
+async fn ensure_session_store_available(state: &AppState) -> Result<(), String> {
+    match &*state.session_store_error.lock().await {
         Some(error) => Err(error.clone()),
         None => Ok(()),
     }
@@ -589,16 +871,16 @@ fn verify_or_trust_host_key(host_port: &str, key: &russh::keys::PublicKey) -> Re
     }
 }
 
-fn load_persistent_sessions() -> Vec<Session> {
-    let Ok(path) = session_store_path() else {
-        return Vec::new();
+fn load_persistent_sessions() -> Result<Vec<Session>, String> {
+    let path = session_store_path()?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("连接配置读取失败：{error}")),
     };
 
-    let Ok(content) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-
-    serde_json::from_str::<Vec<Session>>(&content).unwrap_or_default()
+    serde_json::from_str::<Vec<Session>>(&content)
+        .map_err(|error| format!("连接配置已损坏，已进入只读保护状态：{error}"))
 }
 
 fn save_persistent_sessions(sessions: &[Session]) -> Result<(), String> {
@@ -620,8 +902,8 @@ fn same_session_identity(left: &Session, right: &Session) -> bool {
         && left.username.eq_ignore_ascii_case(&right.username)
 }
 
-fn load_initial_sessions() -> Vec<Session> {
-    let mut sessions = load_persistent_sessions();
+fn load_initial_sessions() -> Result<Vec<Session>, String> {
+    let mut sessions = load_persistent_sessions()?;
 
     for xshell_session in load_xshell_sessions() {
         if sessions
@@ -636,7 +918,7 @@ fn load_initial_sessions() -> Vec<Session> {
     // Preserve the persisted order so a user's custom drag-and-drop ordering
     // survives restarts. Newly imported Xshell sessions are already sorted by
     // name inside load_xshell_sessions and simply appended above.
-    sessions
+    Ok(sessions)
 }
 
 fn migrate_legacy_credentials(
@@ -677,8 +959,14 @@ fn migrate_legacy_credentials(
     Ok(changed)
 }
 
-fn load_secure_state() -> (Vec<Session>, CredentialVaultState) {
-    let mut sessions = load_initial_sessions();
+fn load_secure_state() -> (Vec<Session>, CredentialVaultState, Option<String>) {
+    let (mut sessions, session_store_error) = match load_initial_sessions() {
+        Ok(sessions) => (sessions, None),
+        Err(error) => {
+            eprintln!("[Session] {error}");
+            (Vec::new(), Some(error))
+        }
+    };
     let (vault, load_error) = match load_credential_vault() {
         Ok(vault) => (vault, None),
         Err(error) => {
@@ -692,7 +980,7 @@ fn load_secure_state() -> (Vec<Session>, CredentialVaultState) {
         load_error,
     };
 
-    if credentials.load_error.is_none() {
+    if credentials.load_error.is_none() && session_store_error.is_none() {
         match migrate_legacy_credentials(&mut sessions, &mut credentials) {
             Ok(true) => {
                 if let Err(error) = save_credential_vault(&credentials.vault)
@@ -706,7 +994,7 @@ fn load_secure_state() -> (Vec<Session>, CredentialVaultState) {
         }
     }
 
-    (sessions, credentials)
+    (sessions, credentials, session_store_error)
 }
 
 fn resolved_session(session: &Session, credentials: &CredentialVaultState) -> Result<Session, String> {
@@ -1559,25 +1847,39 @@ fn write_unique_local_file(
     file_name: &str,
     bytes: &[u8],
 ) -> Result<PathBuf, String> {
-    for index in 0..=10_000 {
-        let candidate = local_destination_candidate(directory, file_name, index)?;
-        match fs::OpenOptions::new()
+    local_destination_candidate(directory, file_name, 0)?;
+    let temporary = directory.join(format!(".pandaterm-download-{}.tmp", Uuid::new_v4()));
+    let prepare_result = (|| {
+        let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                if let Err(error) = file.write_all(bytes) {
-                    drop(file);
-                    let _ = fs::remove_file(&candidate);
-                    return Err(format!("写入本地文件失败：{error}"));
-                }
+            .open(&temporary)
+            .map_err(|error| format!("创建下载临时文件失败：{error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("写入下载临时文件失败：{error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("同步下载临时文件失败：{error}"))
+    })();
+    if let Err(error) = prepare_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    for index in 0..=10_000 {
+        let candidate = local_destination_candidate(directory, file_name, index)?;
+        match fs::hard_link(&temporary, &candidate) {
+            Ok(()) => {
+                let _ = fs::remove_file(&temporary);
                 return Ok(candidate);
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("创建本地文件失败：{error}")),
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(format!("提交下载文件失败：{error}"));
+            }
         }
     }
+    let _ = fs::remove_file(&temporary);
     Err("下载目录中同名文件过多".to_string())
 }
 
@@ -1840,11 +2142,18 @@ async fn read_remote_file_preview(
 
     let quoted = shell_quote(&path);
     let command = format!(
-        "printf 'SIZE:%s\\n' \"$(stat -c %s {quoted} 2>/dev/null || stat -f %z {quoted} 2>/dev/null || wc -c < {quoted} 2>/dev/null || echo 0)\"; \
+        "__size=$(stat -c %s {quoted} 2>/dev/null || stat -f %z {quoted} 2>/dev/null || wc -c < {quoted} 2>/dev/null) || exit $?; \
+         printf 'SIZE:%s\\n' \"$__size\"; \
          head -c {limit} {quoted} 2>/dev/null || dd if={quoted} bs={limit} count=1 2>/dev/null",
         limit = REMOTE_FILE_PREVIEW_LIMIT
     );
-    let output = exec_remote_command(&handle, &command).await?;
+    let (output, stderr, exit_code) = exec_remote_command_full(&handle, &command).await?;
+    if exit_code != Some(0) {
+        return Err(format!(
+            "远程文件读取失败（退出码 {exit_code:?}）：{}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
 
     let newline_pos = output
         .iter()
@@ -1884,13 +2193,19 @@ async fn read_remote_file_full(
 
     let quoted = shell_quote(&path);
     // Check size first to avoid pulling huge files through the SSH channel.
-    let size_output = exec_remote_command(
+    let (size_output, size_stderr, size_code) = exec_remote_command_full(
         &handle,
         &format!(
-            "stat -c %s {quoted} 2>/dev/null || stat -f %z {quoted} 2>/dev/null || wc -c < {quoted} 2>/dev/null || echo 0"
+            "stat -c %s {quoted} 2>/dev/null || stat -f %z {quoted} 2>/dev/null || wc -c < {quoted} 2>/dev/null"
         ),
     )
     .await?;
+    if size_code != Some(0) {
+        return Err(format!(
+            "远程文件大小读取失败（退出码 {size_code:?}）：{}",
+            String::from_utf8_lossy(&size_stderr).trim()
+        ));
+    }
     let size_str = String::from_utf8_lossy(&size_output);
     let size: u64 = size_str
         .split_whitespace()
@@ -1905,7 +2220,14 @@ async fn read_remote_file_full(
         ));
     }
 
-    let output = exec_remote_command(&handle, &format!("cat {quoted} 2>/dev/null")).await?;
+    let (output, stderr, exit_code) =
+        exec_remote_command_full(&handle, &format!("cat {quoted}")).await?;
+    if exit_code != Some(0) {
+        return Err(format!(
+            "远程文件读取失败（退出码 {exit_code:?}）：{}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
     let content = String::from_utf8(output)
         .map_err(|_| "暂不支持编辑二进制文件".to_string())?;
     let name = path.rsplit('/').next().unwrap_or(&path).to_string();
@@ -2256,10 +2578,217 @@ async fn stream_upload_file_atomic(
     Ok(())
 }
 
+fn bounded_ai_terminal_output(stdout: &[u8], stderr: &[u8]) -> (String, bool) {
+    let mut combined = Vec::with_capacity(stdout.len() + stderr.len() + 16);
+    combined.extend_from_slice(stdout);
+    if !stdout.is_empty() && !stderr.is_empty() && !stdout.ends_with(b"\n") {
+        combined.push(b'\n');
+    }
+    combined.extend_from_slice(stderr);
+    if combined.len() <= AI_TERMINAL_OUTPUT_LIMIT {
+        return (String::from_utf8_lossy(&combined).into_owned(), false);
+    }
+    let start = combined.len() - AI_TERMINAL_OUTPUT_LIMIT;
+    (
+        format!(
+            "[输出已截断，仅保留最后 {} 字节]\n{}",
+            AI_TERMINAL_OUTPUT_LIMIT,
+            String::from_utf8_lossy(&combined[start..])
+        ),
+        true,
+    )
+}
+
+async fn run_ai_local_terminal_command(
+    command: &str,
+    timeout_duration: Duration,
+) -> Result<AiTerminalCommandResult, String> {
+    let mut process = if cfg!(target_os = "windows") {
+        let mut process = Command::new("powershell.exe");
+        process
+            .arg("-NoLogo")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(command);
+        process
+    } else {
+        let mut process = Command::new("/bin/sh");
+        process.arg("-lc").arg(command);
+        process
+    };
+    process
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = match tokio::time::timeout(timeout_duration, process.output()).await {
+        Ok(result) => result.map_err(|error| format!("启动本地命令失败：{error}"))?,
+        Err(_) => {
+            return Ok(AiTerminalCommandResult {
+                output: "命令执行超时，进程已终止".to_string(),
+                exit_code: None,
+                truncated: false,
+                timed_out: true,
+            });
+        }
+    };
+    let (output_text, truncated) = bounded_ai_terminal_output(&output.stdout, &output.stderr);
+    Ok(AiTerminalCommandResult {
+        output: output_text,
+        exit_code: output.status.code(),
+        truncated,
+        timed_out: false,
+    })
+}
+
+#[tauri::command]
+async fn run_ai_terminal_command(
+    request: AiTerminalCommandRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<AiTerminalCommandResult, String> {
+    let command = request.command.trim();
+    if command.is_empty() || command.len() > AI_TERMINAL_COMMAND_MAX_LENGTH {
+        return Err(format!(
+            "命令长度必须为 1-{} 字节",
+            AI_TERMINAL_COMMAND_MAX_LENGTH
+        ));
+    }
+    if !(AI_TERMINAL_MIN_TIMEOUT_MS..=AI_TERMINAL_MAX_TIMEOUT_MS)
+        .contains(&request.timeout_ms)
+    {
+        return Err(format!(
+            "命令超时必须为 {}-{} 毫秒",
+            AI_TERMINAL_MIN_TIMEOUT_MS, AI_TERMINAL_MAX_TIMEOUT_MS
+        ));
+    }
+    let terminal_id = Uuid::parse_str(&request.terminal_id)
+        .map_err(|error| format!("终端标识无效：{error}"))?;
+    let timeout_duration = Duration::from_millis(request.timeout_ms);
+
+    if !request.is_remote {
+        let terminals = state.local_terminals.lock().await;
+        if !terminals.contains_key(&terminal_id) {
+            return Err("本地终端已经关闭".to_string());
+        }
+        drop(terminals);
+        return run_ai_local_terminal_command(command, timeout_duration).await;
+    }
+
+    let handle = interactive_remote_handle(&state, terminal_id).await?;
+    let (stdout, stderr, exit_code) = match tokio::time::timeout(
+        timeout_duration,
+        exec_remote_command_full(&handle, command),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Ok(AiTerminalCommandResult {
+                output: "命令执行超时，SSH exec 通道已关闭".to_string(),
+                exit_code: None,
+                truncated: false,
+                timed_out: true,
+            });
+        }
+    };
+    let (output, truncated) = bounded_ai_terminal_output(&stdout, &stderr);
+    Ok(AiTerminalCommandResult {
+        output,
+        exit_code,
+        truncated,
+        timed_out: false,
+    })
+}
+
+#[tauri::command]
+async fn write_local_file_checked(
+    path: String,
+    expected_content: String,
+    content: String,
+) -> Result<(), String> {
+    if content.len() as u64 > LOCAL_FILE_FULL_LIMIT {
+        return Err(format!(
+            "修改后的文件过大（{} 字节），最多允许 {} 字节",
+            content.len(),
+            LOCAL_FILE_FULL_LIMIT
+        ));
+    }
+    let canonical_file = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|error| format!("本地文件校验失败：{error}"))?;
+    let metadata = fs::metadata(&canonical_file)
+        .map_err(|error| format!("本地文件校验失败：{error}"))?;
+    if !metadata.is_file() {
+        return Err("只能修改文件".to_string());
+    }
+    if metadata.len() > LOCAL_FILE_FULL_LIMIT {
+        return Err(format!(
+            "原文件过大（{} 字节），最多允许 {} 字节",
+            metadata.len(),
+            LOCAL_FILE_FULL_LIMIT
+        ));
+    }
+    let current = fs::read_to_string(&canonical_file)
+        .map_err(|error| format!("本地文件校验失败：{error}"))?;
+    if current != expected_content {
+        return Err("AI_EDIT_STALE:文件内容已变化，请重新读取并生成修改提案".to_string());
+    }
+    atomic_write_bytes(&canonical_file, content.as_bytes())
+        .map_err(|error| format!("本地文件保存失败：{error}"))
+}
+
 #[tauri::command]
 async fn write_local_file(path: String, content: String) -> Result<(), String> {
-    let file_path = PathBuf::from(&path);
-    fs::write(&file_path, content.as_bytes()).map_err(|error| error.to_string())
+    atomic_write_bytes(Path::new(&path), content.as_bytes())
+        .map_err(|error| format!("本地文件保存失败：{error}"))
+}
+
+#[tauri::command]
+async fn write_remote_file_checked(
+    terminal_id: Uuid,
+    path: String,
+    expected_content: String,
+    content: String,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    if expected_content.len() as u64 > REMOTE_FILE_FULL_LIMIT
+        || content.len() as u64 > REMOTE_FILE_FULL_LIMIT
+    {
+        return Err(format!(
+            "AI 修改文件最多允许 {} 字节",
+            REMOTE_FILE_FULL_LIMIT
+        ));
+    }
+
+    let handle = connect_russh_transfer_session(&app, terminal_id, &state).await?;
+    let quoted = shell_quote(&path);
+    let (current, stderr, exit_code) =
+        exec_remote_command_full(&handle, &format!("cat {quoted}")).await?;
+    if exit_code != Some(0) {
+        return Err(format!(
+            "远程文件校验失败（退出码 {exit_code:?}）：{}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
+    if current != expected_content.as_bytes() {
+        return Err("AI_EDIT_STALE:文件内容已变化，请重新读取并生成修改提案".to_string());
+    }
+
+    let transfer_id = Uuid::new_v4().to_string();
+    let attempt_started = AtomicBool::new(false);
+    write_remote_file_atomic(
+        &handle,
+        &path,
+        content.as_bytes(),
+        &app,
+        &transfer_id,
+        None,
+        &attempt_started,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2455,8 +2984,8 @@ async fn upload_local_file(
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(local_file_name);
 
-    if file_name.contains('/') || file_name.contains('\\') {
-        return Err("远程文件名不能包含路径分隔符".to_string());
+    if file_name == "." || file_name == ".." || file_name.contains('/') || file_name.contains('\\') {
+        return Err("远程文件名无效，不能使用路径分隔符、. 或 ..".to_string());
     }
 
     // Ensure the local path exists and is a regular file before streaming.
@@ -2598,7 +3127,7 @@ async fn upload_directory(
     let mut dirs_created: u64 = 1; // root dir already created
     let mut failed_items: Vec<String> = Vec::new();
     let mut total_bytes: u64 = 0;
-    let mut file_jobs: Vec<(PathBuf, String)> = Vec::new();
+    let mut file_jobs: Vec<(PathBuf, String, u64)> = Vec::new();
 
     // Walk the local directory tree: create remote directories and collect the
     // file jobs. The actual uploads run concurrently afterwards so the per-file
@@ -2635,7 +3164,7 @@ async fn upload_directory(
                     .await
                     .map_err(|e| format!("读取文件信息失败：{e}"))?;
                 total_bytes += metadata.len();
-                file_jobs.push((entry_path, remote_entry_path));
+                file_jobs.push((entry_path, remote_entry_path, metadata.len()));
             }
         }
     }
@@ -2645,7 +3174,9 @@ async fn upload_directory(
     let semaphore = std::sync::Arc::new(Semaphore::new(concurrency));
     let mut tasks = Vec::with_capacity(file_jobs.len());
 
-    for (local_path, remote_entry_path) in file_jobs {
+    emit_upload_progress(&app, &transfer_id, 0, total_bytes as usize);
+
+    for (local_path, remote_entry_path, file_size) in file_jobs {
         if cancellation.load(Ordering::SeqCst) {
             return Err("上传已取消".to_string());
         }
@@ -2672,14 +3203,22 @@ async fn upload_directory(
             )
             .await
         });
-        tasks.push(task);
+        tasks.push((task, file_size));
     }
 
     let mut files_uploaded: u64 = 0;
-    for task in tasks {
+    let mut uploaded_bytes: u64 = 0;
+    for (task, file_size) in tasks {
         match task.await {
             Ok(Ok(())) => {
                 files_uploaded += 1;
+                uploaded_bytes += file_size;
+                emit_upload_progress(
+                    &app,
+                    &transfer_id,
+                    uploaded_bytes as usize,
+                    total_bytes as usize,
+                );
             }
             Ok(Err(e)) => {
                 failed_items.push(e);
@@ -3050,12 +3589,30 @@ async fn read_file_as_data_url(
                 .ok_or_else(|| format!("terminal is not connected: {tid}"))?
         };
         let quoted = shell_quote(&path);
-        let size_out = exec_remote_command(&handle, &format!("stat -c %s {quoted} 2>/dev/null || echo 0")).await?;
+        let (size_out, size_stderr, size_code) = exec_remote_command_full(
+            &handle,
+            &format!("stat -c %s {quoted} 2>/dev/null || stat -f %z {quoted} 2>/dev/null || wc -c < {quoted} 2>/dev/null"),
+        )
+        .await?;
+        if size_code != Some(0) {
+            return Err(format!(
+                "远程媒体大小读取失败（退出码 {size_code:?}）：{}",
+                String::from_utf8_lossy(&size_stderr).trim()
+            ));
+        }
         let size: u64 = String::from_utf8_lossy(&size_out).trim().parse().unwrap_or(0);
         if size > DATA_URL_LIMIT {
             return Err(format!("文件过大（{} 字节），媒体查看上限 {} 字节", size, DATA_URL_LIMIT));
         }
-        exec_remote_command(&handle, &format!("cat {quoted} 2>/dev/null")).await?
+        let (bytes, stderr, exit_code) =
+            exec_remote_command_full(&handle, &format!("cat {quoted}")).await?;
+        if exit_code != Some(0) {
+            return Err(format!(
+                "远程媒体读取失败（退出码 {exit_code:?}）：{}",
+                String::from_utf8_lossy(&stderr).trim()
+            ));
+        }
+        bytes
     } else {
         let p = PathBuf::from(&path);
         let canonical = p.canonicalize().map_err(|e| format!("无法访问文件 {path}: {e}"))?;
@@ -4095,6 +4652,647 @@ fn remove_session_credentials(vault: &mut CredentialVault, session: &Session) {
     }
 }
 
+fn validate_ai_model(model: &str) -> Result<String, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("模型名称不能为空".to_string());
+    }
+    if model.len() > 200 || model.chars().any(char::is_control) {
+        return Err("模型名称无效".to_string());
+    }
+    Ok(model.to_string())
+}
+
+fn validate_ai_base_url(base_url: &str) -> Result<Url, String> {
+    let raw = base_url.trim();
+    if raw.is_empty() {
+        return Err("Base URL 不能为空".to_string());
+    }
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    let mut url = Url::parse(&candidate).map_err(|error| format!("Base URL 无效：{error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Base URL 只支持 HTTP 或 HTTPS".to_string());
+    }
+    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err("Base URL 必须包含有效域名，且不能内嵌账号密码".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("Base URL 不能包含查询参数或片段".to_string());
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn ai_chat_completions_url(base_url: &str) -> Result<Url, String> {
+    let mut url = validate_ai_base_url(base_url)?;
+    let path = url.path().trim_end_matches('/');
+    let endpoint = if path.ends_with("/chat/completions") {
+        path.to_string()
+    } else if path.is_empty() {
+        "/chat/completions".to_string()
+    } else {
+        format!("{path}/chat/completions")
+    };
+    url.set_path(&endpoint);
+    Ok(url)
+}
+
+fn ai_config_snapshot(config: &AiProviderConfigStore, error: Option<String>) -> AiProviderConfig {
+    AiProviderConfig {
+        base_url: config.base_url.clone(),
+        model: config.model.clone(),
+        use_api_key: config.use_api_key,
+        api_key_configured: config.api_key_secret_id.is_some(),
+        error,
+    }
+}
+
+fn validate_ai_messages(messages: &[AiChatMessage]) -> Result<(), String> {
+    if messages.is_empty() {
+        return Err("对话消息不能为空".to_string());
+    }
+    if messages.len() > MAX_AI_MESSAGES {
+        return Err(format!("对话消息不能超过 {MAX_AI_MESSAGES} 条"));
+    }
+    let mut total_chars = 0usize;
+    for message in messages {
+        if !matches!(message.role.as_str(), "system" | "user" | "assistant") {
+            return Err("对话消息角色无效".to_string());
+        }
+        let chars = message.content.chars().count();
+        if chars == 0 || chars > MAX_AI_MESSAGE_CHARS {
+            return Err(format!("单条消息必须为 1 到 {MAX_AI_MESSAGE_CHARS} 个字符"));
+        }
+        total_chars = total_chars.saturating_add(chars);
+    }
+    if total_chars > MAX_AI_TOTAL_CHARS {
+        return Err(format!("对话内容不能超过 {MAX_AI_TOTAL_CHARS} 个字符"));
+    }
+    Ok(())
+}
+
+fn extract_ai_content(content: &Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return (!text.trim().is_empty()).then(|| text.to_string());
+    }
+    let parts = content.as_array()?;
+    let text = parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn extract_provider_error(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("message").and_then(Value::as_str))
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| body.chars().take(500).collect::<String>())
+}
+
+#[tauri::command]
+async fn get_ai_provider_config(
+    state: State<'_, Arc<AppState>>,
+) -> Result<AiProviderConfig, String> {
+    let config = state.ai_config.lock().await.clone();
+    let error = state.ai_config_error.lock().await.clone();
+    Ok(ai_config_snapshot(&config, error))
+}
+
+#[tauri::command]
+async fn save_ai_provider_config(
+    request: SaveAiProviderConfigRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<AiProviderConfig, String> {
+    if let Some(error) = state.ai_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let base_url = validate_ai_base_url(&request.base_url)?.to_string();
+    let model = validate_ai_model(&request.model)?;
+    let supplied_key = request.api_key.filter(|key| !key.trim().is_empty());
+    let current = state.ai_config.lock().await.clone();
+    if request.use_api_key && supplied_key.is_none() && current.api_key_secret_id.is_none() {
+        return Err("启用 API Key 时必须输入密钥".to_string());
+    }
+
+    let mut credentials = state.credentials.lock().await;
+    let next_secret_id = if let Some(key) = supplied_key.as_deref() {
+        let id = format!("{AI_API_KEY_PREFIX}:{}", Uuid::new_v4());
+        Some(store_credential(&mut credentials, id, key.trim())?)
+    } else if request.use_api_key {
+        current.api_key_secret_id.clone()
+    } else {
+        None
+    };
+    let next = AiProviderConfigStore {
+        version: AI_CONFIG_VERSION,
+        base_url,
+        model,
+        use_api_key: request.use_api_key,
+        api_key_secret_id: next_secret_id,
+    };
+
+    if next.api_key_secret_id != current.api_key_secret_id {
+        save_credential_vault(&credentials.vault)?;
+    }
+    save_ai_config(&next)?;
+    if let Some(old_id) = current
+        .api_key_secret_id
+        .filter(|old_id| Some(old_id) != next.api_key_secret_id.as_ref())
+    {
+        credentials.vault.entries.remove(&old_id);
+        if let Err(error) = save_credential_vault(&credentials.vault) {
+            eprintln!("[Credential] obsolete AI API key cleanup deferred: {error}");
+        }
+    }
+    *state.ai_config.lock().await = next.clone();
+    Ok(ai_config_snapshot(&next, None))
+}
+
+#[tauri::command]
+async fn ai_chat(
+    request: AiChatRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<AiChatResponse, String> {
+    validate_ai_messages(&request.messages)?;
+    if let Some(error) = state.ai_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let config = state.ai_config.lock().await.clone();
+    let endpoint = ai_chat_completions_url(&config.base_url)?;
+    let api_key = if config.use_api_key {
+        let secret_id = config
+            .api_key_secret_id
+            .as_deref()
+            .ok_or_else(|| "尚未配置 AI API Key".to_string())?;
+        let credentials = state.credentials.lock().await;
+        Some(Zeroizing::new(resolve_credential(&credentials, secret_id)?))
+    } else {
+        None
+    };
+
+    let payload = OpenAiChatRequest {
+        model: &config.model,
+        messages: &request.messages,
+    };
+    let mut builder = state.ai_http.post(endpoint).json(&payload);
+    if let Some(key) = api_key.as_deref() {
+        builder = builder.bearer_auth(key);
+    }
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| format!("AI 供应商请求失败：{error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("AI 供应商响应读取失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "AI 供应商返回 HTTP {}：{}",
+            status.as_u16(),
+            extract_provider_error(&body)
+        ));
+    }
+    let response: OpenAiChatResponse = serde_json::from_str(&body)
+        .map_err(|error| format!("AI 供应商响应格式不兼容：{error}"))?;
+    let content = response
+        .choices
+        .first()
+        .and_then(|choice| extract_ai_content(&choice.message.content))
+        .ok_or_else(|| "AI 供应商响应中没有可用文本".to_string())?;
+    Ok(AiChatResponse {
+        content,
+        model: response.model.unwrap_or(config.model),
+    })
+}
+
+fn validate_ai_conversation(conversation: &AiConversation) -> Result<(), String> {
+    Uuid::parse_str(&conversation.id).map_err(|_| "AI 会话 ID 无效".to_string())?;
+    let title = conversation.title.trim();
+    if title.is_empty() || title.chars().count() > 120 {
+        return Err("AI 会话标题必须为 1 到 120 个字符".to_string());
+    }
+    if !matches!(conversation.mode.as_str(), "ask" | "agent") {
+        return Err("AI 会话模式无效".to_string());
+    }
+    if conversation.messages.len() > 500 {
+        return Err("单个 AI 会话最多保存 500 条消息".to_string());
+    }
+    let mut total_chars = 0usize;
+    for message in &conversation.messages {
+        if !matches!(message.role.as_str(), "user" | "assistant") {
+            return Err("AI 会话消息角色无效".to_string());
+        }
+        if !matches!(message.status.as_str(), "complete" | "cancelled" | "error") {
+            return Err("AI 会话消息状态无效".to_string());
+        }
+        if message.id.is_empty() || message.id.len() > 100 {
+            return Err("AI 会话消息 ID 无效".to_string());
+        }
+        if message.contexts.len() > 20
+            || message.contexts.iter().any(|context| {
+                !matches!(context.kind.as_str(), "terminal" | "selection" | "file")
+                    || context.label.chars().count() > 260
+                    || context
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.chars().count() > 1_024)
+            })
+        {
+            return Err("AI 会话上下文引用过多或无效".to_string());
+        }
+        let chars = message.content.chars().count();
+        if chars > 64_000 {
+            return Err("单条 AI 会话消息不能超过 64000 个字符".to_string());
+        }
+        total_chars = total_chars.saturating_add(chars);
+    }
+    if total_chars > 2_000_000 {
+        return Err("单个 AI 会话内容不能超过 2000000 个字符".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_ai_conversations(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<AiConversation>, String> {
+    if let Some(error) = state.ai_conversation_error.lock().await.clone() {
+        return Err(error);
+    }
+    Ok(state.ai_conversations.lock().await.conversations.clone())
+}
+
+#[tauri::command]
+async fn save_ai_conversation(
+    conversation: AiConversation,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<AiConversation>, String> {
+    if let Some(error) = state.ai_conversation_error.lock().await.clone() {
+        return Err(error);
+    }
+    validate_ai_conversation(&conversation)?;
+    let mut store = state.ai_conversations.lock().await;
+    if let Some(existing) = store
+        .conversations
+        .iter_mut()
+        .find(|item| item.id == conversation.id)
+    {
+        *existing = conversation;
+    } else {
+        if store.conversations.len() >= 100 {
+            return Err("最多保存 100 个 AI 会话，请先删除旧会话".to_string());
+        }
+        store.conversations.insert(0, conversation);
+    }
+    save_ai_conversations(&store)?;
+    Ok(store.conversations.clone())
+}
+
+#[tauri::command]
+async fn delete_ai_conversation(
+    conversation_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<AiConversation>, String> {
+    if let Some(error) = state.ai_conversation_error.lock().await.clone() {
+        return Err(error);
+    }
+    Uuid::parse_str(&conversation_id).map_err(|_| "AI 会话 ID 无效".to_string())?;
+    let mut store = state.ai_conversations.lock().await;
+    store.conversations.retain(|item| item.id != conversation_id);
+    save_ai_conversations(&store)?;
+    Ok(store.conversations.clone())
+}
+
+fn emit_ai_stream_event(
+    app: &AppHandle,
+    request_id: &str,
+    kind: &str,
+    delta: Option<String>,
+    model: Option<String>,
+    message: Option<String>,
+) {
+    let _ = app.emit(
+        AI_CHAT_STREAM_EVENT,
+        AiChatStreamEvent {
+            request_id: request_id.to_string(),
+            kind: kind.to_string(),
+            delta,
+            model,
+            message,
+        },
+    );
+}
+
+async fn register_ai_generation(
+    state: &AppState,
+    request_id: &str,
+) -> Result<Option<AiGenerationEntry>, String> {
+    Uuid::parse_str(request_id).map_err(|_| "AI 请求 ID 无效".to_string())?;
+    let mut generations = state.ai_generations.lock().await;
+    if let Some(existing) = generations.get(request_id) {
+        if existing.signal.load(Ordering::SeqCst) {
+            generations.remove(request_id);
+            return Ok(None);
+        }
+        return Err("同一 AI 请求正在处理中".to_string());
+    }
+    let entry = AiGenerationEntry {
+        signal: Arc::new(AtomicBool::new(false)),
+        notification: Arc::new(Notify::new()),
+    };
+    generations.insert(
+        request_id.to_string(),
+        AiGenerationEntry {
+            signal: Arc::clone(&entry.signal),
+            notification: Arc::clone(&entry.notification),
+        },
+    );
+    Ok(Some(entry))
+}
+
+async fn finish_ai_generation(state: &AppState, request_id: &str, signal: &Arc<AtomicBool>) {
+    let mut generations = state.ai_generations.lock().await;
+    if generations
+        .get(request_id)
+        .is_some_and(|entry| Arc::ptr_eq(&entry.signal, signal))
+    {
+        generations.remove(request_id);
+    }
+}
+
+fn take_sse_events(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut events = Vec::new();
+    loop {
+        let separator = buffer
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .map(|index| (index, 2))
+            .or_else(|| {
+                buffer
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| (index, 4))
+            });
+        let Some((index, length)) = separator else {
+            break;
+        };
+        let event = buffer.drain(..index).collect::<Vec<_>>();
+        buffer.drain(..length);
+        events.push(event);
+    }
+    events
+}
+
+fn sse_data(event: &[u8]) -> Result<Option<String>, String> {
+    let text = std::str::from_utf8(event).map_err(|_| "AI 流式响应不是有效 UTF-8".to_string())?;
+    let data = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok((!data.is_empty()).then_some(data))
+}
+
+#[tauri::command]
+async fn stop_ai_chat(
+    request_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    Uuid::parse_str(&request_id).map_err(|_| "AI 请求 ID 无效".to_string())?;
+    let mut generations = state.ai_generations.lock().await;
+    let entry = generations
+        .entry(request_id)
+        .or_insert_with(|| AiGenerationEntry {
+            signal: Arc::new(AtomicBool::new(true)),
+            notification: Arc::new(Notify::new()),
+        });
+    entry.signal.store(true, Ordering::SeqCst);
+    entry.notification.notify_waiters();
+    Ok(())
+}
+
+#[tauri::command]
+async fn ai_chat_stream(
+    request: AiChatStreamRequest,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    validate_ai_messages(&request.messages)?;
+    if let Some(error) = state.ai_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let config = state.ai_config.lock().await.clone();
+    let endpoint = ai_chat_completions_url(&config.base_url)?;
+    let api_key = if config.use_api_key {
+        let secret_id = config
+            .api_key_secret_id
+            .as_deref()
+            .ok_or_else(|| "尚未配置 AI API Key".to_string())?;
+        let credentials = state.credentials.lock().await;
+        Some(Zeroizing::new(resolve_credential(&credentials, secret_id)?))
+    } else {
+        None
+    };
+    let Some(generation) = register_ai_generation(&state, &request.request_id).await? else {
+        emit_ai_stream_event(&app, &request.request_id, "cancelled", None, None, None);
+        return Ok(());
+    };
+    let payload = OpenAiChatStreamRequest {
+        model: &config.model,
+        messages: &request.messages,
+        stream: true,
+    };
+    let mut builder = state.ai_http.post(endpoint).json(&payload);
+    if let Some(key) = api_key.as_deref() {
+        builder = builder.bearer_auth(key);
+    }
+    emit_ai_stream_event(
+        &app,
+        &request.request_id,
+        "started",
+        None,
+        Some(config.model.clone()),
+        None,
+    );
+    let send_result = tokio::select! {
+        result = builder.send() => Some(result),
+        _ = generation.notification.notified() => None,
+    };
+    let Some(send_result) = send_result else {
+        emit_ai_stream_event(&app, &request.request_id, "cancelled", None, None, None);
+        finish_ai_generation(&state, &request.request_id, &generation.signal).await;
+        return Ok(());
+    };
+    let mut response = match send_result {
+        Ok(response) => response,
+        Err(error) => {
+            emit_ai_stream_event(
+                &app,
+                &request.request_id,
+                "error",
+                None,
+                None,
+                Some(format!("AI 供应商请求失败：{error}")),
+            );
+            finish_ai_generation(&state, &request.request_id, &generation.signal).await;
+            return Ok(());
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        emit_ai_stream_event(
+            &app,
+            &request.request_id,
+            "error",
+            None,
+            None,
+            Some(format!(
+                "AI 供应商返回 HTTP {}：{}",
+                status.as_u16(),
+                extract_provider_error(&body)
+            )),
+        );
+        finish_ai_generation(&state, &request.request_id, &generation.signal).await;
+        return Ok(());
+    }
+
+    let mut buffer = Vec::new();
+    let mut response_model = config.model;
+    let mut completed = false;
+    let mut cancelled = false;
+    let mut stream_error = None;
+    'stream: loop {
+        let chunk = tokio::select! {
+            result = response.chunk() => Some(result),
+            _ = generation.notification.notified() => None,
+        };
+        let Some(chunk) = chunk else {
+            cancelled = true;
+            break;
+        };
+        match chunk {
+            Ok(Some(bytes)) => buffer.extend_from_slice(&bytes),
+            Ok(None) => {
+                if !completed {
+                    emit_ai_stream_event(
+                        &app,
+                        &request.request_id,
+                        "completed",
+                        None,
+                        Some(response_model.clone()),
+                        None,
+                    );
+                }
+                break;
+            }
+            Err(error) => {
+                emit_ai_stream_event(
+                    &app,
+                    &request.request_id,
+                    "error",
+                    None,
+                    None,
+                    Some(format!("AI 流式响应读取失败：{error}")),
+                );
+                break;
+            }
+        }
+        for event in take_sse_events(&mut buffer) {
+            let data = match sse_data(&event) {
+                Ok(Some(data)) => data,
+                Ok(None) => continue,
+                Err(error) => {
+                    stream_error = Some(error);
+                    break 'stream;
+                }
+            };
+            if data == "[DONE]" {
+                emit_ai_stream_event(
+                    &app,
+                    &request.request_id,
+                    "completed",
+                    None,
+                    Some(response_model.clone()),
+                    None,
+                );
+                completed = true;
+                break;
+            }
+            let chunk: OpenAiStreamChunk = match serde_json::from_str(&data) {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    stream_error = Some(format!("AI 流式响应格式不兼容：{error}"));
+                    break 'stream;
+                }
+            };
+            if let Some(model) = chunk.model {
+                response_model = model;
+            }
+            for choice in chunk.choices {
+                if let Some(content) = choice.delta.content.as_ref().and_then(extract_ai_content) {
+                    emit_ai_stream_event(
+                        &app,
+                        &request.request_id,
+                        "delta",
+                        Some(content),
+                        None,
+                        None,
+                    );
+                }
+                if choice.finish_reason.is_some() && !completed {
+                    emit_ai_stream_event(
+                        &app,
+                        &request.request_id,
+                        "completed",
+                        None,
+                        Some(response_model.clone()),
+                        None,
+                    );
+                    completed = true;
+                }
+            }
+        }
+        if generation.signal.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
+        if completed {
+            break;
+        }
+    }
+    if let Some(error) = stream_error {
+        emit_ai_stream_event(
+            &app,
+            &request.request_id,
+            "error",
+            None,
+            None,
+            Some(error),
+        );
+    } else if cancelled {
+        emit_ai_stream_event(&app, &request.request_id, "cancelled", None, None, None);
+    }
+    finish_ai_generation(&state, &request.request_id, &generation.signal).await;
+    Ok(())
+}
+
 #[tauri::command]
 async fn credential_status(
     state: State<'_, Arc<AppState>>,
@@ -4108,6 +5306,12 @@ async fn unlock_credentials(
     master_password: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CredentialStatus, String> {
+    let session_store_available = state.session_store_error.lock().await.is_none();
+    let mut sessions = if session_store_available {
+        Some(state.sessions.lock().await)
+    } else {
+        None
+    };
     let mut credentials = state.credentials.lock().await;
     ensure_vault_available(&credentials)?;
     if credentials.vault.mode != ProtectionMode::MasterPassword {
@@ -4131,6 +5335,16 @@ async fn unlock_credentials(
         return Err("Master Password 不正确".to_string());
     }
     credentials.master_password = Some(master_password);
+
+    if let Some(sessions) = sessions.as_mut() {
+        let mut migrated_sessions = sessions.all().to_vec();
+        if migrate_legacy_credentials(&mut migrated_sessions, &mut credentials)? {
+            save_credential_vault(&credentials.vault)?;
+            save_persistent_sessions(&migrated_sessions)?;
+            **sessions = SessionCatalog::new(migrated_sessions);
+        }
+    }
+
     Ok(credential_status_snapshot(&credentials))
 }
 
@@ -4204,6 +5418,7 @@ async fn set_credential_protection(
 
 #[tauri::command]
 async fn list_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<Session>, String> {
+    ensure_session_store_available(&state).await?;
     let sessions = state.sessions.lock().await;
     Ok(sessions.all().to_vec())
 }
@@ -4213,6 +5428,7 @@ async fn save_session(
     request: SaveSessionRequest,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<Session>, String> {
+    ensure_session_store_available(&state).await?;
     let mut sessions = state.sessions.lock().await;
     let existing = sessions
         .all()
@@ -4256,6 +5472,7 @@ async fn delete_session(
     session_id: Uuid,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<Session>, String> {
+    ensure_session_store_available(&state).await?;
     let mut sessions = state.sessions.lock().await;
     let removed = sessions
         .all()
@@ -4263,15 +5480,20 @@ async fn delete_session(
         .find(|session| session.id == session_id)
         .cloned()
         .ok_or_else(|| format!("session not found: {session_id}"))?;
+    let credential_ids = session_credential_ids(&removed);
     let mut credentials = state.credentials.lock().await;
-    ensure_vault_available(&credentials)?;
+    if !credential_ids.is_empty() {
+        ensure_vault_available(&credentials)?;
+    }
     sessions
         .remove(session_id)
         .map_err(|error| error.to_string())?;
     save_persistent_sessions(sessions.all())?;
-    remove_session_credentials(&mut credentials.vault, &removed);
-    if let Err(error) = save_credential_vault(&credentials.vault) {
-        eprintln!("[Credential] deleted session credential cleanup deferred: {error}");
+    if !credential_ids.is_empty() {
+        remove_session_credentials(&mut credentials.vault, &removed);
+        if let Err(error) = save_credential_vault(&credentials.vault) {
+            eprintln!("[Credential] deleted session credential cleanup deferred: {error}");
+        }
     }
     Ok(sessions.all().to_vec())
 }
@@ -4281,6 +5503,7 @@ async fn reorder_sessions(
     ordered_ids: Vec<Uuid>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<Session>, String> {
+    ensure_session_store_available(&state).await?;
     let mut sessions = state.sessions.lock().await;
     sessions
         .reorder(&ordered_ids)
@@ -4459,10 +5682,30 @@ fn apply_window_dark_mode(window_label: String, app: tauri::AppHandle) -> Result
 }
 
 fn main() {
-    let (sessions, credentials) = load_secure_state();
+    let (sessions, credentials, session_store_error) = load_secure_state();
+    let (ai_config, ai_config_error) = match load_ai_config() {
+        Ok(config) => (config, None),
+        Err(error) => (AiProviderConfigStore::default(), Some(error)),
+    };
+    let (ai_conversations, ai_conversation_error) = match load_ai_conversations() {
+        Ok(store) => (store, None),
+        Err(error) => (AiConversationStore::default(), Some(error)),
+    };
+    let ai_http = Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("failed to initialize AI HTTP client");
     let state = Arc::new(AppState {
         sessions: Mutex::new(SessionCatalog::new(sessions)),
+        session_store_error: Mutex::new(session_store_error),
         credentials: Mutex::new(credentials),
+        ai_config: Mutex::new(ai_config),
+        ai_config_error: Mutex::new(ai_config_error),
+        ai_conversations: Mutex::new(ai_conversations),
+        ai_conversation_error: Mutex::new(ai_conversation_error),
+        ai_generations: Mutex::new(HashMap::new()),
+        ai_http,
         local_terminals: Mutex::new(HashMap::new()),
         remote_terminals: Mutex::new(HashMap::new()),
         transfer_handles: Mutex::new(HashMap::new()),
@@ -4529,6 +5772,15 @@ fn main() {
             unlock_credentials,
             lock_credentials,
             set_credential_protection,
+            get_ai_provider_config,
+            save_ai_provider_config,
+            ai_chat,
+            ai_chat_stream,
+            stop_ai_chat,
+            list_ai_conversations,
+            save_ai_conversation,
+            delete_ai_conversation,
+            run_ai_terminal_command,
             connect_session,
             disconnect_session,
             terminal_write,
@@ -4537,7 +5789,9 @@ fn main() {
             read_remote_file_preview,
             read_remote_file_full,
             write_local_file,
+            write_local_file_checked,
             write_remote_file,
+            write_remote_file_checked,
             upload_file,
             upload_local_file,
             cancel_transfer,
@@ -4646,6 +5900,89 @@ mod tests {
         );
 
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[tokio::test]
+    async fn checked_ai_write_rejects_stale_content() {
+        let directory = std::env::temp_dir().join(format!("pandaterm-test-{}", Uuid::new_v4()));
+        let path = directory.join("proposal.txt");
+        atomic_write_text(&path, "current").expect("write initial file");
+
+        let error = write_local_file_checked(
+            path.to_string_lossy().into_owned(),
+            "outdated".to_string(),
+            "replacement".to_string(),
+        )
+        .await
+        .expect_err("reject stale write");
+
+        assert!(error.starts_with("AI_EDIT_STALE:"));
+        assert_eq!(fs::read_to_string(&path).expect("read unchanged file"), "current");
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn ai_terminal_output_keeps_bounded_tail() {
+        let oversized = vec![b'x'; AI_TERMINAL_OUTPUT_LIMIT + 128];
+        let (output, truncated) = bounded_ai_terminal_output(&oversized, b"stderr-tail");
+        assert!(truncated);
+        assert!(output.contains("输出已截断"));
+        assert!(output.ends_with("stderr-tail"));
+        assert!(output.len() <= AI_TERMINAL_OUTPUT_LIMIT + 128);
+    }
+
+    #[tokio::test]
+    async fn ai_local_terminal_command_captures_output() {
+        let command = if cfg!(target_os = "windows") {
+            "Write-Output 'pandaterm-ai-tool'"
+        } else {
+            "printf 'pandaterm-ai-tool'"
+        };
+        let result = run_ai_local_terminal_command(command, Duration::from_secs(5))
+            .await
+            .expect("run isolated command");
+        assert!(!result.timed_out);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.output.contains("pandaterm-ai-tool"));
+    }
+
+    #[test]
+    fn ai_conversation_mode_defaults_and_validates() {
+        let legacy = r#"{
+            "id":"00000000-0000-0000-0000-000000000001",
+            "title":"legacy",
+            "created_at":"2026-01-01T00:00:00Z",
+            "updated_at":"2026-01-01T00:00:00Z",
+            "messages":[]
+        }"#;
+        let mut conversation: AiConversation =
+            serde_json::from_str(legacy).expect("deserialize legacy conversation");
+        assert_eq!(conversation.mode, "ask");
+        validate_ai_conversation(&conversation).expect("validate default ask mode");
+
+        conversation.mode = "automatic".to_string();
+        assert_eq!(
+            validate_ai_conversation(&conversation).expect_err("reject invalid mode"),
+            "AI 会话模式无效"
+        );
+    }
+
+    #[test]
+    fn ai_endpoint_accepts_custom_openai_compatible_base_urls() {
+        assert_eq!(
+            ai_chat_completions_url("https://api.openai.com/v1")
+                .expect("build OpenAI endpoint")
+                .as_str(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            ai_chat_completions_url("gateway.example.com/openai/v1/")
+                .expect("build custom endpoint")
+                .as_str(),
+            "https://gateway.example.com/openai/v1/chat/completions"
+        );
+        assert!(ai_chat_completions_url("file:///tmp/model").is_err());
+        assert!(ai_chat_completions_url("https://user:secret@example.com/v1").is_err());
     }
 
     #[cfg(target_os = "windows")]

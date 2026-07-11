@@ -229,6 +229,109 @@ export async function setCredentialProtection(
   });
 }
 
+export type AiProviderConfig = {
+  base_url: string;
+  model: string;
+  use_api_key: boolean;
+  api_key_configured: boolean;
+  error?: string | null;
+};
+
+export type AiChatMessage = {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+};
+
+export type AiChatResponse = {
+  content: string;
+  model: string;
+};
+
+export type AiChatStreamEvent = {
+  request_id: string;
+  kind: 'started' | 'delta' | 'completed' | 'cancelled' | 'error';
+  delta?: string | null;
+  model?: string | null;
+  message?: string | null;
+};
+
+export type AiStoredContext = {
+  kind: 'terminal' | 'selection' | 'file';
+  label: string;
+  source?: string | null;
+};
+
+export type AiStoredMessage = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  contexts: AiStoredContext[];
+  created_at: string;
+  status: 'complete' | 'cancelled' | 'error';
+};
+
+export type AiConversation = {
+  id: string;
+  title: string;
+  mode: 'ask' | 'agent';
+  created_at: string;
+  updated_at: string;
+  messages: AiStoredMessage[];
+};
+
+export type AiTerminalCommandResult = {
+  output: string;
+  exit_code?: number | null;
+  truncated: boolean;
+  timed_out: boolean;
+};
+
+export async function runAiTerminalCommand(request: {
+  terminal_id: string;
+  is_remote: boolean;
+  command: string;
+  timeout_ms: number;
+}): Promise<AiTerminalCommandResult> {
+  return await invoke<AiTerminalCommandResult>('run_ai_terminal_command', { request });
+}
+
+export async function getAiProviderConfig(): Promise<AiProviderConfig> {
+  return await invoke<AiProviderConfig>('get_ai_provider_config');
+}
+
+export async function saveAiProviderConfig(
+  config: Pick<AiProviderConfig, 'base_url' | 'model' | 'use_api_key'>,
+  apiKey?: string | null,
+): Promise<AiProviderConfig> {
+  return await invoke<AiProviderConfig>('save_ai_provider_config', {
+    request: { ...config, api_key: apiKey || null },
+  });
+}
+
+export async function sendAiChat(messages: AiChatMessage[]): Promise<AiChatResponse> {
+  return await invoke<AiChatResponse>('ai_chat', { request: { messages } });
+}
+
+export async function streamAiChat(requestId: string, messages: AiChatMessage[]): Promise<void> {
+  await invoke('ai_chat_stream', { request: { request_id: requestId, messages } });
+}
+
+export async function stopAiChat(requestId: string): Promise<void> {
+  await invoke('stop_ai_chat', { requestId });
+}
+
+export async function listAiConversations(): Promise<AiConversation[]> {
+  return await invoke<AiConversation[]>('list_ai_conversations');
+}
+
+export async function saveAiConversation(conversation: AiConversation): Promise<AiConversation[]> {
+  return await invoke<AiConversation[]>('save_ai_conversation', { conversation });
+}
+
+export async function deleteAiConversation(conversationId: string): Promise<AiConversation[]> {
+  return await invoke<AiConversation[]>('delete_ai_conversation', { conversationId });
+}
+
 export async function deleteSession(sessionId: string): Promise<Session[]> {
   return await invoke<Session[]>('delete_session', { sessionId });
 }
@@ -269,6 +372,19 @@ export async function readLocalFileFull(path: string): Promise<LocalFilePreview>
 
 export async function readRemoteFileFull(terminalId: string, path: string): Promise<LocalFilePreview> {
   return await invoke<LocalFilePreview>('read_remote_file_full', { terminalId, path });
+}
+
+export async function writeLocalFileChecked(path: string, expectedContent: string, content: string): Promise<void> {
+  await invoke('write_local_file_checked', { path, expectedContent, content });
+}
+
+export async function writeRemoteFileChecked(
+  terminalId: string,
+  path: string,
+  expectedContent: string,
+  content: string,
+): Promise<void> {
+  await invoke('write_remote_file_checked', { terminalId, path, expectedContent, content });
 }
 
 export async function writeLocalFile(path: string, content: string): Promise<void> {
