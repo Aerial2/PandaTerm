@@ -6353,6 +6353,7 @@ fn main() {
     }
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(state)
         .setup(|app| {
             #[cfg(target_os = "windows")]

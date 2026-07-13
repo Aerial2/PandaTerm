@@ -1,4 +1,16 @@
 import { invoke } from '@tauri-apps/api/core';
+import {
+  readText as readNativeClipboardText,
+  writeText as writeNativeClipboardText,
+} from '@tauri-apps/plugin-clipboard-manager';
+
+export async function readClipboardText(): Promise<string> {
+  return (await readNativeClipboardText()) ?? '';
+}
+
+export async function writeClipboardText(text: string): Promise<void> {
+  await writeNativeClipboardText(text);
+}
 
 export async function openConnectionWindow(mode: 'manage' | 'create') {
   const { WebviewWindow, getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');

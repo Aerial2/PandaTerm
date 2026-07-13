@@ -105,6 +105,8 @@ import {
   getUploadConcurrency,
   resizeLocalTerminal,
   resizeTerminal,
+  readClipboardText,
+  writeClipboardText,
   sendLocalTerminalInput,
   startLocalTerminal,
   stopLocalTerminal,
@@ -112,6 +114,11 @@ import {
   openConnectionWindow,
 } from './api';
 import type { AiChatMessage, AiChatStreamEvent, AiConversation, AiProviderConfig, AiStoredMessage, LocalDirectoryEntry, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, SystemMonitorData } from './api';
+import {
+  prepareTerminalPaste,
+  formatTerminalPasteSize,
+  type PreparedTerminalPaste,
+} from './terminalPaste';
 import {
   applyExactEdits,
   parseAiEditResponse,
@@ -1379,6 +1386,8 @@ export function App() {
   const [showEditor, setShowEditor] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: ResourceFile | null } | null>(null);
   const [terminalContextMenu, setTerminalContextMenu] = useState<{ x: number; y: number; tabId: string; selection: string } | null>(null);
+  const [pendingTerminalPaste, setPendingTerminalPaste] = useState<(PreparedTerminalPaste & { tabId: string }) | null>(null);
+  const terminalPasteInFlightRef = useRef(new Set<string>());
   const [isUploading, setIsUploading] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1538,16 +1547,6 @@ export function App() {
       scheduleTerminalSettledFit(tabId);
     } else {
       fitTerminalIfNeeded(tabId);
-    }
-  }
-
-  function writeTerminalInput(tabId: string, data: string) {
-    const tab = tabsRef.current.find((item) => item.id === tabId);
-    if (!tab || !tab.terminalId) return;
-    if (tab.session.id === localSession.id) {
-      void sendLocalTerminalInput(tab.terminalId, data);
-    } else {
-      void terminalWrite(tab.terminalId, data);
     }
   }
 
@@ -1716,6 +1715,10 @@ export function App() {
   }
 
   function disposeTerminalRuntime(tab: WorkspaceTab) {
+    setPendingTerminalPaste((current) => current?.tabId === tab.id ? null : current);
+    setTerminalContextMenu((current) => current?.tabId === tab.id ? null : current);
+    terminalPasteInFlightRef.current.delete(tab.id);
+
     if (tab.kind === 'terminal' && tab.terminalId) {
       if (tab.session.id !== localSession.id) {
         void disconnectSession(tab.terminalId).catch(() => {});
@@ -2513,23 +2516,35 @@ export function App() {
       const tabId = terminalTab.id;
 
       terminal.attachCustomKeyEventHandler((event) => {
-        if (!(event.ctrlKey && event.shiftKey)) return true;
+        if (event.altKey) return true;
 
-        if (event.type === 'keydown' && event.code === 'KeyC') {
+        const key = event.key.toLowerCase();
+        const isCopyShortcut = event.ctrlKey
+          && (event.code === 'KeyC' || key === 'c' || event.code === 'Insert');
+        const isPasteShortcut = (event.ctrlKey && (event.code === 'KeyV' || key === 'v'))
+          || (event.shiftKey && event.code === 'Insert');
+
+        if (isCopyShortcut) {
+          if (event.type !== 'keydown') return false;
+
           const selection = terminal.getSelection();
           if (selection) {
-            void navigator.clipboard.writeText(selection).catch(() => {});
+            event.preventDefault();
+            event.stopPropagation();
+            void copyTerminalSelection(tabId);
+            return false;
           }
-          return false;
+
+          // Plain Ctrl+C must still reach the PTY as SIGINT when nothing is selected.
+          return event.code === 'KeyC' && !event.shiftKey;
         }
 
-        if (event.type === 'keydown' && event.code === 'KeyV') {
-          void navigator.clipboard.readText()
-            .then((text) => {
-              if (!text) return;
-              writeTerminalInput(tabId, text);
-            })
-            .catch(() => {});
+        if (isPasteShortcut) {
+          event.preventDefault();
+          event.stopPropagation();
+          if (event.type === 'keydown' && !event.repeat) {
+            void pasteToTerminal(tabId);
+          }
           return false;
         }
 
@@ -3537,37 +3552,93 @@ export function App() {
 
   function handleTerminalContextMenu(event: React.MouseEvent, tabId: string) {
     event.preventDefault();
+    event.stopPropagation();
+
     const term = terminalsRef.current.get(tabId);
     const selection = term?.getSelection() ?? '';
-    setTerminalContextMenu({ x: event.clientX, y: event.clientY, tabId, selection });
+
+    if (event.shiftKey) {
+      setTerminalContextMenu({ x: event.clientX, y: event.clientY, tabId, selection });
+      return;
+    }
+
+    if (selection) {
+      void copyTerminalSelection(tabId);
+      return;
+    }
+
+    term?.focus();
+    void pasteToTerminal(tabId);
   }
 
   async function copyTerminalSelection(tabId: string) {
     const term = terminalsRef.current.get(tabId);
     const selection = term?.getSelection();
-    if (selection) {
-      try {
-        await navigator.clipboard.writeText(selection);
-      } catch {
-        // Non-critical — clipboard may be unavailable
-      }
-    }
     setTerminalContextMenu(null);
+    if (!term || !selection) return;
+
+    try {
+      await writeClipboardText(selection);
+      if (terminalsRef.current.get(tabId) === term) {
+        term.clearSelection();
+      }
+      setStatusMessage(`已复制 ${selection.length} 个字符`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`复制失败：${message}`);
+    }
+  }
+
+  function commitTerminalPaste(tabId: string, prepared: PreparedTerminalPaste) {
+    const term = terminalsRef.current.get(tabId);
+    if (!term) {
+      setStatusMessage('粘贴失败：终端已关闭');
+      return;
+    }
+
+    term.focus();
+    term.paste(prepared.text);
+    setStatusMessage(prepared.truncated
+      ? `已粘贴前 ${formatTerminalPasteSize(prepared.pasteBytes)}，超出部分已截断`
+      : `已粘贴 ${prepared.lineCount} 行（${formatTerminalPasteSize(prepared.pasteBytes)}）`);
   }
 
   async function pasteToTerminal(tabId: string) {
     const term = terminalsRef.current.get(tabId);
-    if (!term) {
-      setTerminalContextMenu(null);
-      return;
-    }
-    try {
-      const text = await navigator.clipboard.readText();
-      if (text) writeTerminalInput(tabId, text);
-    } catch {
-      // Non-critical — clipboard may be unavailable
-    }
     setTerminalContextMenu(null);
+    if (!term || terminalPasteInFlightRef.current.has(tabId)) return;
+
+    terminalPasteInFlightRef.current.add(tabId);
+    try {
+      const text = await readClipboardText();
+      if (terminalsRef.current.get(tabId) !== term) {
+        setStatusMessage('粘贴已取消：目标终端已关闭或重新创建');
+        return;
+      }
+      if (!text) {
+        setStatusMessage('剪贴板中没有可粘贴的文本');
+        return;
+      }
+
+      const prepared = prepareTerminalPaste(text);
+      if (prepared.requiresConfirmation) {
+        setPendingTerminalPaste({ tabId, ...prepared });
+        return;
+      }
+
+      commitTerminalPaste(tabId, prepared);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`读取剪贴板失败：${message}`);
+    } finally {
+      terminalPasteInFlightRef.current.delete(tabId);
+    }
+  }
+
+  function handleTerminalPasteEvent(event: React.ClipboardEvent, tabId: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    void pasteToTerminal(tabId);
   }
 
   function searchTerminalSelection(selection: string) {
@@ -4525,7 +4596,7 @@ export function App() {
       const text = await exportMcpServersCursorJson(mcpServersDraft);
       let copied = false;
       try {
-        await navigator.clipboard?.writeText(text);
+        await writeClipboardText(text);
         copied = true;
       } catch {
         copied = false;
@@ -6209,6 +6280,7 @@ export function App() {
                   }
                 }}
                 onContextMenu={(event) => handleTerminalContextMenu(event, tab.id)}
+                onPasteCapture={(event) => handleTerminalPasteEvent(event, tab.id)}
               />
             ))}
             {(paneTab.status === 'connecting' || paneTab.status === 'reconnecting') && (
@@ -8286,7 +8358,7 @@ export function App() {
                             className="ai-settings-ghost-btn"
                             title="Copy path"
                             onClick={() => {
-                              void navigator.clipboard?.writeText(mcpSnapshot.config_path || '').catch(() => {});
+                              void writeClipboardText(mcpSnapshot.config_path || '').catch(() => {});
                             }}
                           >
                             <Clipboard size={13} aria-hidden />
@@ -8826,6 +8898,51 @@ export function App() {
                 }}
               >
                 确定
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingTerminalPaste && (
+        <div className="dialog-backdrop" onMouseDown={() => setPendingTerminalPaste(null)}>
+          <div
+            className="dialog-card terminal-paste-dialog"
+            onMouseDown={(event) => event.stopPropagation()}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') setPendingTerminalPaste(null);
+            }}
+          >
+            <h3>确认粘贴到终端</h3>
+            <p className="dialog-message">
+              剪贴板包含 {pendingTerminalPaste.lineCount} 行，原始大小 {formatTerminalPasteSize(pendingTerminalPaste.originalBytes)}。
+              旧版或未启用 Bracketed Paste 的 Shell 可能立即执行其中的命令。
+            </p>
+            {pendingTerminalPaste.hasControlCharacters && (
+              <p className="terminal-paste-warning">
+                内容包含不可见控制字符；预览已用控制图片符号显示，粘贴后可能改变终端状态或触发快捷操作。
+              </p>
+            )}
+            {pendingTerminalPaste.truncated && (
+              <p className="terminal-paste-warning">
+                内容超过安全上限，仅会粘贴前 {formatTerminalPasteSize(pendingTerminalPaste.pasteBytes)}。
+              </p>
+            )}
+            <pre className="terminal-paste-preview">{pendingTerminalPaste.preview}</pre>
+            {pendingTerminalPaste.previewTruncated && (
+              <p className="terminal-paste-preview-note">预览已截断，不代表完整粘贴内容。</p>
+            )}
+            <div className="dialog-actions">
+              <button className="dialog-btn" autoFocus onClick={() => setPendingTerminalPaste(null)}>取消</button>
+              <button
+                className="dialog-btn primary"
+                onClick={() => {
+                  const pending = pendingTerminalPaste;
+                  setPendingTerminalPaste(null);
+                  commitTerminalPaste(pending.tabId, pending);
+                }}
+              >
+                仍然粘贴
               </button>
             </div>
           </div>

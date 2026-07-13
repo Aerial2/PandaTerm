@@ -19,6 +19,8 @@
     "core:webview:default",
     "core:webview:allow-create-webview-window",
     "core:app:default",
-    "core:path:default"
+    "core:path:default",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text"
   ]
 }

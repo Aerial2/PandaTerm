@@ -22,6 +22,7 @@ import {
   unlockCredentials,
   lockCredentials,
   setCredentialProtection,
+  writeClipboardText,
 } from './api';
 import type { CredentialStatus, Session, AuthType } from './api';
 import './styles.css';
@@ -518,7 +519,7 @@ export function ConnectionWindow() {
 
   function handleCopySessionInfo(session: Session) {
     const info = `${session.name}\t${session.host}\t${session.username}\t${session.port}`;
-    void navigator.clipboard.writeText(info);
+    void writeClipboardText(info);
     setContextMenu(null);
   }
 

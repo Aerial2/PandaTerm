@@ -6083,6 +6083,42 @@ body.connection-reordering {
   word-break: break-word;
 }
 
+.terminal-paste-dialog {
+  width: min(640px, 90vw);
+}
+
+.terminal-paste-warning {
+  margin: 12px 0 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(224, 108, 117, 0.35);
+  border-radius: 6px;
+  color: #e8949b;
+  background: rgba(224, 108, 117, 0.08);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.terminal-paste-preview {
+  max-height: min(320px, 45vh);
+  margin: 14px 0 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  font: 12px/1.5 Consolas, "Cascadia Mono", monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.terminal-paste-preview-note {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
 .dialog-btn.danger {
   background: var(--accent-red);
   border-color: var(--accent-red);
