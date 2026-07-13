@@ -1,7 +1,8 @@
 //! Model Context Protocol (MCP) client for PandaTerm.
 //!
 //! Cursor-compatible config shape under `~/.pandaterm/mcp.json`.
-//! Runtime: stdio transport with JSON-RPC 2.0 + Content-Length framing.
+//! Runtime: stdio (JSON-RPC + Content-Length) and streamable-http (JSON / SSE responses).
+//! Legacy pure SSE (GET event stream) is not implemented; URL transports use streamable-http client.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,8 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{oneshot, Mutex};
@@ -19,6 +21,7 @@ use uuid::Uuid;
 
 pub const MCP_CONFIG_VERSION: u8 = 1;
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MCP_HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_INIT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_MCP_SERVERS: usize = 40;
@@ -219,11 +222,34 @@ struct LiveStdioSession {
     tools: Vec<McpToolInfo>,
 }
 
+/// Streamable HTTP MCP session（SSE 旧传输未单独实现；URL 类统一走此客户端）
+struct LiveHttpSession {
+    client: reqwest::Client,
+    url: String,
+    headers: HashMap<String, String>,
+    session_id: Option<String>,
+    next_id: AtomicU64,
+    tools: Vec<McpToolInfo>,
+}
+
+enum LiveSession {
+    Stdio(LiveStdioSession),
+    Http(LiveHttpSession),
+}
+
+impl LiveSession {
+    async fn shutdown(self) {
+        if let LiveSession::Stdio(mut live) = self {
+            let _ = live.child.kill().await;
+        }
+    }
+}
+
 struct SessionSlot {
     status: String,
     error: Option<String>,
     tools: Vec<McpToolInfo>,
-    live: Option<LiveStdioSession>,
+    live: Option<LiveSession>,
 }
 
 impl Default for SessionSlot {
@@ -241,13 +267,20 @@ pub struct McpRuntime {
     sessions: Mutex<HashMap<String, SessionSlot>>,
     /// Shared stdout reader tasks need to route responses.
     response_routes: Mutex<HashMap<String, Arc<Mutex<HashMap<u64, PendingRequest>>>>>,
+    http: reqwest::Client,
 }
 
 impl Default for McpRuntime {
     fn default() -> Self {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(MCP_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             sessions: Mutex::new(HashMap::new()),
             response_routes: Mutex::new(HashMap::new()),
+            http,
         }
     }
 }
@@ -363,7 +396,8 @@ fn cursor_server_to_config(id: String, entry: CursorMcpServer) -> McpServerConfi
         Some("sse") => McpTransport::Sse,
         Some("streamable-http") | Some("http") => McpTransport::StreamableHttp,
         Some("stdio") => McpTransport::Stdio,
-        _ if !url.trim().is_empty() => McpTransport::Sse,
+        // 有 URL 默认 streamable-http（运行时可连）；显式 transport=sse 仍保留标签
+        _ if !url.trim().is_empty() => McpTransport::StreamableHttp,
         _ => McpTransport::Stdio,
     };
     McpServerConfig {
@@ -526,6 +560,25 @@ pub fn list_mcp_import_candidates() -> Vec<McpImportCandidate> {
         });
     };
 
+    // 当前工作目录向上查找项目级 .cursor/mcp.json
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut dir = Some(cwd.as_path());
+        let mut depth = 0usize;
+        while let Some(current) = dir {
+            if depth >= 6 {
+                break;
+            }
+            let project_path = current.join(".cursor").join("mcp.json");
+            push(
+                &format!("project-cursor-{depth}"),
+                &format!("项目 .cursor/mcp.json ({})", current.display()),
+                project_path,
+            );
+            dir = current.parent();
+            depth += 1;
+        }
+    }
+
     if let Some(home) = dirs_home_dir() {
         push(
             "cursor-global",
@@ -576,6 +629,14 @@ pub fn list_mcp_import_candidates() -> Vec<McpImportCandidate> {
         );
     }
 
+    // 存在的候选排前，便于 UI 优先展示
+    candidates.sort_by(|left, right| {
+        right
+            .exists
+            .cmp(&left.exists)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+
     candidates
 }
 
@@ -612,10 +673,63 @@ pub fn import_mcp_servers_from_path(path: &str) -> Result<McpImportPreview, Stri
     })
 }
 
-/// 合并导入服务器到现有列表：同 id 覆盖配置；新 id 追加；总数不超过上限。
+/// 导出为 Cursor `{ "mcpServers": { ... } }` JSON 文本（不落盘）。
+pub fn export_mcp_servers_cursor_json(servers: &[McpServerConfig]) -> Result<String, String> {
+    let normalized = normalize_mcp_servers(servers.to_vec())?;
+    let mut map = Map::new();
+    for server in normalized {
+        let mut entry = Map::new();
+        match server.transport {
+            McpTransport::Stdio => {
+                entry.insert("command".into(), json!(server.command));
+                if !server.args.is_empty() {
+                    entry.insert("args".into(), json!(server.args));
+                }
+                if !server.env.is_empty() {
+                    entry.insert("env".into(), json!(server.env));
+                }
+                if let Some(cwd) = server.cwd.as_ref().filter(|value| !value.trim().is_empty()) {
+                    entry.insert("cwd".into(), json!(cwd));
+                }
+            }
+            McpTransport::Sse | McpTransport::StreamableHttp => {
+                entry.insert("url".into(), json!(server.url));
+                if !server.headers.is_empty() {
+                    entry.insert("headers".into(), json!(server.headers));
+                }
+                entry.insert(
+                    "transport".into(),
+                    json!(transport_label(&server.transport)),
+                );
+            }
+        }
+        if !server.enabled {
+            entry.insert("disabled".into(), json!(true));
+        }
+        // name 与 id 不同时写入，便于往返
+        let display = server.name.trim();
+        if !display.is_empty() && display != server.id {
+            entry.insert("name".into(), json!(display));
+        }
+        map.insert(server.id, Value::Object(entry));
+    }
+    let root = json!({ "mcpServers": Value::Object(map) });
+    serde_json::to_string_pretty(&root).map_err(|error| format!("MCP 导出序列化失败：{error}"))
+}
+
+/// 合并导入服务器到现有列表。
+/// `overwrite=true`：同 id 覆盖；`false`：同 id 跳过。
 pub fn merge_mcp_server_imports(
     existing: Vec<McpServerConfig>,
     imported: Vec<McpServerConfig>,
+) -> Result<(Vec<McpServerConfig>, usize, usize), String> {
+    merge_mcp_server_imports_with_strategy(existing, imported, true)
+}
+
+pub fn merge_mcp_server_imports_with_strategy(
+    existing: Vec<McpServerConfig>,
+    imported: Vec<McpServerConfig>,
+    overwrite: bool,
 ) -> Result<(Vec<McpServerConfig>, usize, usize), String> {
     if imported.is_empty() {
         return Ok((existing, 0, 0));
@@ -630,16 +744,22 @@ pub fn merge_mcp_server_imports(
     }
     let mut added = 0usize;
     let mut updated = 0usize;
+    let mut skipped = 0usize;
     for server in imported {
         if by_id.contains_key(&server.id) {
-            updated += 1;
-            by_id.insert(server.id.clone(), server);
+            if overwrite {
+                updated += 1;
+                by_id.insert(server.id.clone(), server);
+            } else {
+                skipped = skipped.saturating_add(1);
+            }
         } else {
             added += 1;
             order.push(server.id.clone());
             by_id.insert(server.id.clone(), server);
         }
     }
+    let _ = skipped;
     let merged = order
         .into_iter()
         .filter_map(|id| by_id.remove(&id))
@@ -741,8 +861,8 @@ impl McpRuntime {
     pub async fn disconnect_all(&self) {
         let mut sessions = self.sessions.lock().await;
         for (_, slot) in sessions.drain() {
-            if let Some(mut live) = slot.live {
-                let _ = live.child.kill().await;
+            if let Some(live) = slot.live {
+                live.shutdown().await;
             }
         }
         self.response_routes.lock().await.clear();
@@ -751,8 +871,8 @@ impl McpRuntime {
     pub async fn disconnect_server(&self, server_id: &str) {
         let mut sessions = self.sessions.lock().await;
         if let Some(slot) = sessions.remove(server_id) {
-            if let Some(mut live) = slot.live {
-                let _ = live.child.kill().await;
+            if let Some(live) = slot.live {
+                live.shutdown().await;
             }
         }
         self.response_routes.lock().await.remove(server_id);
@@ -793,8 +913,8 @@ impl McpRuntime {
                 .collect();
             for id in stale {
                 if let Some(slot) = sessions.remove(&id) {
-                    if let Some(mut live) = slot.live {
-                        let _ = live.child.kill().await;
+                    if let Some(live) = slot.live {
+                        live.shutdown().await;
                     }
                 }
                 self.response_routes.lock().await.remove(&id);
@@ -840,6 +960,23 @@ impl McpRuntime {
             );
             return Err("stdio MCP 缺少 command".to_string());
         }
+        if matches!(
+            config.transport,
+            McpTransport::Sse | McpTransport::StreamableHttp
+        ) && config.url.trim().is_empty()
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.insert(
+                config.id.clone(),
+                SessionSlot {
+                    status: "error".to_string(),
+                    error: Some("远程 MCP 缺少 url".to_string()),
+                    tools: Vec::new(),
+                    live: None,
+                },
+            );
+            return Err("远程 MCP 缺少 url".to_string());
+        }
 
         {
             let mut sessions = self.sessions.lock().await;
@@ -854,8 +991,9 @@ impl McpRuntime {
 
         let result = match config.transport {
             McpTransport::Stdio => self.spawn_stdio_session(config).await,
+            // URL 类统一走 streamable-http 客户端（兼容多数 Cursor 远程 MCP）
             McpTransport::Sse | McpTransport::StreamableHttp => {
-                Err("远程 MCP（SSE / Streamable HTTP）将在后续版本接入；请先使用 stdio 服务器".to_string())
+                self.spawn_http_session(config).await
             }
         };
 
@@ -1051,7 +1189,75 @@ impl McpRuntime {
                 status: "connected".to_string(),
                 error: None,
                 tools: tools.clone(),
-                live: Some(live),
+                live: Some(LiveSession::Stdio(live)),
+            },
+        );
+        Ok(tools)
+    }
+
+    async fn spawn_http_session(
+        &self,
+        config: &McpServerConfig,
+    ) -> Result<Vec<McpToolInfo>, String> {
+        let url = config.url.trim().to_string();
+        if url.is_empty() {
+            return Err("远程 MCP 缺少 url".to_string());
+        }
+        let mut live = LiveHttpSession {
+            client: self.http.clone(),
+            url,
+            headers: config.headers.clone(),
+            session_id: None,
+            next_id: AtomicU64::new(1),
+            tools: Vec::new(),
+        };
+
+        let _init = http_jsonrpc_request(
+            &mut live,
+            "initialize",
+            json!({
+                "protocolVersion": MCP_HTTP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "pandaterm",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }),
+            MCP_INIT_TIMEOUT,
+            false,
+        )
+        .await?;
+
+        // notifications/initialized
+        let _ = http_jsonrpc_request(
+            &mut live,
+            "notifications/initialized",
+            json!({}),
+            MCP_REQUEST_TIMEOUT,
+            true,
+        )
+        .await;
+
+        let tools_result = http_jsonrpc_request(
+            &mut live,
+            "tools/list",
+            json!({}),
+            MCP_REQUEST_TIMEOUT,
+            false,
+        )
+        .await?
+        .ok_or_else(|| "MCP tools/list 无响应".to_string())?;
+        let tools = parse_tools_list(&tools_result)?;
+        live.tools = tools.clone();
+
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(
+            config.id.clone(),
+            SessionSlot {
+                status: "connected".to_string(),
+                error: None,
+                tools: tools.clone(),
+                live: Some(LiveSession::Http(live)),
             },
         );
         Ok(tools)
@@ -1093,9 +1299,6 @@ impl McpRuntime {
         if !server.enabled {
             return Err(format!("MCP 服务器已禁用：{}", request.server_id));
         }
-        if !matches!(server.transport, McpTransport::Stdio) {
-            return Err("当前仅支持 stdio MCP 工具调用".to_string());
-        }
 
         // Ensure connected
         let needs_connect = {
@@ -1108,44 +1311,72 @@ impl McpRuntime {
             self.connect_server(server).await?;
         }
 
-        let pending_map = {
-            let routes = self.response_routes.lock().await;
-            routes
-                .get(&server.id)
-                .cloned()
-                .ok_or_else(|| "MCP 会话未就绪".to_string())?
-        };
-
         let tool_name = request.tool_name.trim();
         if tool_name.is_empty() || tool_name.chars().count() > 128 {
             return Err("MCP 工具名无效".to_string());
         }
         let arguments = request.arguments.unwrap_or_else(|| json!({}));
 
-        let (stdin, next_id) = {
-            let sessions = self.sessions.lock().await;
+        // 取出 live，避免在 await 期间长期占用 sessions 锁
+        let live = {
+            let mut sessions = self.sessions.lock().await;
             let slot = sessions
-                .get(&server.id)
+                .get_mut(&server.id)
                 .ok_or_else(|| "MCP 会话不存在".to_string())?;
-            let live = slot
-                .live
-                .as_ref()
-                .ok_or_else(|| "MCP 进程未连接".to_string())?;
-            (Arc::clone(&live.stdin), Arc::clone(&live.next_id))
+            slot.live
+                .take()
+                .ok_or_else(|| "MCP 会话未连接".to_string())?
         };
 
-        let result = request_on_session(
-            &stdin,
-            &next_id,
-            &pending_map,
-            "tools/call",
-            json!({
-                "name": tool_name,
-                "arguments": arguments,
-            }),
-            MCP_REQUEST_TIMEOUT,
-        )
-        .await;
+        let result = match live {
+            LiveSession::Stdio(stdio) => {
+                let pending_map = {
+                    let routes = self.response_routes.lock().await;
+                    routes.get(&server.id).cloned()
+                };
+                let call = match pending_map {
+                    Some(pending_map) => {
+                        request_on_session(
+                            &stdio.stdin,
+                            &stdio.next_id,
+                            &pending_map,
+                            "tools/call",
+                            json!({
+                                "name": tool_name,
+                                "arguments": arguments,
+                            }),
+                            MCP_REQUEST_TIMEOUT,
+                        )
+                        .await
+                    }
+                    None => Err("MCP 会话未就绪".to_string()),
+                };
+                let mut sessions = self.sessions.lock().await;
+                if let Some(slot) = sessions.get_mut(&server.id) {
+                    slot.live = Some(LiveSession::Stdio(stdio));
+                }
+                call
+            }
+            LiveSession::Http(mut http) => {
+                let call = http_jsonrpc_request(
+                    &mut http,
+                    "tools/call",
+                    json!({
+                        "name": tool_name,
+                        "arguments": arguments,
+                    }),
+                    MCP_REQUEST_TIMEOUT,
+                    false,
+                )
+                .await
+                .and_then(|value| value.ok_or_else(|| "MCP tools/call 无响应".to_string()));
+                let mut sessions = self.sessions.lock().await;
+                if let Some(slot) = sessions.get_mut(&server.id) {
+                    slot.live = Some(LiveSession::Http(http));
+                }
+                call
+            }
+        };
 
         match result {
             Ok(value) => Ok(parse_tool_call_result(value)),
@@ -1154,14 +1385,196 @@ impl McpRuntime {
                 if let Some(slot) = sessions.get_mut(&server.id) {
                     slot.status = "error".to_string();
                     slot.error = Some(error.clone());
-                    if let Some(mut live) = slot.live.take() {
-                        let _ = live.child.kill().await;
+                    if let Some(live) = slot.live.take() {
+                        live.shutdown().await;
                     }
                 }
+                self.response_routes.lock().await.remove(&server.id);
                 Err(error)
             }
         }
     }
+}
+
+async fn http_jsonrpc_request(
+    session: &mut LiveHttpSession,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+    notification: bool,
+) -> Result<Option<Value>, String> {
+    let body = if notification {
+        json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        })
+    } else {
+        let id = session.next_id.fetch_add(1, Ordering::SeqCst);
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        })
+    };
+    let request_id = body.get("id").cloned();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/json, text/event-stream"),
+    );
+    headers.insert(
+        HeaderName::from_static("mcp-protocol-version"),
+        HeaderValue::from_static(MCP_HTTP_PROTOCOL_VERSION),
+    );
+    for (key, value) in &session.headers {
+        let name = HeaderName::from_bytes(key.as_bytes())
+            .map_err(|_| format!("无效 header 名：{key}"))?;
+        let header_value = HeaderValue::from_str(value)
+            .map_err(|_| format!("无效 header 值：{key}"))?;
+        headers.insert(name, header_value);
+    }
+    if let Some(session_id) = session.session_id.as_ref() {
+        if let Ok(value) = HeaderValue::from_str(session_id) {
+            headers.insert(
+                HeaderName::from_static("mcp-session-id"),
+                value,
+            );
+        }
+    }
+
+    let response = session
+        .client
+        .post(&session.url)
+        .headers(headers)
+        .json(&body)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|error| format!("MCP HTTP 请求失败（{method}）：{error}"))?;
+
+    if let Some(session_header) = response
+        .headers()
+        .get("mcp-session-id")
+        .or_else(|| response.headers().get("Mcp-Session-Id"))
+    {
+        if let Ok(value) = session_header.to_str() {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                session.session_id = Some(trimmed.to_string());
+            }
+        }
+    }
+
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("MCP HTTP 响应读取失败：{error}"))?;
+
+    // 202 / 空 body：通知常见；非通知则视为无结果
+    if text.trim().is_empty() {
+        if notification || status.as_u16() == 202 {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(format!("MCP HTTP {}（{method}）", status.as_u16()));
+        }
+        return Err(format!("MCP HTTP 响应为空（{method}）"));
+    }
+
+    if !status.is_success() {
+        let snippet: String = text.chars().take(400).collect();
+        return Err(format!(
+            "MCP HTTP {}（{method}）：{snippet}",
+            status.as_u16()
+        ));
+    }
+
+    if notification {
+        return Ok(None);
+    }
+
+    let request_id = request_id.ok_or_else(|| "MCP 请求缺少 id".to_string())?;
+    if content_type.contains("text/event-stream") || text.trim_start().starts_with("event:") || text.contains("\ndata:") {
+        parse_sse_jsonrpc_result(&text, &request_id).map(Some)
+    } else {
+        parse_jsonrpc_result(&text, &request_id).map(Some)
+    }
+}
+
+fn jsonrpc_id_matches(left: &Value, right: &Value) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.as_u64(), right.as_u64()) {
+        (Some(a), Some(b)) => a == b,
+        _ => match (left.as_i64(), right.as_i64()) {
+            (Some(a), Some(b)) => a == b,
+            _ => left.as_str().is_some_and(|a| right.as_str() == Some(a)),
+        },
+    }
+}
+
+fn parse_jsonrpc_result(text: &str, request_id: &Value) -> Result<Value, String> {
+    let message: Value = serde_json::from_str(text.trim())
+        .map_err(|error| format!("MCP HTTP JSON 无效：{error}"))?;
+    if let Some(id) = message.get("id") {
+        if !jsonrpc_id_matches(id, request_id) {
+            return Err("MCP HTTP 响应 id 不匹配".to_string());
+        }
+    }
+    if let Some(error) = message.get("error") {
+        let text = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("MCP 请求失败")
+            .to_string();
+        return Err(text);
+    }
+    Ok(message.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn parse_sse_jsonrpc_result(text: &str, request_id: &Value) -> Result<Value, String> {
+    let mut data_blocks: Vec<String> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            if !current.is_empty() {
+                data_blocks.push(current.join("\n"));
+                current.clear();
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            current.push(rest.trim_start().to_string());
+        }
+    }
+    if !current.is_empty() {
+        data_blocks.push(current.join("\n"));
+    }
+
+    let mut last_error = "MCP SSE 响应中没有 JSON-RPC 结果".to_string();
+    for block in data_blocks {
+        let trimmed = block.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            continue;
+        }
+        match parse_jsonrpc_result(trimmed, request_id) {
+            Ok(result) => return Ok(result),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 async fn request_on_session(
@@ -1388,7 +1801,7 @@ mod tests {
             "remote".into(),
             cursor.mcp_servers.get("remote").cloned().unwrap(),
         );
-        assert!(matches!(remote.transport, McpTransport::Sse));
+        assert!(matches!(remote.transport, McpTransport::StreamableHttp));
         assert!(remote.url.starts_with("https://"));
 
         let store = parse_mcp_config_content(raw).expect("parse content");
@@ -1433,13 +1846,69 @@ mod tests {
             enabled: false,
         }];
         let (merged, added, updated) =
-            merge_mcp_server_imports(existing, imported).expect("merge");
+            merge_mcp_server_imports(existing.clone(), imported.clone()).expect("merge");
         assert_eq!(added, 1);
         assert_eq!(updated, 1);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].command, "npx");
         assert_eq!(merged[0].name, "memory");
         assert_eq!(merged[1].id, "fs");
+
+        let (skipped_merge, added2, updated2) =
+            merge_mcp_server_imports_with_strategy(existing, imported, false).expect("skip");
+        assert_eq!(added2, 1);
+        assert_eq!(updated2, 0);
+        assert_eq!(skipped_merge[0].command, "old");
+    }
+
+    #[test]
+    fn export_cursor_shape_roundtrip() {
+        let servers = vec![
+            McpServerConfig {
+                id: "memory".into(),
+                name: "memory".into(),
+                transport: McpTransport::Stdio,
+                command: "npx".into(),
+                args: vec!["-y".into(), "@modelcontextprotocol/server-memory".into()],
+                env: HashMap::new(),
+                cwd: None,
+                url: String::new(),
+                headers: HashMap::new(),
+                enabled: true,
+            },
+            McpServerConfig {
+                id: "remote".into(),
+                name: "remote".into(),
+                transport: McpTransport::StreamableHttp,
+                command: String::new(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                url: "https://example.com/mcp".into(),
+                headers: HashMap::from([("Authorization".into(), "Bearer x".into())]),
+                enabled: false,
+            },
+        ];
+        let exported = export_mcp_servers_cursor_json(&servers).expect("export");
+        let reimported = parse_mcp_config_content(&exported).expect("reimport");
+        assert_eq!(reimported.servers.len(), 2);
+        assert!(reimported.servers.iter().any(|s| s.id == "memory" && s.command == "npx"));
+        assert!(reimported
+            .servers
+            .iter()
+            .any(|s| s.id == "remote" && !s.enabled && s.url.starts_with("https://")));
+    }
+
+    #[test]
+    fn parse_sse_and_json_http_results() {
+        let id = json!(1);
+        let json_body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}"#;
+        let result = parse_jsonrpc_result(json_body, &id).expect("json");
+        assert_eq!(result["tools"][0]["name"], "a");
+
+        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let sse_result = parse_sse_jsonrpc_result(sse, &id).expect("sse");
+        assert_eq!(sse_result["ok"], true);
     }
 
     #[test]

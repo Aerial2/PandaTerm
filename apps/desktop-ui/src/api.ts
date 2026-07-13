@@ -260,6 +260,12 @@ export type AiChatStreamEvent = {
   delta?: string | null;
   model?: string | null;
   message?: string | null;
+  /** Agent 模式流式结束后附带的 OpenAI tool_calls */
+  tool_calls?: Array<{
+    id: string;
+    name: string;
+    arguments: string;
+  }> | null;
 };
 
 export type AiStoredContext = {
@@ -437,12 +443,27 @@ export async function importMcpServersFromPath(path: string): Promise<McpImportP
   return await invoke<McpImportPreview>('import_mcp_servers_from_path', { path });
 }
 
+/** 导出 Cursor 风格 mcpServers JSON 文本（不落盘） */
+export async function exportMcpServersCursorJson(servers: McpServerConfig[]): Promise<string> {
+  return await invoke<string>('export_mcp_servers_cursor_json', { servers });
+}
+
 export async function sendAiChat(messages: AiChatMessage[]): Promise<AiChatResponse> {
   return await invoke<AiChatResponse>('ai_chat', { request: { messages } });
 }
 
-export async function streamAiChat(requestId: string, messages: AiChatMessage[]): Promise<void> {
-  await invoke('ai_chat_stream', { request: { request_id: requestId, messages } });
+export async function streamAiChat(
+  requestId: string,
+  messages: AiChatMessage[],
+  mode?: 'ask' | 'agent' | null,
+): Promise<void> {
+  await invoke('ai_chat_stream', {
+    request: {
+      request_id: requestId,
+      messages,
+      mode: mode ?? null,
+    },
+  });
 }
 
 export async function stopAiChat(requestId: string): Promise<void> {

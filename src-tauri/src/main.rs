@@ -278,6 +278,17 @@ struct AiStoredContext {
 struct AiChatStreamRequest {
     request_id: String,
     messages: Vec<AiChatMessage>,
+    /// ask | agent；agent 模式注入 OpenAI-compatible tools
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiToolCall {
+    id: String,
+    name: String,
+    /// 供应商返回的 function.arguments JSON 字符串（可能分片拼接）
+    arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -287,6 +298,8 @@ struct AiChatStreamEvent {
     delta: Option<String>,
     model: Option<String>,
     message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<AiToolCall>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -296,6 +309,10 @@ struct OpenAiChatStreamRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Value]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,6 +330,28 @@ struct OpenAiStreamChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiStreamDelta {
     content: Option<Value>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OpenAiStreamToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    function: Option<OpenAiStreamFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+#[derive(Default)]
+struct StreamToolCallBuilder {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4968,6 +5007,113 @@ fn extract_ai_content(content: &Value) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// Agent 模式注入的固定 OpenAI tools；前端映射为待授权动作卡，不在后端直接执行。
+fn agent_openai_tools() -> Vec<Value> {
+    vec![
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "run_terminal_command",
+                "description": "Propose a one-shot non-interactive terminal command. Creates a pending approval card; the command is NOT executed until the user authorizes it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": "Short action summary shown on the approval card"
+                        },
+                        "context_source": {
+                            "type": "string",
+                            "description": "Exact source field from workspace_context_json for the target terminal (usually terminal:sessionId-uuid). Do not invent placeholders like terminal/current/active."
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "One-shot non-interactive shell command. Keep a space before shell redirections (e.g. nginx -T 2>/dev/null)."
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Timeout in milliseconds (3000-30000). Default 10000."
+                        }
+                    },
+                    "required": ["summary", "context_source", "command"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "call_mcp_tool",
+                "description": "Propose an MCP tool invocation. Creates a pending approval card; the tool is NOT called until the user authorizes it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": "Short action summary shown on the approval card"
+                        },
+                        "server": {
+                            "type": "string",
+                            "description": "MCP server id from the connected tools catalog"
+                        },
+                        "tool": {
+                            "type": "string",
+                            "description": "MCP tool name from the connected tools catalog"
+                        },
+                        "arguments": {
+                            "type": "object",
+                            "description": "JSON object arguments for the MCP tool"
+                        }
+                    },
+                    "required": ["summary", "server", "tool"]
+                }
+            }
+        }),
+    ]
+}
+
+fn apply_stream_tool_call_delta(
+    builders: &mut HashMap<usize, StreamToolCallBuilder>,
+    delta: OpenAiStreamToolCallDelta,
+) {
+    let entry = builders.entry(delta.index).or_default();
+    if let Some(id) = delta.id.filter(|value| !value.is_empty()) {
+        entry.id = id;
+    }
+    if let Some(function) = delta.function {
+        if let Some(name) = function.name.filter(|value| !value.is_empty()) {
+            entry.name = name;
+        }
+        if let Some(arguments) = function.arguments {
+            entry.arguments.push_str(&arguments);
+        }
+    }
+}
+
+fn finalize_stream_tool_calls(
+    builders: HashMap<usize, StreamToolCallBuilder>,
+) -> Vec<AiToolCall> {
+    let mut ordered = builders.into_iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|(index, _)| *index);
+    ordered
+        .into_iter()
+        .filter_map(|(_, builder)| {
+            let name = builder.name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(AiToolCall {
+                id: if builder.id.trim().is_empty() {
+                    format!("call_{}", Uuid::new_v4())
+                } else {
+                    builder.id
+                },
+                name: name.to_string(),
+                arguments: builder.arguments,
+            })
+        })
+        .collect()
+}
+
 fn extract_provider_error(body: &str) -> String {
     serde_json::from_str::<Value>(body)
         .ok()
@@ -5248,6 +5394,14 @@ fn import_mcp_servers_from_path(path: String) -> Result<mcp::McpImportPreview, S
     mcp::import_mcp_servers_from_path(&path)
 }
 
+/// 导出当前草稿为 Cursor mcpServers JSON（不落盘）。
+#[tauri::command]
+fn export_mcp_servers_cursor_json(
+    servers: Vec<mcp::McpServerConfig>,
+) -> Result<String, String> {
+    mcp::export_mcp_servers_cursor_json(&servers)
+}
+
 #[tauri::command]
 async fn ai_chat(
     request: AiChatRequest,
@@ -5414,6 +5568,18 @@ fn emit_ai_stream_event(
     model: Option<String>,
     message: Option<String>,
 ) {
+    emit_ai_stream_event_with_tools(app, request_id, kind, delta, model, message, None);
+}
+
+fn emit_ai_stream_event_with_tools(
+    app: &AppHandle,
+    request_id: &str,
+    kind: &str,
+    delta: Option<String>,
+    model: Option<String>,
+    message: Option<String>,
+    tool_calls: Option<Vec<AiToolCall>>,
+) {
     let _ = app.emit(
         AI_CHAT_STREAM_EVENT,
         AiChatStreamEvent {
@@ -5422,6 +5588,7 @@ fn emit_ai_stream_event(
             delta,
             model,
             message,
+            tool_calls,
         },
     );
 }
@@ -5541,11 +5708,23 @@ async fn ai_chat_stream(
         emit_ai_stream_event(&app, &request.request_id, "cancelled", None, None, None);
         return Ok(());
     };
+    let agent_mode = request
+        .mode
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("agent"));
+    let agent_tools = if agent_mode {
+        Some(agent_openai_tools())
+    } else {
+        None
+    };
     let payload = OpenAiChatStreamRequest {
         model: &config.model,
         messages: &request.messages,
         stream: true,
         reasoning_effort: ai_request_reasoning_effort(&config.reasoning_effort),
+        tools: agent_tools.as_deref(),
+        tool_choice: agent_mode.then_some("auto"),
     };
     let mut builder = state.ai_http.post(endpoint).json(&payload);
     if let Some(key) = api_key.as_deref() {
@@ -5607,6 +5786,7 @@ async fn ai_chat_stream(
     let mut completed = false;
     let mut cancelled = false;
     let mut stream_error = None;
+    let mut tool_call_builders: HashMap<usize, StreamToolCallBuilder> = HashMap::new();
     'stream: loop {
         let chunk = tokio::select! {
             result = response.chunk() => Some(result),
@@ -5620,13 +5800,15 @@ async fn ai_chat_stream(
             Ok(Some(bytes)) => buffer.extend_from_slice(&bytes),
             Ok(None) => {
                 if !completed {
-                    emit_ai_stream_event(
+                    let tool_calls = finalize_stream_tool_calls(std::mem::take(&mut tool_call_builders));
+                    emit_ai_stream_event_with_tools(
                         &app,
                         &request.request_id,
                         "completed",
                         None,
                         Some(response_model.clone()),
                         None,
+                        (!tool_calls.is_empty()).then_some(tool_calls),
                     );
                 }
                 break;
@@ -5653,15 +5835,19 @@ async fn ai_chat_stream(
                 }
             };
             if data == "[DONE]" {
-                emit_ai_stream_event(
-                    &app,
-                    &request.request_id,
-                    "completed",
-                    None,
-                    Some(response_model.clone()),
-                    None,
-                );
-                completed = true;
+                if !completed {
+                    let tool_calls = finalize_stream_tool_calls(std::mem::take(&mut tool_call_builders));
+                    emit_ai_stream_event_with_tools(
+                        &app,
+                        &request.request_id,
+                        "completed",
+                        None,
+                        Some(response_model.clone()),
+                        None,
+                        (!tool_calls.is_empty()).then_some(tool_calls),
+                    );
+                    completed = true;
+                }
                 break;
             }
             let chunk: OpenAiStreamChunk = match serde_json::from_str(&data) {
@@ -5685,14 +5871,21 @@ async fn ai_chat_stream(
                         None,
                     );
                 }
+                if let Some(tool_deltas) = choice.delta.tool_calls {
+                    for tool_delta in tool_deltas {
+                        apply_stream_tool_call_delta(&mut tool_call_builders, tool_delta);
+                    }
+                }
                 if choice.finish_reason.is_some() && !completed {
-                    emit_ai_stream_event(
+                    let tool_calls = finalize_stream_tool_calls(std::mem::take(&mut tool_call_builders));
+                    emit_ai_stream_event_with_tools(
                         &app,
                         &request.request_id,
                         "completed",
                         None,
                         Some(response_model.clone()),
                         None,
+                        (!tool_calls.is_empty()).then_some(tool_calls),
                     );
                     completed = true;
                 }
@@ -6228,6 +6421,7 @@ fn main() {
             call_mcp_tool,
             list_mcp_import_candidates,
             import_mcp_servers_from_path,
+            export_mcp_servers_cursor_json,
             ai_chat,
             ai_chat_stream,
             stop_ai_chat,
@@ -6541,6 +6735,74 @@ mod tests {
                 "raw-string-model".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn stream_tool_call_deltas_merge_by_index() {
+        let mut builders = HashMap::new();
+        apply_stream_tool_call_delta(
+            &mut builders,
+            OpenAiStreamToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                function: Some(OpenAiStreamFunctionDelta {
+                    name: Some("run_terminal_command".to_string()),
+                    arguments: Some("{\"summary\":".to_string()),
+                }),
+            },
+        );
+        apply_stream_tool_call_delta(
+            &mut builders,
+            OpenAiStreamToolCallDelta {
+                index: 0,
+                id: None,
+                function: Some(OpenAiStreamFunctionDelta {
+                    name: None,
+                    arguments: Some("\"ls\",\"context_source\":\"terminal:a\",\"command\":\"ls\"}".to_string()),
+                }),
+            },
+        );
+        let tools = finalize_stream_tool_calls(builders);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].id, "call_1");
+        assert_eq!(tools[0].name, "run_terminal_command");
+        assert!(tools[0].arguments.contains("context_source"));
+        assert_eq!(agent_openai_tools().len(), 2);
+    }
+
+    #[test]
+    fn agent_stream_request_serializes_tools_only_when_present() {
+        let messages = [AiChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let tools = agent_openai_tools();
+        let with_tools = serde_json::to_value(OpenAiChatStreamRequest {
+            model: "gpt-4o-mini",
+            messages: &messages,
+            stream: true,
+            reasoning_effort: None,
+            tools: Some(tools.as_slice()),
+            tool_choice: Some("auto"),
+        })
+        .expect("serialize tools");
+        assert!(with_tools.get("tools").is_some());
+        assert_eq!(
+            with_tools.get("tool_choice").and_then(Value::as_str),
+            Some("auto")
+        );
+
+        let without_tools = serde_json::to_value(OpenAiChatStreamRequest {
+            model: "gpt-4o-mini",
+            messages: &messages,
+            stream: true,
+            reasoning_effort: None,
+            tools: None,
+            tool_choice: None,
+        })
+        .expect("serialize without tools");
+        assert!(without_tools.get("tools").is_none());
+        assert!(without_tools.get("tool_choice").is_none());
     }
 
     #[cfg(target_os = "windows")]
