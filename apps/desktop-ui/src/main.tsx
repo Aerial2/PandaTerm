@@ -9,11 +9,7 @@ const root = ReactDOM.createRoot(document.getElementById('root') as HTMLElement)
 async function bootstrap() {
   if (windowMode === 'connection') {
     const { ConnectionWindow } = await import('./ConnectionWindow');
-    root.render(
-      <React.StrictMode>
-        <ConnectionWindow />
-      </React.StrictMode>,
-    );
+    root.render(<ConnectionWindow />);
     return;
   }
 

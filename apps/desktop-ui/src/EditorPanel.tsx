@@ -22,6 +22,7 @@ export type EditorTab = {
   terminalId?: string;
   loading: boolean;
   error: string;
+  isUntitled?: boolean;
 };
 
 export type EditorPanelProps = {
@@ -31,6 +32,7 @@ export type EditorPanelProps = {
   onCloseTab: (id: string) => void;
   onSave: (id: string) => void;
   onContentChange: (id: string, content: string) => void;
+  onCreateUntitled: () => void;
   theme?: string;
 };
 
@@ -56,7 +58,16 @@ export { detectLanguage };
 
 const DARK_THEME = 'pandaterm-dark';
 
-export function EditorPanel({ tabs, activeTabId, onSelectTab, onCloseTab, onSave, onContentChange, theme }: EditorPanelProps) {
+export function EditorPanel({
+  tabs,
+  activeTabId,
+  onSelectTab,
+  onCloseTab,
+  onSave,
+  onContentChange,
+  onCreateUntitled,
+  theme,
+}: EditorPanelProps) {
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const saveHandlersRef = useRef<Map<string, () => void>>(new Map());
 
@@ -115,8 +126,6 @@ export function EditorPanel({ tabs, activeTabId, onSelectTab, onCloseTab, onSave
     return () => { saveHandlersRef.current.delete(activeTab.id); };
   }, [activeTab, onSave]);
 
-  if (tabs.length === 0) return null;
-
   // Compute display labels — when multiple tabs share the same filename
   // (e.g. nginx.conf on different servers) we show a short path suffix to
   // distinguish them, similar to VS Code.
@@ -136,13 +145,19 @@ export function EditorPanel({ tabs, activeTabId, onSelectTab, onCloseTab, onSave
   return (
     <div className="editor-panel">
       <div className="editor-tabs-bar">
-        <div className="editor-tabs">
+        <div
+          className="editor-tabs"
+          title="双击空白处新建空白文件"
+          onDoubleClick={(event) => {
+            if (event.target === event.currentTarget) onCreateUntitled();
+          }}
+        >
           {tabs.map((tab) => (
             <div
               key={tab.id}
               className={tab.id === activeTabId ? 'editor-tab active' : 'editor-tab'}
               onClick={() => onSelectTab(tab.id)}
-              title={tab.path}
+              title={tab.isUntitled ? '未保存的空白文件' : tab.path}
             >
               <FileText size={13} />
               <span className="editor-tab-name">{tabLabel(tab)}</span>
@@ -162,8 +177,8 @@ export function EditorPanel({ tabs, activeTabId, onSelectTab, onCloseTab, onSave
         {activeTab && (
           <button
             className="editor-save-btn"
-            title="保存 (Ctrl+S)"
-            disabled={activeTab.content === activeTab.originalContent || activeTab.loading}
+            title={activeTab.isUntitled ? '未命名文件需先指定保存路径' : '保存 (Ctrl+S)'}
+            disabled={activeTab.isUntitled || activeTab.content === activeTab.originalContent || activeTab.loading}
             onClick={() => onSave(activeTab.id)}
           >
             <Save size={15} />
@@ -212,7 +227,7 @@ export function EditorPanel({ tabs, activeTabId, onSelectTab, onCloseTab, onSave
             }}
           />
         ) : (
-          <div className="editor-empty">选择一个文件进行编辑</div>
+          <div className="editor-empty">双击上方标签栏空白处新建空白文件</div>
         )}
       </div>
     </div>

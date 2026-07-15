@@ -55,6 +55,11 @@ const initialConnectionForm: ConnectionFormState = {
 
 type ConnectionWindowMode = 'manage' | 'create';
 
+const initialWindowMode: ConnectionWindowMode = new URLSearchParams(window.location.search).get('connectionMode') === 'create'
+  ? 'create'
+  : 'manage';
+const initialWindowLabel = initialWindowMode === 'create' ? 'connection-create' : 'connection-panel';
+
 type ContextMenuState = {
   x: number;
   y: number;
@@ -75,9 +80,9 @@ const localSession: Session = {
 };
 
 export function ConnectionWindow() {
-  const windowLabelRef = useRef<string>('connection-panel');
-  const [windowLabel, setWindowLabel] = useState<string>('connection-panel');
-  const [mode, setMode] = useState<ConnectionWindowMode>('manage');
+  const windowLabelRef = useRef<string>(initialWindowLabel);
+  const [windowLabel, setWindowLabel] = useState<string>(initialWindowLabel);
+  const [mode, setMode] = useState<ConnectionWindowMode>(initialWindowMode);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [connectionSearchQuery, setConnectionSearchQuery] = useState('');
@@ -190,7 +195,9 @@ export function ConnectionWindow() {
   }
 
   useEffect(() => {
-    void refreshSessions();
+    if (initialWindowMode === 'manage') {
+      void refreshSessions();
+    }
     void getCredentialStatus().then((status) => {
       setCredentialStatus(status);
       if (status.error) setConnectionFormError(status.error);
@@ -212,7 +219,9 @@ export function ConnectionWindow() {
     // Keep the list in sync when sessions change in another connection window
     // (e.g. a connection created/deleted in the separate "新建连接" window).
     const unlistenChanges = listen('sessions-changed', () => {
-      void refreshSessions();
+      if (windowLabelRef.current === 'connection-panel') {
+        void refreshSessions();
+      }
     });
 
     // Detect window label, apply dark mode, and show window

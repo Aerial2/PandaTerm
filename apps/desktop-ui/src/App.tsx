@@ -1350,6 +1350,7 @@ export function App() {
   pendingPaneTabIdRef.current = pendingPaneTabId;
   const [editorTabs, setEditorTabs] = useState<EditorTab[]>([]);
   const [activeEditorTabId, setActiveEditorTabId] = useState<string | null>(null);
+  const untitledEditorCounterRef = useRef(1);
   const [showEditor, setShowEditor] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: ResourceFile | null } | null>(null);
   const [terminalContextMenu, setTerminalContextMenu] = useState<{ x: number; y: number; tabId: string; selection: string } | null>(null);
@@ -2602,6 +2603,28 @@ export function App() {
     }
   }
 
+  function createUntitledEditorTab() {
+    const sequence = untitledEditorCounterRef.current++;
+    const id = `untitled:${crypto.randomUUID()}`;
+    const name = `Untitled-${sequence}`;
+    const newTab: EditorTab = {
+      id,
+      path: '',
+      name,
+      language: 'plaintext',
+      content: '',
+      originalContent: '',
+      isRemote: false,
+      loading: false,
+      error: '',
+      isUntitled: true,
+    };
+    setEditorTabs((current) => [...current, newTab]);
+    setActiveEditorTabId(id);
+    setShowEditor(true);
+    setStatusMessage(`已新建空白文件：${name}`);
+  }
+
   async function openFileInEditor(file: ResourceFile) {
     // If already open, just focus it.  Must match both path AND the
     // originating session (terminalId) so that the same filename on
@@ -2698,9 +2721,6 @@ export function App() {
       if (activeEditorTabId === id) {
         setActiveEditorTabId(next.length > 0 ? next[next.length - 1].id : null);
       }
-      if (next.length === 0) {
-        setShowEditor(false);
-      }
       return next;
     });
   }
@@ -2714,6 +2734,10 @@ export function App() {
   async function saveEditorFile(id: string) {
     const tab = editorTabs.find((t) => t.id === id);
     if (!tab || tab.content === tab.originalContent) return;
+    if (tab.isUntitled) {
+      setStatusMessage('未命名文件需要先选择保存路径');
+      return;
+    }
     const generation = (editorSaveGenerationRef.current.get(id) ?? 0) + 1;
     editorSaveGenerationRef.current.set(id, generation);
     try {
@@ -7598,13 +7622,14 @@ export function App() {
           )}
 
           <div className="workspace-body">
-            {activeTab?.kind === 'terminal' && (showEditor || editorTabs.length > 0) && (
+            {activeTab && (showEditor || editorTabs.length > 0) && (
               <div className="workspace-view-toggle">
                 <button
                   className={!showEditor ? 'active' : ''}
                   onClick={() => setShowEditor(false)}
                 >
-                  <TerminalSquare size={14} /> 终端
+                  {activeTab.kind === 'terminal' ? <TerminalSquare size={14} /> : <FolderOpen size={14} />}
+                  {activeTab.kind === 'terminal' ? '终端' : '资源'}
                 </button>
                 <button
                   className={showEditor ? 'active' : ''}
@@ -7615,7 +7640,7 @@ export function App() {
                 </button>
               </div>
             )}
-            {showEditor && editorTabs.length > 0 ? (
+            {showEditor ? (
               <EditorPanel
                 tabs={editorTabs}
                 activeTabId={activeEditorTabId}
@@ -7623,6 +7648,7 @@ export function App() {
                 onCloseTab={closeEditorTab}
                 onSave={saveEditorFile}
                 onContentChange={updateEditorContent}
+                onCreateUntitled={createUntitledEditorTab}
               />
             ) : !activeTab ? (
               <div className="empty-workspace">

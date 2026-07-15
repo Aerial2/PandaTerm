@@ -17,10 +17,12 @@ export async function openConnectionWindow(mode: 'manage' | 'create') {
   const label = mode === 'create' ? 'connection-create' : 'connection-panel';
   const payload = { mode, target: label };
 
-  // If the window already exists, focus it and send mode event
+  // A rapid repeated click can reach this branch while the first window is
+  // still being created. Reuse that instance instead of creating duplicates.
   const existing = await WebviewWindow.getByLabel(label);
   if (existing) {
     await existing.emit('connection-window-set-mode', payload);
+    await existing.show();
     await existing.setFocus();
     return;
   }
@@ -35,9 +37,11 @@ export async function openConnectionWindow(mode: 'manage' | 'create') {
   let windowPosition: { x: number; y: number } | { center: true };
   try {
     const parent = getCurrentWebviewWindow();
-    const scale = await parent.scaleFactor();
-    const parentPos = await parent.outerPosition();
-    const parentSize = await parent.outerSize();
+    const [scale, parentPos, parentSize] = await Promise.all([
+      parent.scaleFactor(),
+      parent.outerPosition(),
+      parent.outerSize(),
+    ]);
     const logicalX = parentPos.x / scale;
     const logicalY = parentPos.y / scale;
     const logicalW = parentSize.width / scale;
@@ -51,12 +55,13 @@ export async function openConnectionWindow(mode: 'manage' | 'create') {
   }
 
   // Create new window
+  const connectionMode = `connectionMode=${mode}`;
   const devUrl = import.meta.env.DEV
-    ? `http://localhost:1420?mode=connection`
+    ? `http://localhost:1420?mode=connection&${connectionMode}`
     : undefined;
   const entry = import.meta.env.DEV
     ? undefined
-    : `index.html?mode=connection`;
+    : `index.html?mode=connection&${connectionMode}`;
 
   const webviewWindow = new WebviewWindow(label, {
     url: devUrl ?? entry!,
@@ -67,11 +72,6 @@ export async function openConnectionWindow(mode: 'manage' | 'create') {
     decorations: false,
     transparent: false,
     visible: false,
-  });
-
-  // Wait for window to be created then send mode
-  await webviewWindow.once('tauri://created', async () => {
-    await webviewWindow.emit('connection-window-set-mode', payload);
   });
 
   webviewWindow.once('tauri://error', (e) => {
