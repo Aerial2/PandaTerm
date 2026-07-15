@@ -21,6 +21,7 @@ export type AiTerminalAction = {
   truncated?: boolean;
   error?: string;
   continued?: boolean;
+  toolCallId?: string;
   createdAt: string;
 };
 
@@ -38,6 +39,7 @@ export type ParsedAiTerminalResponse = {
     contextSource: string;
     command: string;
     timeoutMs: number;
+    toolCallId?: string;
   }>;
   errors: string[];
 };

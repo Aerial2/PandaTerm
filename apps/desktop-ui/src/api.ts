@@ -293,11 +293,65 @@ export type AiStoredContext = {
   source?: string | null;
 };
 
+export type AiStoredEditAction = {
+  kind: 'edit';
+  id: string;
+  summary: string;
+  target_source: string;
+  target_label: string;
+  status: 'proposed' | 'reading' | 'ready' | 'applying' | 'applied' | 'rejected' | 'stale' | 'error';
+  edits: Array<{ search: string; replace: string }>;
+  is_remote: boolean;
+  terminal_id?: string | null;
+  error?: string | null;
+  continued: boolean;
+  created_at: string;
+};
+
+export type AiStoredTerminalAction = {
+  kind: 'terminal';
+  id: string;
+  summary: string;
+  context_source: string;
+  context_label: string;
+  command: string;
+  timeout_ms: number;
+  status: 'proposed' | 'running' | 'completed' | 'rejected' | 'timeout' | 'error';
+  is_remote: boolean;
+  terminal_id: string;
+  output?: string | null;
+  exit_code?: number | null;
+  truncated: boolean;
+  error?: string | null;
+  continued: boolean;
+  tool_call_id?: string | null;
+  created_at: string;
+};
+
+export type AiStoredMcpAction = {
+  kind: 'mcp';
+  id: string;
+  summary: string;
+  server_id: string;
+  tool_name: string;
+  arguments: Record<string, unknown>;
+  status: 'proposed' | 'running' | 'completed' | 'rejected' | 'error';
+  content?: string | null;
+  is_error: boolean;
+  error?: string | null;
+  continued: boolean;
+  tool_call_id?: string | null;
+  created_at: string;
+};
+
+export type AiStoredAction = AiStoredEditAction | AiStoredTerminalAction | AiStoredMcpAction;
+
 export type AiStoredMessage = {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   contexts: AiStoredContext[];
+  actions?: AiStoredAction[];
   created_at: string;
   status: 'complete' | 'cancelled' | 'error';
 };

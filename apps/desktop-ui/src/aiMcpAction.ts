@@ -16,6 +16,7 @@ export type AiMcpAction = {
   isError?: boolean;
   error?: string;
   continued?: boolean;
+  toolCallId?: string;
   createdAt: string;
 };
 
@@ -33,6 +34,7 @@ export type ParsedAiMcpResponse = {
     serverId: string;
     toolName: string;
     arguments: Record<string, unknown>;
+    toolCallId?: string;
   }>;
   errors: string[];
 };

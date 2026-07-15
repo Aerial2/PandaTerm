@@ -149,7 +149,7 @@ const DEFAULT_AI_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_AI_REASONING_EFFORT: &str = "none";
 const MAX_AI_MESSAGES: usize = 100;
 const MAX_AI_MESSAGE_CHARS: usize = 32_000;
-const MAX_AI_TOTAL_CHARS: usize = 128_000;
+const MAX_AI_TOTAL_CHARS: usize = 200_000;
 
 fn default_ai_reasoning_effort() -> String {
     DEFAULT_AI_REASONING_EFFORT.to_string()
@@ -224,7 +224,7 @@ struct SyncAiModelsRequest {
     api_key: Option<String>,
 }
 
-const AI_CONVERSATION_VERSION: u8 = 1;
+const AI_CONVERSATION_VERSION: u8 = 2;
 const AI_CHAT_STREAM_EVENT: &str = "ai-chat-stream";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,8 +263,73 @@ struct AiStoredMessage {
     role: String,
     content: String,
     contexts: Vec<AiStoredContext>,
+    #[serde(default)]
+    actions: Vec<AiStoredAction>,
     created_at: String,
     status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum AiStoredAction {
+    Edit {
+        id: String,
+        summary: String,
+        target_source: String,
+        target_label: String,
+        status: String,
+        edits: Vec<AiStoredEditOperation>,
+        #[serde(default)]
+        is_remote: bool,
+        terminal_id: Option<String>,
+        error: Option<String>,
+        #[serde(default)]
+        continued: bool,
+        created_at: String,
+    },
+    Terminal {
+        id: String,
+        summary: String,
+        context_source: String,
+        context_label: String,
+        command: String,
+        timeout_ms: u64,
+        status: String,
+        is_remote: bool,
+        terminal_id: String,
+        output: Option<String>,
+        exit_code: Option<i32>,
+        #[serde(default)]
+        truncated: bool,
+        error: Option<String>,
+        #[serde(default)]
+        continued: bool,
+        tool_call_id: Option<String>,
+        created_at: String,
+    },
+    Mcp {
+        id: String,
+        summary: String,
+        server_id: String,
+        tool_name: String,
+        #[serde(default)]
+        arguments: Value,
+        status: String,
+        content: Option<String>,
+        #[serde(default)]
+        is_error: bool,
+        error: Option<String>,
+        #[serde(default)]
+        continued: bool,
+        tool_call_id: Option<String>,
+        created_at: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiStoredEditOperation {
+    search: String,
+    replace: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -677,9 +742,11 @@ fn load_ai_conversations() -> Result<AiConversationStore, String> {
         }
         Err(error) => return Err(format!("AI 会话记录读取失败：{error}")),
     };
-    let store: AiConversationStore = serde_json::from_str(&content)
+    let mut store: AiConversationStore = serde_json::from_str(&content)
         .map_err(|error| format!("AI 会话记录已损坏，已拒绝覆盖原文件：{error}"))?;
-    if store.version != AI_CONVERSATION_VERSION {
+    if store.version == 1 {
+        store.version = AI_CONVERSATION_VERSION;
+    } else if store.version != AI_CONVERSATION_VERSION {
         return Err(format!("不支持的 AI 会话记录版本：{}", store.version));
     }
     Ok(store)
@@ -5628,6 +5695,132 @@ async fn ai_chat(
     })
 }
 
+fn validate_ai_stored_action(action: &AiStoredAction) -> Result<usize, String> {
+    let serialized = serde_json::to_string(action)
+        .map_err(|error| format!("AI 动作记录序列化失败：{error}"))?;
+    let chars = serialized.chars().count();
+    if chars > 256_000 {
+        return Err("单个 AI 动作记录不能超过 256000 个字符".to_string());
+    }
+
+    match action {
+        AiStoredAction::Edit {
+            id,
+            summary,
+            target_source,
+            target_label,
+            status,
+            edits,
+            terminal_id,
+            created_at,
+            ..
+        } => {
+            if id.is_empty()
+                || id.len() > 100
+                || summary.trim().is_empty()
+                || summary.chars().count() > 500
+                || target_source.trim().is_empty()
+                || target_source.chars().count() > 1_024
+                || target_label.chars().count() > 260
+                || !matches!(
+                    status.as_str(),
+                    "proposed"
+                        | "reading"
+                        | "ready"
+                        | "applying"
+                        | "applied"
+                        | "rejected"
+                        | "stale"
+                        | "error"
+                )
+                || edits.is_empty()
+                || edits.len() > 20
+                || edits.iter().any(|edit| {
+                    edit.search.is_empty()
+                        || edit.search.chars().count() > 100_000
+                        || edit.replace.chars().count() > 100_000
+                })
+                || terminal_id
+                    .as_ref()
+                    .is_some_and(|terminal_id| terminal_id.len() > 100)
+                || created_at.len() > 64
+            {
+                return Err("AI 文件修改动作记录无效".to_string());
+            }
+        }
+        AiStoredAction::Terminal {
+            id,
+            summary,
+            context_source,
+            context_label,
+            command,
+            timeout_ms,
+            status,
+            terminal_id,
+            tool_call_id,
+            created_at,
+            ..
+        } => {
+            if id.is_empty()
+                || id.len() > 100
+                || summary.trim().is_empty()
+                || summary.chars().count() > 500
+                || context_source.trim().is_empty()
+                || context_source.chars().count() > 1_024
+                || context_label.chars().count() > 260
+                || command.trim().is_empty()
+                || command.chars().count() > 4_000
+                || !(3_000..=30_000).contains(timeout_ms)
+                || !matches!(
+                    status.as_str(),
+                    "proposed" | "running" | "completed" | "rejected" | "timeout" | "error"
+                )
+                || terminal_id.is_empty()
+                || terminal_id.len() > 100
+                || tool_call_id
+                    .as_ref()
+                    .is_some_and(|tool_call_id| tool_call_id.len() > 200)
+                || created_at.len() > 64
+            {
+                return Err("AI 终端动作记录无效".to_string());
+            }
+        }
+        AiStoredAction::Mcp {
+            id,
+            summary,
+            server_id,
+            tool_name,
+            arguments,
+            status,
+            tool_call_id,
+            created_at,
+            ..
+        } => {
+            if id.is_empty()
+                || id.len() > 100
+                || summary.trim().is_empty()
+                || summary.chars().count() > 500
+                || server_id.trim().is_empty()
+                || server_id.chars().count() > 200
+                || tool_name.trim().is_empty()
+                || tool_name.chars().count() > 200
+                || !arguments.is_object()
+                || !matches!(
+                    status.as_str(),
+                    "proposed" | "running" | "completed" | "rejected" | "error"
+                )
+                || tool_call_id
+                    .as_ref()
+                    .is_some_and(|tool_call_id| tool_call_id.len() > 200)
+                || created_at.len() > 64
+            {
+                return Err("AI MCP 动作记录无效".to_string());
+            }
+        }
+    }
+    Ok(chars)
+}
+
 fn validate_ai_conversation(conversation: &AiConversation) -> Result<(), String> {
     Uuid::parse_str(&conversation.id).map_err(|_| "AI 会话 ID 无效".to_string())?;
     let title = conversation.title.trim();
@@ -5663,11 +5856,22 @@ fn validate_ai_conversation(conversation: &AiConversation) -> Result<(), String>
         {
             return Err("AI 会话上下文引用过多或无效".to_string());
         }
+        if message.actions.len() > 20 {
+            return Err("单条 AI 会话消息最多保存 20 个动作".to_string());
+        }
+        let action_chars = message.actions.iter().try_fold(0usize, |total, action| {
+            validate_ai_stored_action(action).map(|chars| total.saturating_add(chars))
+        })?;
+        if action_chars > 512_000 {
+            return Err("单条 AI 会话消息的动作记录不能超过 512000 个字符".to_string());
+        }
         let chars = message.content.chars().count();
         if chars > 64_000 {
             return Err("单条 AI 会话消息不能超过 64000 个字符".to_string());
         }
-        total_chars = total_chars.saturating_add(chars);
+        total_chars = total_chars
+            .saturating_add(chars)
+            .saturating_add(action_chars);
     }
     if total_chars > 2_000_000 {
         return Err("单个 AI 会话内容不能超过 2000000 个字符".to_string());
@@ -6852,11 +7056,19 @@ mod tests {
             "title":"legacy",
             "created_at":"2026-01-01T00:00:00Z",
             "updated_at":"2026-01-01T00:00:00Z",
-            "messages":[]
+            "messages":[{
+                "id":"message-1",
+                "role":"assistant",
+                "content":"legacy message",
+                "contexts":[],
+                "created_at":"2026-01-01T00:00:00Z",
+                "status":"complete"
+            }]
         }"#;
         let mut conversation: AiConversation =
             serde_json::from_str(legacy).expect("deserialize legacy conversation");
         assert_eq!(conversation.mode, "ask");
+        assert!(conversation.messages[0].actions.is_empty());
         validate_ai_conversation(&conversation).expect("validate default ask mode");
 
         conversation.mode = "automatic".to_string();
