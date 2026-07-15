@@ -824,8 +824,11 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+/* 助手完成态正文：比用户气泡略大，便于阅读长回复 */
 .ai-message.assistant .ai-message-content {
-  color: var(--text-secondary);
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.7;
 }
 
 .ai-message-contexts {

@@ -113,7 +113,12 @@ import {
   terminalWrite,
   openConnectionWindow,
 } from './api';
-import type { AiChatMessage, AiChatStreamEvent, AiConversation, AiProviderConfig, AiStoredMessage, LocalDirectoryEntry, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, SystemMonitorData } from './api';
+import type { AiChatMessage, AiChatStreamEvent, AiConversation, AiProviderConfig, AiStoredMessage, LocalDirectoryEntry, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, TerminalStatusEvent, SystemMonitorData } from './api';
+import {
+  applyTerminalLifecycleState,
+  shouldApplyTerminalStatus,
+  terminalLifecycleMessage,
+} from './terminalLifecycle';
 import {
   prepareTerminalPaste,
   formatTerminalPasteSize,
@@ -568,9 +573,10 @@ function isAiConfigDraftDirty(
     use_api_key: boolean;
   },
   apiKeyDraft: string,
+  apiKeyBaseline: string,
   saved: AiProviderConfig | null,
 ): boolean {
-  if (apiKeyDraft.trim().length > 0) return true;
+  if (apiKeyDraft !== apiKeyBaseline) return true;
   if (!saved) return true;
   const draftCatalog = resolveAiModelCatalog(draft);
   const savedCatalog = resolveAiModelCatalog(saved);
@@ -932,47 +938,6 @@ type TerminalSizeSnapshot = {
   rows: number;
 };
 
-const REMOTE_READY_MARKER = '__PANDATERM_REMOTE_READY__';
-
-function isRemoteSessionReadyOutput(payload: string) {
-  const normalized = payload.toLowerCase();
-  return payload.includes(REMOTE_READY_MARKER)
-    || normalized.includes('ssh shell started')
-    || normalized.includes('last login')
-    || normalized.includes('welcome')
-    || normalized.includes('microsoft')
-    || normalized.includes('ubuntu')
-    || /[$#>]\s*$/.test(payload.trimEnd());
-}
-
-function stripRemoteReadyMarker(payload: string) {
-  return payload
-    .split(/\r?\n/)
-    .filter((line) => !line.includes(REMOTE_READY_MARKER))
-    .join('\r\n');
-}
-
-function isRemoteSessionFailureOutput(payload: string) {
-  const normalized = payload.toLowerCase();
-  return normalized.includes('permission denied')
-    || normalized.includes('connection timed out')
-    || normalized.includes('connection refused')
-    || normalized.includes('no route to host')
-    || normalized.includes('could not resolve hostname')
-    || normalized.includes('[pandaterm ssh] failed')
-    || normalized.includes('ssh tcp 连接失败')
-    || normalized.includes('ssh 握手失败')
-    || normalized.includes('ssh 认证失败')
-    || normalized.includes('ssh shell 启动失败')
-    || normalized.includes('ssh 通道创建失败');
-}
-
-function isRemoteSessionDisconnectedOutput(payload: string) {
-  const normalized = payload.toLowerCase();
-  return normalized.includes('连接已关闭')
-    || normalized.includes('disconnected');
-}
-
 function createDefaultTerminalLayout(tabId: string): TerminalLayoutNode {
   return { type: 'leaf', tabId, tabIds: [tabId] };
 }
@@ -1190,6 +1155,7 @@ export function App() {
   const [isAiApiKeyVisible, setIsAiApiKeyVisible] = useState(false);
   /** 设置弹窗内 API Key 草稿（可回填展示；关闭后清空） */
   const [aiApiKeyDraft, setAiApiKeyDraft] = useState('');
+  const aiApiKeyBaselineRef = useRef('');
   const aiApiKeyInputRef = useRef<HTMLInputElement | null>(null);
   const isAiSettingsOpenRef = useRef(false);
   isAiSettingsOpenRef.current = isAiSettingsOpen;
@@ -1324,6 +1290,7 @@ export function App() {
     if (isAiSettingsOpen) return;
     setIsAiApiKeyVisible(false);
     setAiApiKeyDraft('');
+    aiApiKeyBaselineRef.current = '';
     setAiModelListQuery('');
     setMcpServerListQuery('');
     setMcpImportOpen(false);
@@ -1426,6 +1393,7 @@ export function App() {
   // Bridges the gap between PTY output arriving and setTabs flushing the real terminalId.
   const terminalIdToTabIdRef = useRef<Map<string, string>>(new Map());
   const pendingOutputRef = useRef<Map<string, string[]>>(new Map());
+  const pendingTerminalStatusRef = useRef<Map<string, TerminalStatusEvent>>(new Map());
   const retiredTerminalIdsRef = useRef<Set<string>>(new Set());
   const currentPathRef = useRef('');
   const resourceFilesRef = useRef<ResourceFile[]>([]);
@@ -1558,63 +1526,52 @@ export function App() {
     };
   }
 
-  function consumePendingRemoteOutput(terminalId: string, tabId: string, session: Session) {
-    const pendingRawPayloads = pendingOutputRef.current.get(terminalId);
-    if (!pendingRawPayloads || pendingRawPayloads.length === 0) return false;
+  function consumePendingTerminalOutput(terminalId: string, tabId: string) {
+    const pendingPayloads = pendingOutputRef.current.get(terminalId);
+    if (!pendingPayloads || pendingPayloads.length === 0) return;
     pendingOutputRef.current.delete(terminalId);
 
-    const displayPayloads = pendingRawPayloads
-      .map(stripRemoteReadyMarker)
-      .filter((payload) => payload.length > 0);
-    const hasFailure = pendingRawPayloads.some(isRemoteSessionFailureOutput);
-    const hasDisconnected = pendingRawPayloads.some(isRemoteSessionDisconnectedOutput);
-    const hasReady = pendingRawPayloads.some(isRemoteSessionReadyOutput);
-    const nextStatus = hasFailure
-      ? 'failed'
-      : hasDisconnected
-        ? 'disconnected'
-        : hasReady
-          ? 'connected'
-          : null;
-    const nextStatusMessage = nextStatus === 'connected'
-      ? '已连接'
-      : nextStatus === 'failed'
-        ? '连接失败'
-        : nextStatus === 'disconnected'
-          ? '已断开'
-          : null;
+    setTabs((current) => current.map((item) => item.id === tabId
+      ? { ...item, output: [...item.output, ...pendingPayloads].slice(-500) }
+      : item));
+
+    const term = terminalsRef.current.get(tabId);
+    for (const payload of pendingPayloads) {
+      term?.write(payload);
+    }
+  }
+
+  function applyTerminalStatusToTab(event: TerminalStatusEvent, tabId: string) {
+    const message = terminalLifecycleMessage(event);
+    const sessionName = tabsRef.current.find((item) => item.id === tabId)?.session.name
+      ?? event.transport;
 
     setTabs((current) => current.map((item) => {
       if (item.id !== tabId) return item;
+      const nextStatus = applyTerminalLifecycleState(item.status, event.state);
+      if (nextStatus === item.status && item.statusMessage === message) return item;
       return {
         ...item,
-        terminalId,
-        status: nextStatus ?? item.status,
-        statusMessage: nextStatusMessage ?? item.statusMessage,
-        activityLog: nextStatusMessage
-          ? [...item.activityLog, createActivity(nextStatus === 'failed' ? 'error' : 'info', nextStatusMessage)].slice(-20)
-          : item.activityLog,
-        output: displayPayloads.length > 0
-          ? [...item.output, ...displayPayloads].slice(-500)
-          : item.output,
+        terminalId: item.terminalId || event.terminal_id,
+        status: nextStatus,
+        statusMessage: message,
+        activityLog: [
+          ...item.activityLog,
+          createActivity(event.state === 'failed' ? 'error' : 'info', message),
+        ].slice(-20),
       };
     }));
 
-    const term = terminalsRef.current.get(tabId);
-    for (const payload of displayPayloads) {
-      term?.write(payload);
-    }
+    setOpeningConnection((current) => current?.tabId === tabId ? null : current);
+    setStatusMessage(`${event.state === 'failed' ? '连接失败' : message}：${sessionName}`);
+  }
 
-    if (nextStatus) {
-      setOpeningConnection(null);
-      setStatusMessage(nextStatus === 'failed'
-        ? `连接失败：${session.name}`
-        : nextStatus === 'disconnected'
-          ? `已断开：${session.name}`
-          : `已连接：${session.name}`);
-    }
-
-    return Boolean(nextStatus);
+  function consumePendingTerminalStatus(terminalId: string, tabId: string) {
+    const pendingStatus = pendingTerminalStatusRef.current.get(terminalId);
+    if (!pendingStatus) return false;
+    pendingTerminalStatusRef.current.delete(terminalId);
+    applyTerminalStatusToTab(pendingStatus, tabId);
+    return true;
   }
 
   function addLogEntry(level: LogEntry['level'], text: string) {
@@ -1712,6 +1669,7 @@ export function App() {
       if (oldestTerminalId) retiredTerminalIdsRef.current.delete(oldestTerminalId);
     }
     pendingOutputRef.current.delete(terminalId);
+    pendingTerminalStatusRef.current.delete(terminalId);
   }
 
   function disposeTerminalRuntime(tab: WorkspaceTab) {
@@ -2099,7 +2057,7 @@ export function App() {
   async function closeTab(tab: WorkspaceTab) {
     const relatedTabIds = [tab.id, ...tabs.filter((item) => item.parentTabId === tab.id).map((item) => item.id)];
     for (const relatedTab of tabs.filter((item) => relatedTabIds.includes(item.id))) {
-      if (relatedTab.kind === 'terminal' && relatedTab.status === 'connecting' && !relatedTab.terminalId) {
+      if (relatedTab.kind === 'terminal' && relatedTab.status === 'connecting') {
         cancelledConnectionTabIdsRef.current.add(relatedTab.id);
       }
       disposeTerminalRuntime({ ...relatedTab, closedByUser: true, status: 'closed' });
@@ -2166,34 +2124,23 @@ export function App() {
     setStatusMessage(`已添加到当前 pane：${session.name}`);
 
     if (session.id !== localSession.id) {
+      const terminalId = crypto.randomUUID();
+      terminalIdToTabIdRef.current.set(terminalId, nextTab.id);
+      setTabs((current) => current.map((item) => item.id === nextTab.id
+        ? { ...item, terminalId }
+        : item));
       try {
         setOpeningConnection({ session, tabId: nextTab.id, startedAt: Date.now(), seconds: 0 });
-        const event = await connectSession(session.id);
-        const terminalId = event.session_id;
+        await connectSession(session.id, terminalId);
         if (cancelledConnectionTabIdsRef.current.delete(nextTab.id)) {
           retireTerminalId(terminalId);
           await disconnectSession(terminalId).catch(() => {});
           setOpeningConnection(null);
           return;
         }
-        setTabs((current) =>
-          current.map((item) =>
-            item.id === nextTab.id
-              ? {
-                  ...item,
-                  terminalId,
-                  statusMessage: '等待远程 shell 输出...',
-                  activityLog: [...item.activityLog, createActivity('info', 'SSH 已建立，等待远程 shell 输出')].slice(-20),
-                }
-              : item,
-          ),
-        );
-        const consumedPendingStatus = consumePendingRemoteOutput(terminalId, nextTab.id, session);
-        setOpeningConnection(null);
+        consumePendingTerminalOutput(terminalId, nextTab.id);
+        consumePendingTerminalStatus(terminalId, nextTab.id);
         scheduleTerminalSettledFit(nextTab.id);
-        if (!consumedPendingStatus) {
-          setStatusMessage(`SSH 已建立，等待远程终端输出：${session.name}`);
-        }
       } catch (error) {
         if (cancelledConnectionTabIdsRef.current.delete(nextTab.id)) {
           setOpeningConnection(null);
@@ -2201,20 +2148,12 @@ export function App() {
         }
         const message = error instanceof Error ? error.message : String(error);
         setOpeningConnection(null);
-        setTabs((current) =>
-          current.map((item) =>
-            item.id === nextTab.id
-              ? {
-                  ...item,
-                  status: 'failed',
-                  statusMessage: message,
-                  output: [...item.output, `\r\n${message}\r\n`],
-                  activityLog: [...item.activityLog, createActivity('error', message)].slice(-20),
-                }
-              : item,
-          ),
-        );
-        setStatusMessage(`连接失败：${message}`);
+        applyTerminalStatusToTab({
+          terminal_id: terminalId,
+          transport: 'remote',
+          state: 'failed',
+          reason: message,
+        }, nextTab.id);
       }
     }
 
@@ -2243,7 +2182,7 @@ export function App() {
 
     const paneTab = tabsRef.current.find((item) => item.id === paneId);
     if (paneTab) {
-      if (paneTab.status === 'connecting' && !paneTab.terminalId) {
+      if (paneTab.status === 'connecting') {
         cancelledConnectionTabIdsRef.current.add(paneTab.id);
       }
       disposeTerminalRuntime({ ...paneTab, closedByUser: true, status: 'closed' });
@@ -2259,9 +2198,11 @@ export function App() {
   }
 
   async function openRemoteTerminal(session: Session) {
-    const nextTab = createTerminalTab(session, '正在建立 SSH 连接...');
+    const terminalId = crypto.randomUUID();
+    const nextTab = { ...createTerminalTab(session, '正在建立 SSH 连接...'), terminalId };
     const tabId = nextTab.id;
 
+    terminalIdToTabIdRef.current.set(terminalId, tabId);
     activeTabRef.current = nextTab;
     activeTabIdRef.current = tabId;
     setOpeningConnection({ session, tabId, startedAt: Date.now(), seconds: 0 });
@@ -2269,33 +2210,16 @@ export function App() {
     setActiveTabId(tabId);
     setStatusMessage(`正在连接：${session.username}@${session.host}:${session.port}`);
     try {
-      const event = await connectSession(session.id);
-      // The backend returns a terminal_id in event.session_id
-      const terminalId = event.session_id;
+      await connectSession(session.id, terminalId);
       if (cancelledConnectionTabIdsRef.current.delete(tabId)) {
         retireTerminalId(terminalId);
         await disconnectSession(terminalId).catch(() => {});
         setOpeningConnection(null);
         return;
       }
-      setTabs((current) =>
-        current.map((item) =>
-          item.id === tabId
-            ? {
-                ...item,
-                terminalId,
-                statusMessage: '等待远程 shell 输出...',
-                activityLog: [...item.activityLog, createActivity('info', 'SSH 已建立，等待远程 shell 输出')].slice(-20),
-              }
-            : item,
-        ),
-      );
-      const consumedPendingStatus = consumePendingRemoteOutput(terminalId, tabId, session);
-      setOpeningConnection(null);
+      consumePendingTerminalOutput(terminalId, tabId);
+      consumePendingTerminalStatus(terminalId, tabId);
       scheduleTerminalSettledFit(tabId);
-      if (!consumedPendingStatus) {
-        setStatusMessage(`SSH 已建立，等待远程终端输出：${session.name}`);
-      }
     } catch (error) {
       if (cancelledConnectionTabIdsRef.current.delete(tabId)) {
         setOpeningConnection(null);
@@ -2303,20 +2227,12 @@ export function App() {
       }
       const message = error instanceof Error ? error.message : String(error);
       setOpeningConnection(null);
-      setTabs((current) =>
-        current.map((item) =>
-          item.id === tabId
-            ? {
-                ...item,
-                status: 'failed',
-                statusMessage: message,
-                output: [...item.output, `\r\n${message}\r\n`],
-                activityLog: [...item.activityLog, createActivity('error', message)].slice(-20),
-              }
-            : item,
-        ),
-      );
-      setStatusMessage(`连接失败：${message}`);
+      applyTerminalStatusToTab({
+        terminal_id: terminalId,
+        transport: 'remote',
+        state: 'failed',
+        reason: message,
+      }, tabId);
     }
   }
 
@@ -2384,86 +2300,69 @@ export function App() {
       if (!isActive) return;
       const terminalId = event.payload.terminal_id;
       if (retiredTerminalIdsRef.current.has(terminalId)) return;
-      const rawPayload = event.payload.payload;
-      const displayPayload = stripRemoteReadyMarker(rawPayload);
+      const payload = event.payload.payload;
+      if (!payload) return;
 
-      // Find the tab that owns this terminal_id.
-      // Try tabsRef first (fast path), then fall back to terminalIdToTabIdRef
-      // which covers the race where PTY output arrives before setTabs
-      // flushes the real terminalId (local terminal startup).
-      let targetTab = tabsRef.current.find((t) => t.terminalId === terminalId);
+      let targetTab = tabsRef.current.find((tab) => tab.terminalId === terminalId);
       if (!targetTab) {
         const fallbackTabId = terminalIdToTabIdRef.current.get(terminalId);
-        if (fallbackTabId) targetTab = tabsRef.current.find((t) => t.id === fallbackTabId);
+        if (fallbackTabId) targetTab = tabsRef.current.find((tab) => tab.id === fallbackTabId);
       }
 
-      // If no tab is mapped yet (race: PTY output arrived before startLocalTerminal resolved),
-      // buffer the output so it can be flushed once the mapping is registered.
-      if (!targetTab && rawPayload) {
+      if (!targetTab) {
         const pending = pendingOutputRef.current.get(terminalId);
         if (pending) {
-          pending.push(rawPayload);
+          pending.push(payload);
         } else {
-          pendingOutputRef.current.set(terminalId, [rawPayload]);
+          pendingOutputRef.current.set(terminalId, [payload]);
         }
         return;
       }
 
-      setTabs((current) => {
-        return current.map((item) => {
-          const isMatch = item.terminalId === terminalId ||
-            (targetTab && item.id === targetTab.id && !item.terminalId);
-          if (!isMatch) return item;
-          const itemNextStatus = isRemoteSessionFailureOutput(rawPayload)
-            ? 'failed'
-            : isRemoteSessionDisconnectedOutput(rawPayload) && item.status === 'connected'
-              ? 'disconnected'
-              : item.status === 'connecting' && isRemoteSessionReadyOutput(rawPayload)
-                ? 'connected'
-                : item.status;
-          const nextStatusMessage = itemNextStatus === 'connected'
-            ? '已连接'
-            : itemNextStatus === 'failed'
-              ? '连接失败'
-              : itemNextStatus === 'disconnected'
-                ? '已断开'
-                : item.statusMessage;
-          const nextActivity = itemNextStatus !== item.status
-            ? [
-                ...item.activityLog,
-                createActivity(itemNextStatus === 'failed' ? 'error' : 'info', nextStatusMessage || itemNextStatus),
-              ].slice(-20)
-            : item.activityLog;
-          return {
+      setTabs((current) => current.map((item) => item.id === targetTab?.id
+        ? {
             ...item,
             terminalId: item.terminalId || terminalId,
-            status: itemNextStatus,
-            statusMessage: nextStatusMessage,
-            activityLog: nextActivity,
-            output: displayPayload ? [...item.output, displayPayload].slice(-500) : item.output,
-          };
-        });
-      });
+            output: [...item.output, payload].slice(-500),
+          }
+        : item));
 
-      // Write to the corresponding xterm instance (if it exists)
-      if (targetTab && displayPayload) {
-        const term = terminalsRef.current.get(targetTab.id);
-        term?.write(displayPayload);
+      terminalsRef.current.get(targetTab.id)?.write(payload);
+    }).then((unlisten) => {
+      if (!isActive) {
+        unlisten();
+      } else {
+        unlistenFn = unlisten;
+      }
+    });
+
+    return () => {
+      isActive = false;
+      unlistenFn?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlistenFn: (() => void) | null = null;
+    let isActive = true;
+
+    void listen<TerminalStatusEvent>('terminal-status', (event) => {
+      if (!isActive) return;
+      const status = event.payload;
+      if (!shouldApplyTerminalStatus(status, retiredTerminalIdsRef.current)) return;
+
+      let targetTab = tabsRef.current.find((tab) => tab.terminalId === status.terminal_id);
+      if (!targetTab) {
+        const fallbackTabId = terminalIdToTabIdRef.current.get(status.terminal_id);
+        if (fallbackTabId) targetTab = tabsRef.current.find((tab) => tab.id === fallbackTabId);
       }
 
-      // Handle status transitions
-      if (isRemoteSessionReadyOutput(rawPayload) || isRemoteSessionFailureOutput(rawPayload) || isRemoteSessionDisconnectedOutput(rawPayload)) {
-        setOpeningConnection((current) =>
-          current && targetTab ? null : current,
-        );
-        if (targetTab) {
-          setStatusMessage(isRemoteSessionFailureOutput(rawPayload)
-            ? `连接失败：${targetTab.session.name}`
-            : isRemoteSessionDisconnectedOutput(rawPayload)
-              ? `已断开：${targetTab.session.name}`
-              : `已连接：${targetTab.session.name}`);
-        }
+      if (!targetTab) {
+        pendingTerminalStatusRef.current.set(status.terminal_id, status);
+        return;
       }
+
+      applyTerminalStatusToTab(status, targetTab.id);
     }).then((unlisten) => {
       if (!isActive) {
         unlisten();
@@ -2584,27 +2483,15 @@ export function App() {
               return;
             }
             terminalIdToTabIdRef.current.set(profile.terminal_id, terminalTab.id);
-            const pending = pendingOutputRef.current.get(profile.terminal_id);
-            if (pending) {
-              const term = terminalsRef.current.get(terminalTab.id);
-              for (const chunk of pending) {
-                term?.write(chunk);
-              }
-              pendingOutputRef.current.delete(profile.terminal_id);
-            }
             setTabs((current) =>
               current.map((item) =>
                 item.id === terminalTab.id
-                  ? {
-                      ...item,
-                      terminalId: profile.terminal_id,
-                      status: 'connected',
-                      statusMessage: '已连接',
-                      activityLog: [...item.activityLog, createActivity('info', '本地终端已连接')].slice(-20),
-                    }
+                  ? { ...item, terminalId: profile.terminal_id }
                   : item,
               ),
             );
+            consumePendingTerminalOutput(profile.terminal_id, terminalTab.id);
+            consumePendingTerminalStatus(profile.terminal_id, terminalTab.id);
             startedTerminalsRef.current.add(profile.terminal_id);
             scheduleTerminalSettledFit(terminalTab.id);
           }).catch((error) => {
@@ -4251,6 +4138,7 @@ export function App() {
       const shouldFillApiKey = Boolean(options?.fillApiKey || isAiSettingsOpenRef.current);
       if (shouldFillApiKey) {
         const revealed = config.api_key?.trim() ?? '';
+        aiApiKeyBaselineRef.current = revealed;
         setAiApiKeyDraft(revealed);
         if (config.api_key_configured && !revealed && !config.error) {
           setAiConfigError('已配置密钥，但当前进程未能解密回填。请完全重启 PandaTerm 后再打开设置。');
@@ -4286,6 +4174,8 @@ export function App() {
     setMcpServerListQuery('');
     setAiConfigError(aiProviderConfig?.error ?? '');
     setMcpError('');
+    aiApiKeyBaselineRef.current = '';
+    setAiApiKeyDraft('');
     setIsAiSettingsOpen(true);
     isAiSettingsOpenRef.current = true;
     // 打开时重新拉取，确保 vault 中的密钥可回填
@@ -4296,7 +4186,12 @@ export function App() {
   /** 关闭设置：Models/MCP 任一侧有未保存改动时确认 */
   function requestCloseAiSettings() {
     if (isAiConfigSaving || isAiModelsSyncing || isMcpSaving || mcpBusyServerId) return;
-    const modelsDirty = isAiConfigDraftDirty(aiConfigDraft, aiApiKeyDraft, aiProviderConfig);
+    const modelsDirty = isAiConfigDraftDirty(
+      aiConfigDraft,
+      aiApiKeyDraft,
+      aiApiKeyBaselineRef.current,
+      aiProviderConfig,
+    );
     const mcpDirty = isMcpServersDraftDirty(mcpServersDraft, mcpSnapshot);
     if (!modelsDirty && !mcpDirty) {
       setIsAiSettingsOpen(false);
@@ -4698,6 +4593,7 @@ export function App() {
         use_api_key: aiConfigDraft.use_api_key,
       }, apiKey);
       applyAiProviderConfigState(config);
+      aiApiKeyBaselineRef.current = '';
       setAiApiKeyDraft('');
       setIsAiApiKeyVisible(false);
     } catch (error) {
@@ -4745,7 +4641,11 @@ export function App() {
           model: next.model,
         };
       });
-      if (config.api_key) setAiApiKeyDraft(config.api_key);
+      if (config.api_key) {
+        const revealed = config.api_key.trim();
+        aiApiKeyBaselineRef.current = revealed;
+        setAiApiKeyDraft(revealed);
+      }
     } catch (error) {
       setAiConfigError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -8288,12 +8188,22 @@ export function App() {
                         || Boolean(aiProviderConfig?.error)
                         || !aiConfigDraft.base_url.trim()
                         || !aiConfigDraft.model.trim()
-                        || !isAiConfigDraftDirty(aiConfigDraft, aiApiKeyDraft, aiProviderConfig)
+                        || !isAiConfigDraftDirty(
+                          aiConfigDraft,
+                          aiApiKeyDraft,
+                          aiApiKeyBaselineRef.current,
+                          aiProviderConfig,
+                        )
                       }
                     >
                       {isAiConfigSaving
                         ? 'Saving…'
-                        : isAiConfigDraftDirty(aiConfigDraft, aiApiKeyDraft, aiProviderConfig)
+                        : isAiConfigDraftDirty(
+                            aiConfigDraft,
+                            aiApiKeyDraft,
+                            aiApiKeyBaselineRef.current,
+                            aiProviderConfig,
+                          )
                           ? 'Save'
                           : 'Saved'}
                     </button>

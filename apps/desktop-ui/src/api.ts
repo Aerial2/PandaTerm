@@ -152,6 +152,13 @@ export type TerminalOutputEvent = {
   payload: string;
 };
 
+export type TerminalStatusEvent = {
+  terminal_id: string;
+  transport: 'local' | 'remote';
+  state: 'connected' | 'failed' | 'disconnected';
+  reason?: string | null;
+};
+
 const fallbackLocalTerminalProfile: LocalTerminalProfile = {
   terminal_id: '',
   os: navigator.platform.toLowerCase().includes('mac') ? 'macos' : 'windows',
@@ -502,8 +509,8 @@ export async function reorderSessions(orderedIds: string[]): Promise<Session[]> 
   return await invoke<Session[]>('reorder_sessions', { orderedIds });
 }
 
-export async function connectSession(sessionId: string): Promise<TerminalEvent> {
-  return await invoke<TerminalEvent>('connect_session', { sessionId });
+export async function connectSession(sessionId: string, terminalId: string): Promise<TerminalEvent> {
+  return await invoke<TerminalEvent>('connect_session', { sessionId, terminalId });
 }
 
 export async function disconnectSession(terminalId: string): Promise<TerminalEvent> {

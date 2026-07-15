@@ -1,21 +1,30 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import App from './App';
-import { ConnectionWindow } from './ConnectionWindow';
 import './styles.css';
 
 const params = new URLSearchParams(window.location.search);
 const windowMode = params.get('mode');
+const root = ReactDOM.createRoot(document.getElementById('root') as HTMLElement);
 
-ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
-  <React.StrictMode>
-    {windowMode === 'connection' ? <ConnectionWindow /> : <App />}
-  </React.StrictMode>,
-);
+async function bootstrap() {
+  if (windowMode === 'connection') {
+    const { ConnectionWindow } = await import('./ConnectionWindow');
+    root.render(
+      <React.StrictMode>
+        <ConnectionWindow />
+      </React.StrictMode>,
+    );
+    return;
+  }
 
-// Show the main window after React renders to avoid white flash
-if (windowMode !== 'connection') {
-  // Use requestAnimationFrame to wait for the first render to complete
+  const { default: App } = await import('./App');
+  root.render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>,
+  );
+
+  // Wait for the first render so the main window does not flash white.
   requestAnimationFrame(() => {
     import('@tauri-apps/api/webviewWindow').then(({ getCurrentWebviewWindow }) => {
       const win = getCurrentWebviewWindow();
@@ -23,3 +32,5 @@ if (windowMode !== 'connection') {
     }).catch((e) => console.warn('Failed to show main window:', e));
   });
 }
+
+void bootstrap();

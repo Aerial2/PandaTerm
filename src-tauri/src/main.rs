@@ -514,18 +514,42 @@ const AI_TERMINAL_OUTPUT_LIMIT: usize = 64 * 1024;
 const AI_TERMINAL_MIN_TIMEOUT_MS: u64 = 3_000;
 const AI_TERMINAL_MAX_TIMEOUT_MS: u64 = 30_000;
 const TERMINAL_OUTPUT_EVENT: &str = "terminal-output";
+const TERMINAL_STATUS_EVENT: &str = "terminal-status";
 
-const REMOTE_TERMINAL_READY_MARKER: &str = "__PANDATERM_REMOTE_READY__";
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TerminalTransport {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TerminalLifecycleState {
+    Connected,
+    Failed,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TerminalStatusEvent {
+    terminal_id: String,
+    transport: TerminalTransport,
+    state: TerminalLifecycleState,
+    reason: Option<String>,
+}
 
 fn emit_remote_log(_app: &AppHandle, terminal_id: &str, message: impl AsRef<str>) {
     eprintln!("[SSH {}] {}", terminal_id, message.as_ref());
 }
 
 fn emit_remote_ready(app: &AppHandle, terminal_id: &str) {
-    emit_terminal_output(
+    emit_terminal_status(
         app,
-        terminal_id.to_string(),
-        format!("{REMOTE_TERMINAL_READY_MARKER}\r\n"),
+        terminal_id,
+        TerminalTransport::Remote,
+        TerminalLifecycleState::Connected,
+        None,
     );
 }
 
@@ -1578,6 +1602,8 @@ async fn spawn_russh_terminal(
     let task_handle = Arc::clone(&shared_handle);
 
     tokio::spawn(async move {
+        let mut close_state = TerminalLifecycleState::Disconnected;
+        let mut close_reason = None;
         loop {
             tokio::select! {
                 cmd = rx.recv() => {
@@ -1585,11 +1611,10 @@ async fn spawn_russh_terminal(
                         Some(RemoteTerminalCommand::Write(data)) => {
                             if !data.is_empty() {
                                 if let Err(error) = channel.data(data.as_bytes()).await {
-                                    emit_terminal_output(
-                                        &app,
-                                        terminal_id_clone.clone(),
-                                        format!("\r\n终端写入失败：{error}\r\n"),
-                                    );
+                                    let message = format!("终端写入失败：{error}");
+                                    emit_remote_log(&app, &terminal_id_clone, &message);
+                                    close_state = TerminalLifecycleState::Failed;
+                                    close_reason = Some(message);
                                     break;
                                 }
                             }
@@ -1635,7 +1660,13 @@ async fn spawn_russh_terminal(
         close_notification_clone.notify_one();
         let _ = channel.eof().await;
         let _ = channel.close().await;
-        emit_terminal_output(&app, terminal_id_clone, "\r\n连接已关闭\r\n".to_string());
+        emit_terminal_status(
+            &app,
+            terminal_id_clone,
+            TerminalTransport::Remote,
+            close_state,
+            close_reason,
+        );
         drop(task_handle);
     });
 
@@ -1827,6 +1858,39 @@ fn parse_remote_listing(text: &str) -> Result<LocalDirectoryListing, String> {
     })
 }
 
+fn local_terminal_exit_state(failure: Option<&str>) -> TerminalLifecycleState {
+    if failure.is_some() {
+        TerminalLifecycleState::Failed
+    } else {
+        TerminalLifecycleState::Disconnected
+    }
+}
+
+fn take_terminal_session<T>(
+    terminals: &mut HashMap<Uuid, T>,
+    terminal_id: Uuid,
+) -> Option<T> {
+    terminals.remove(&terminal_id)
+}
+
+fn emit_terminal_status(
+    app: &AppHandle,
+    terminal_id: impl Into<String>,
+    transport: TerminalTransport,
+    state: TerminalLifecycleState,
+    reason: Option<String>,
+) {
+    let event = TerminalStatusEvent {
+        terminal_id: terminal_id.into(),
+        transport,
+        state,
+        reason,
+    };
+    if let Err(error) = app.emit(TERMINAL_STATUS_EVENT, event) {
+        eprintln!("[Terminal] emit FAILED for terminal-status: {error}");
+    }
+}
+
 fn emit_terminal_output(app: &AppHandle, terminal_id: String, payload: String) {
     if payload.is_empty() {
         return;
@@ -1844,17 +1908,20 @@ fn emit_terminal_output(app: &AppHandle, terminal_id: String, payload: String) {
 
 fn spawn_terminal_reader(
     app: AppHandle,
-    session_id: String,
+    terminal_id: Uuid,
     mut reader: Box<dyn Read + Send>,
     writer: SharedWriter,
+    state: Arc<AppState>,
 ) {
-    eprintln!("[PTY] spawn_terminal_reader started for terminal_id={}", session_id);
+    let terminal_id_text = terminal_id.to_string();
+    eprintln!("[PTY] spawn_terminal_reader started for terminal_id={}", terminal_id_text);
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
+        let mut failure = None;
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => {
-                    eprintln!("[PTY] reader returned 0 (EOF) for terminal_id={}", session_id);
+                    eprintln!("[PTY] reader returned 0 (EOF) for terminal_id={}", terminal_id_text);
                     break;
                 }
                 Ok(size) => {
@@ -1871,20 +1938,41 @@ fn spawn_terminal_reader(
                     };
 
                     if !visible_output.is_empty() {
-                        emit_terminal_output(&app, session_id.clone(), visible_output);
+                        emit_terminal_output(&app, terminal_id_text.clone(), visible_output);
                     }
                 }
                 Err(error) => {
-                    eprintln!("[PTY] reader error for terminal_id={}: {}", session_id, error);
-                    emit_terminal_output(
-                        &app,
-                        session_id.clone(),
-                        format!("\r\n终端读取失败：{error}\r\n"),
-                    );
+                    let message = format!("终端读取失败：{error}");
+                    eprintln!("[PTY] reader error for terminal_id={}: {}", terminal_id_text, error);
+                    failure = Some(message);
                     break;
                 }
             }
         }
+
+        tauri::async_runtime::spawn(async move {
+            let session = {
+                let mut terminals = state.local_terminals.lock().await;
+                take_terminal_session(&mut terminals, terminal_id)
+            };
+            if let Some(mut session) = session {
+                let lifecycle_state = local_terminal_exit_state(failure.as_deref());
+                emit_terminal_status(
+                    &app,
+                    terminal_id_text,
+                    TerminalTransport::Local,
+                    lifecycle_state,
+                    failure.clone(),
+                );
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    if failure.is_some() {
+                        let _ = session.child.kill();
+                    }
+                    let _ = session.child.wait();
+                })
+                .await;
+            }
+        });
     });
 }
 
@@ -2336,15 +2424,50 @@ async fn read_remote_file_full(
 
 const REMOTE_UPLOAD_COMPLETION_MARKER: &[u8] = b"__PANDATERM_UPLOAD_COMPLETE__";
 
+fn format_remote_stderr(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        // Keep the UI message compact; remote shells may dump multi-line noise.
+        let single_line = trimmed
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        const MAX_LEN: usize = 240;
+        if single_line.chars().count() > MAX_LEN {
+            let short: String = single_line.chars().take(MAX_LEN).collect();
+            Some(format!("{short}…"))
+        } else {
+            Some(single_line)
+        }
+    }
+}
+
 fn validate_remote_upload_completion(
     exit_code: Option<i32>,
     completion_marker_seen: bool,
+    stderr: &[u8],
 ) -> Result<(), String> {
+    let detail = format_remote_stderr(stderr);
     match (exit_code, completion_marker_seen) {
         (Some(0) | None, true) => Ok(()),
-        (Some(0), false) => Err("远程写入失败：未收到完成标记".to_string()),
-        (Some(code), _) => Err(format!("远程写入失败，退出码: {code}")),
-        (None, false) => Err("远程写入失败：SSH 通道未返回退出状态或完成标记".to_string()),
+        (Some(0), false) => Err(match detail {
+            Some(msg) => format!("远程写入失败：未收到完成标记（{msg}）"),
+            None => "远程写入失败：未收到完成标记".to_string(),
+        }),
+        (Some(code), _) => Err(match detail {
+            // e.g. Permission denied / No such file or directory / Disk quota exceeded
+            Some(msg) => format!("远程写入失败，退出码: {code}（{msg}）"),
+            None => format!("远程写入失败，退出码: {code}"),
+        }),
+        (None, false) => Err(match detail {
+            Some(msg) => format!("远程写入失败：SSH 通道未返回退出状态或完成标记（{msg}）"),
+            None => "远程写入失败：SSH 通道未返回退出状态或完成标记".to_string(),
+        }),
     }
 }
 
@@ -2410,13 +2533,19 @@ async fn write_remote_file_content(
     let read_task = tokio::spawn(async move {
         let mut exit_code = None;
         let mut completion_output = Vec::new();
+        let mut stderr_output = Vec::new();
         while let Some(msg) = reader.wait().await {
             match msg {
                 russh::ChannelMsg::Data { data } => {
                     let remaining = 128usize.saturating_sub(completion_output.len());
                     completion_output.extend_from_slice(&data[..data.len().min(remaining)]);
                 }
-                russh::ChannelMsg::ExtendedData { .. } => {}
+                russh::ChannelMsg::ExtendedData { data, .. } => {
+                    let remaining = 512usize.saturating_sub(stderr_output.len());
+                    if remaining > 0 {
+                        stderr_output.extend_from_slice(&data[..data.len().min(remaining)]);
+                    }
+                }
                 russh::ChannelMsg::ExitStatus { exit_status } => {
                     exit_code = Some(exit_status as i32);
                 }
@@ -2427,7 +2556,7 @@ async fn write_remote_file_content(
         let completion_marker_seen = completion_output
             .windows(REMOTE_UPLOAD_COMPLETION_MARKER.len())
             .any(|window| window == REMOTE_UPLOAD_COMPLETION_MARKER);
-        (exit_code, completion_marker_seen)
+        (exit_code, completion_marker_seen, stderr_output)
     });
 
     let mut transferred = 0usize;
@@ -2455,11 +2584,11 @@ async fn write_remote_file_content(
         .eof()
         .await
         .map_err(|error| format!("SSH eof 失败：{error}"))?;
-    let (observed_exit_code, completion_marker_seen) = read_task
+    let (observed_exit_code, completion_marker_seen, stderr_output) = read_task
         .await
         .map_err(|error| format!("等待远程写入确认失败：{error}"))?;
     let _ = writer.close().await;
-    validate_remote_upload_completion(observed_exit_code, completion_marker_seen)
+    validate_remote_upload_completion(observed_exit_code, completion_marker_seen, &stderr_output)
 }
 
 /// Stream a local file to remote via one SSH channel + concurrent output drain.
@@ -2504,13 +2633,19 @@ async fn stream_upload_file(
     let read_task = tokio::spawn(async move {
         let mut exit_code = None;
         let mut completion_output = Vec::new();
+        let mut stderr_output = Vec::new();
         while let Some(msg) = reader.wait().await {
             match msg {
                 russh::ChannelMsg::Data { data } => {
                     let remaining = 128usize.saturating_sub(completion_output.len());
                     completion_output.extend_from_slice(&data[..data.len().min(remaining)]);
                 }
-                russh::ChannelMsg::ExtendedData { .. } => {}
+                russh::ChannelMsg::ExtendedData { data, .. } => {
+                    let remaining = 512usize.saturating_sub(stderr_output.len());
+                    if remaining > 0 {
+                        stderr_output.extend_from_slice(&data[..data.len().min(remaining)]);
+                    }
+                }
                 russh::ChannelMsg::ExitStatus { exit_status } => {
                     exit_code = Some(exit_status as i32);
                 }
@@ -2521,7 +2656,7 @@ async fn stream_upload_file(
         let completion_marker_seen = completion_output
             .windows(REMOTE_UPLOAD_COMPLETION_MARKER.len())
             .any(|window| window == REMOTE_UPLOAD_COMPLETION_MARKER);
-        (exit_code, completion_marker_seen)
+        (exit_code, completion_marker_seen, stderr_output)
     });
 
     let mut buffer = vec![0u8; 64 * 1024];
@@ -2557,11 +2692,11 @@ async fn stream_upload_file(
         .eof()
         .await
         .map_err(|error| format!("SSH eof 失败：{error}"))?;
-    let (observed_exit_code, completion_marker_seen) = read_task
+    let (observed_exit_code, completion_marker_seen, stderr_output) = read_task
         .await
         .map_err(|error| format!("等待远程写入确认失败：{error}"))?;
     let _ = writer.close().await;
-    validate_remote_upload_completion(observed_exit_code, completion_marker_seen)
+    validate_remote_upload_completion(observed_exit_code, completion_marker_seen, &stderr_output)
 }
 
 async fn remove_remote_temp_file(
@@ -4547,19 +4682,28 @@ async fn local_terminal_start(
         })?;
 
     let shared_writer = Arc::new(std::sync::Mutex::new(writer));
-
-    eprintln!("[PTY] PTY setup complete, spawning reader for terminal_id={}", terminal_id);
-    spawn_terminal_reader(app, terminal_id.to_string(), reader, Arc::clone(&shared_writer));
+    let cleanup_state = Arc::clone(state.inner());
 
     let mut terminals = state.local_terminals.lock().await;
     terminals.insert(
         terminal_id,
         LocalTerminalSession {
             master: pair.master,
-            writer: shared_writer,
+            writer: Arc::clone(&shared_writer),
             child,
         },
     );
+    drop(terminals);
+
+    emit_terminal_status(
+        &app,
+        terminal_id.to_string(),
+        TerminalTransport::Local,
+        TerminalLifecycleState::Connected,
+        None,
+    );
+    eprintln!("[PTY] PTY setup complete, spawning reader for terminal_id={}", terminal_id);
+    spawn_terminal_reader(app, terminal_id, reader, shared_writer, cleanup_state);
 
     Ok(profile)
 }
@@ -4604,11 +4748,33 @@ async fn local_terminal_resize(
 #[tauri::command]
 async fn local_terminal_stop(
     terminal_id: Uuid,
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let mut terminals = state.local_terminals.lock().await;
-    if let Some(mut session) = terminals.remove(&terminal_id) {
-        let _ = session.child.kill();
+    let session = {
+        let mut terminals = state.local_terminals.lock().await;
+        take_terminal_session(&mut terminals, terminal_id)
+    };
+    if let Some(mut session) = session {
+        let cleanup_result = tauri::async_runtime::spawn_blocking(move || {
+            let kill_error = session.child.kill().err();
+            session.child.wait().map_err(|wait_error| match kill_error {
+                Some(kill_error) => format!("终止终端失败：{kill_error}；等待退出失败：{wait_error}"),
+                None => format!("等待终端退出失败：{wait_error}"),
+            })?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+        emit_terminal_status(
+            &app,
+            terminal_id.to_string(),
+            TerminalTransport::Local,
+            TerminalLifecycleState::Disconnected,
+            None,
+        );
+        cleanup_result?;
     }
     Ok(())
 }
@@ -6137,6 +6303,7 @@ async fn reorder_sessions(
 #[tauri::command]
 async fn connect_session(
     session_id: Uuid,
+    terminal_id: Uuid,
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<TerminalEvent, String> {
@@ -6154,8 +6321,6 @@ async fn connect_session(
         resolved_session(&session, &credentials)?
     };
 
-    // Each connect call creates a brand-new terminal instance.
-    let terminal_id = Uuid::new_v4();
     let terminal_id_str = terminal_id.to_string();
 
     // Lock released here — connect_russh_session may take up to 15s.
@@ -6163,6 +6328,13 @@ async fn connect_session(
         Ok(handle) => handle,
         Err(error) => {
             emit_remote_log(&app, &terminal_id_str, format!("FAILED {error}"));
+            emit_terminal_status(
+                &app,
+                terminal_id_str,
+                TerminalTransport::Remote,
+                TerminalLifecycleState::Failed,
+                Some(error.clone()),
+            );
             return Err(error);
         }
     };
@@ -6178,6 +6350,13 @@ async fn connect_session(
         Ok(remote_session) => remote_session,
         Err(error) => {
             emit_remote_log(&app, &terminal_id_str, format!("FAILED {error}"));
+            emit_terminal_status(
+                &app,
+                terminal_id_str,
+                TerminalTransport::Remote,
+                TerminalLifecycleState::Failed,
+                Some(error.clone()),
+            );
             return Err(error);
         }
     };
@@ -6469,6 +6648,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_lifecycle_event_serializes_as_frontend_contract() {
+        let event = TerminalStatusEvent {
+            terminal_id: "terminal-1".to_string(),
+            transport: TerminalTransport::Remote,
+            state: TerminalLifecycleState::Failed,
+            reason: Some("channel closed".to_string()),
+        };
+        let value = serde_json::to_value(event).expect("serialize terminal status");
+        assert_eq!(value["terminal_id"], "terminal-1");
+        assert_eq!(value["transport"], "remote");
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["reason"], "channel closed");
+    }
+
+    #[test]
+    fn local_terminal_exit_maps_reader_result_to_lifecycle_state() {
+        assert_eq!(
+            local_terminal_exit_state(None),
+            TerminalLifecycleState::Disconnected
+        );
+        assert_eq!(
+            local_terminal_exit_state(Some("read failed")),
+            TerminalLifecycleState::Failed
+        );
+    }
+
+    #[test]
+    fn terminal_cleanup_claim_is_idempotent() {
+        let terminal_id = Uuid::new_v4();
+        let mut terminals = HashMap::from([(terminal_id, "session")]);
+
+        assert_eq!(
+            take_terminal_session(&mut terminals, terminal_id),
+            Some("session")
+        );
+        assert_eq!(take_terminal_session(&mut terminals, terminal_id), None);
+    }
+
+    #[test]
+    fn competing_terminal_cleanup_paths_have_one_owner() {
+        let terminal_id = Uuid::new_v4();
+        let terminals = Arc::new(std::sync::Mutex::new(HashMap::from([(
+            terminal_id,
+            "session",
+        )])));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let claims = (0..2)
+            .map(|_| {
+                let terminals = Arc::clone(&terminals);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut terminals = terminals.lock().expect("lock terminal map");
+                    take_terminal_session(&mut terminals, terminal_id).is_some()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let owner_count = claims
+            .into_iter()
+            .map(|claim| claim.join().expect("join cleanup contender"))
+            .filter(|claimed| *claimed)
+            .count();
+        assert_eq!(owner_count, 1);
+    }
+
+    #[test]
     fn drive_enumeration_includes_both_boundaries() {
         let letters: Vec<char> = windows_drive_letters().collect();
         assert_eq!(letters.len(), 26);
@@ -6486,10 +6733,13 @@ mod tests {
 
     #[test]
     fn upload_completion_accepts_marker_without_exit_status() {
-        assert!(validate_remote_upload_completion(None, true).is_ok());
-        assert!(validate_remote_upload_completion(Some(0), true).is_ok());
-        assert!(validate_remote_upload_completion(None, false).is_err());
-        assert!(validate_remote_upload_completion(Some(1), true).is_err());
+        assert!(validate_remote_upload_completion(None, true, b"").is_ok());
+        assert!(validate_remote_upload_completion(Some(0), true, b"").is_ok());
+        assert!(validate_remote_upload_completion(None, false, b"").is_err());
+        let err = validate_remote_upload_completion(Some(1), true, b"cat: Permission denied\n")
+            .expect_err("exit 1 must fail");
+        assert!(err.contains("退出码: 1"));
+        assert!(err.contains("Permission denied"));
     }
 
     #[test]
