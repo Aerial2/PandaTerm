@@ -6,6 +6,8 @@
 //! Legacy pure SSE (GET event stream) is not implemented; URL transports use streamable-http client.
 
 use std::collections::HashMap;
+use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -778,6 +780,244 @@ pub fn transport_label(transport: &McpTransport) -> &'static str {
     }
 }
 
+/// 拼出更完整的 PATH，缓解 GUI 进程缺少终端/fnm/nodejs 路径的问题。
+fn build_mcp_process_path() -> Option<OsString> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(path) = env::var_os("PATH") {
+        dirs.extend(env::split_paths(&path));
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(pf) = env::var("ProgramFiles") {
+            dirs.push(PathBuf::from(pf).join("nodejs"));
+        }
+        if let Ok(pf86) = env::var("ProgramFiles(x86)") {
+            dirs.push(PathBuf::from(pf86).join("nodejs"));
+        }
+        if let Ok(local) = env::var("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            dirs.push(local.join("Programs").join("nodejs"));
+            dirs.push(local.join("fnm"));
+            // 最近 fnm multishell（若存在）
+            let multi = local.join("fnm_multishells");
+            if multi.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&multi) {
+                    let mut shells: Vec<PathBuf> = entries
+                        .filter_map(|e| e.ok().map(|e| e.path()))
+                        .filter(|p| p.is_dir())
+                        .collect();
+                    shells.sort();
+                    // 取末尾若干新目录
+                    for p in shells.into_iter().rev().take(3) {
+                        dirs.push(p);
+                    }
+                }
+            }
+            dirs.push(local.join("Programs").join("Python"));
+        }
+        if let Ok(appdata) = env::var("APPDATA") {
+            dirs.push(PathBuf::from(appdata).join("npm"));
+        }
+        if let Ok(userprofile) = env::var("USERPROFILE") {
+            let home = PathBuf::from(userprofile);
+            dirs.push(home.join(".local").join("bin"));
+            dirs.push(home.join("AppData").join("Roaming").join("Python").join("Scripts"));
+            dirs.push(home.join(".cargo").join("bin"));
+        }
+        // 常见 Python 安装
+        for ver in ["Python313", "Python312", "Python311", "Python310"] {
+            if let Ok(local) = env::var("LOCALAPPDATA") {
+                let base = PathBuf::from(&local).join("Programs").join("Python").join(ver);
+                dirs.push(base.clone());
+                dirs.push(base.join("Scripts"));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(home) = env::var("HOME") {
+            let home = PathBuf::from(home);
+            dirs.push(home.join(".local").join("bin"));
+            dirs.push(home.join(".cargo").join("bin"));
+            dirs.push(home.join(".fnm"));
+            dirs.push(home.join("n").join("bin"));
+        }
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    }
+
+    // 去重保序
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+    env::join_paths(dirs).ok()
+}
+
+fn path_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(joined) = build_mcp_process_path() {
+        dirs.extend(env::split_paths(&joined));
+    }
+    dirs
+}
+
+/// 在 PATH + PATHEXT 中解析可执行文件（Windows 上 `npx` → `npx.cmd`）。
+fn resolve_mcp_program(command: &str) -> Option<PathBuf> {
+    let raw = command.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(raw);
+    if candidate.is_absolute() || raw.contains('/') || raw.contains('\\') {
+        return if candidate.is_file() {
+            Some(candidate)
+        } else {
+            // 绝对路径缺扩展名时再试 PATHEXT
+            #[cfg(windows)]
+            {
+                return resolve_with_pathext_in_dir(
+                    candidate.parent().unwrap_or_else(|| Path::new(".")),
+                    candidate
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(raw),
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        };
+    }
+
+    for dir in path_search_dirs() {
+        #[cfg(windows)]
+        {
+            if let Some(found) = resolve_with_pathext_in_dir(&dir, raw) {
+                return Some(found);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let p = dir.join(raw);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn resolve_with_pathext_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    let pathext = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let mut exts: Vec<String> = pathext
+        .split(';')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| e.to_string())
+        .collect();
+    // 也试无扩展名
+    exts.push(String::new());
+    // 优先 .CMD/.EXE（npx 实际是 .cmd）
+    let preferred = [".CMD", ".EXE", ".BAT", ".COM", ""];
+    let mut ordered = Vec::new();
+    for p in preferred {
+        if p.is_empty() {
+            ordered.push(String::new());
+        } else if exts.iter().any(|e| e.eq_ignore_ascii_case(p)) {
+            ordered.push(p.to_string());
+        }
+    }
+    for e in exts {
+        if !ordered.iter().any(|o| o.eq_ignore_ascii_case(&e)) {
+            ordered.push(e);
+        }
+    }
+
+    let name_has_ext = Path::new(name).extension().is_some();
+    if name_has_ext {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    for ext in ordered {
+        let file_name = if ext.is_empty() {
+            name.to_string()
+        } else if ext.starts_with('.') {
+            format!("{name}{ext}")
+        } else {
+            format!("{name}.{ext}")
+        };
+        let p = dir.join(&file_name);
+        if p.is_file() {
+            return Some(p);
+        }
+        // Windows 文件系统大小写不敏感，但仍尝试小写扩展名
+        if !ext.is_empty() {
+            let lower = format!("{name}{}", ext.to_ascii_lowercase());
+            let p = dir.join(lower);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn windows_quote_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    let needs_quote = arg.chars().any(|c| c.is_whitespace() || c == '"');
+    if !needs_quote {
+        return arg.to_string();
+    }
+    let mut out = String::from("\"");
+    for ch in arg.chars() {
+        if ch == '"' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// 构造 stdio MCP 启动命令：解析真实可执行文件；Windows 批处理走 cmd.exe。
+fn build_mcp_stdio_command(config: &McpServerConfig) -> Result<Command, String> {
+    let program = resolve_mcp_program(&config.command).ok_or_else(|| {
+        format!(
+            "找不到命令「{}」。请确认 Node/Python 已安装，或把启动命令改为完整路径（Windows 上 npx 通常为 npx.cmd）",
+            config.command.trim()
+        )
+    })?;
+
+    #[cfg(windows)]
+    {
+        let is_batch = program
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+            .unwrap_or(false);
+        if is_batch {
+            // CreateProcess 不能直接跑 .cmd，需经 cmd.exe
+            let mut line = format!("\"{}\"", program.display());
+            for arg in &config.args {
+                line.push(' ');
+                line.push_str(&windows_quote_arg(arg));
+            }
+            let mut command = Command::new("cmd.exe");
+            command.arg("/D").arg("/S").arg("/C").arg(line);
+            return Ok(command);
+        }
+    }
+
+    let mut command = Command::new(&program);
+    command.args(&config.args);
+    Ok(command)
+}
+
 fn snapshot_server(
     config: &McpServerConfig,
     slot: Option<&SessionSlot>,
@@ -1058,8 +1298,7 @@ impl McpRuntime {
         &self,
         config: &McpServerConfig,
     ) -> Result<Vec<McpToolInfo>, String> {
-        let mut command = Command::new(&config.command);
-        command.args(&config.args);
+        let mut command = build_mcp_stdio_command(config)?;
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -1087,13 +1326,25 @@ impl McpRuntime {
                 command.env("PYTHONUTF8", "1");
             }
         }
+        // GUI 进程 PATH 常缺 node/python；补齐常见目录，便于 npx/uvx/python
+        if let Some(path) = build_mcp_process_path() {
+            let user_set_path = config.env.keys().any(|k| k.eq_ignore_ascii_case("PATH"));
+            if !user_set_path {
+                command.env("PATH", path);
+            }
+        }
         if let Some(cwd) = config.cwd.as_ref() {
             command.current_dir(cwd);
         }
 
         let mut child = command
             .spawn()
-            .map_err(|error| format!("启动 MCP 进程失败：{error}"))?;
+            .map_err(|error| {
+                format!(
+                    "启动 MCP 进程失败：{error}（命令：{}）。Windows 请确认已安装 Node/Python 且 PATH 可用，或把 command 写成完整路径（如 C:\\\\Program Files\\\\nodejs\\\\npx.cmd）",
+                    config.command
+                )
+            })?;
         let stdin = child
             .stdin
             .take()
@@ -1771,6 +2022,27 @@ pub fn format_mcp_tools_for_agent(catalog: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_npx_like_command_when_present() {
+        // 仅在本机 PATH 有 nodejs 时断言；无则跳过
+        if let Some(path) = resolve_mcp_program("npx") {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            assert!(
+                name.eq_ignore_ascii_case("npx")
+                    || name.eq_ignore_ascii_case("npx.cmd")
+                    || name.eq_ignore_ascii_case("npx.exe"),
+                "unexpected npx path: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn windows_quote_arg_handles_spaces() {
+        assert_eq!(windows_quote_arg("plain"), "plain");
+        assert_eq!(windows_quote_arg("a b"), "\"a b\"");
+    }
 
     #[test]
     fn normalize_stdio_and_reject_duplicate() {

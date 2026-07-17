@@ -8,6 +8,13 @@ const root = ReactDOM.createRoot(document.getElementById('root') as HTMLElement)
 
 async function bootstrap() {
   if (windowMode === 'connection') {
+    // 尽量早显示（非 warm 预热），减少“点了没反应”
+    const isWarm = params.get('warm') === '1';
+    if (!isWarm) {
+      void import('@tauri-apps/api/webviewWindow')
+        .then(({ getCurrentWebviewWindow }) => getCurrentWebviewWindow().show())
+        .catch(() => undefined);
+    }
     const { ConnectionWindow } = await import('./ConnectionWindow');
     root.render(<ConnectionWindow />);
     return;

@@ -3,10 +3,21 @@ import { listen } from '@tauri-apps/api/event';
 import { Terminal, type ITheme } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
+import {
+  addLogEntry,
+  addTransferRecord,
+  addTransferRecords,
+  getTransferLogSnapshot,
+  setStatusMessage,
+  updateTransferRecord,
+} from './appShellStore';
 import { EditorPanel, detectLanguage, type EditorTab } from './EditorPanel';
 import { VscodeFileIcon } from './FileIcon';
+import { ResourceBottomPanel } from './ResourceBottomPanel';
+import { StatusBar } from './StatusBar';
+import { TopMenubar } from './TopMenubar';
 import {
   ArrowLeft,
   ArrowRight,
@@ -102,7 +113,6 @@ import {
   createDirectory,
   copyPath,
   movePath,
-  getLocalIpv4,
   getUploadConcurrency,
   resizeLocalTerminal,
   resizeTerminal,
@@ -114,6 +124,7 @@ import {
   terminalWrite,
   openConnectionWindow,
   openAiSettingsWindow,
+  preloadConnectionWindows,
 } from './api';
 import type { AiChatMessage, AiChatStreamEvent, AiProviderConfig, LocalDirectoryEntry, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, TerminalStatusEvent, SystemMonitorData } from './api';
 import {
@@ -299,7 +310,6 @@ type UploadConflictApplyAll = {
 };
 
 type ResourceSortKey = 'name' | 'size' | 'modifiedTime';
-type ResourceBottomTab = 'transfer' | 'log';
 type InlineRenameState = {
   path: string;
   originalName: string;
@@ -309,28 +319,6 @@ type InlineRenameState = {
 };
 
 const RESOURCE_RENAME_SECOND_CLICK_DELAY_MS = 500;
-
-type TransferRecord = {
-  id: string;
-  fileName: string;
-  direction: 'upload' | 'download' | 'open';
-  target: string;
-  size: number;
-  status: 'pending' | 'uploading' | 'success' | 'failed' | 'cancelled';
-  message: string;
-  time: string;
-  progress: number;
-  transferred: number;
-  speed: number;
-  startTime: number;
-};
-
-type LogEntry = {
-  id: string;
-  time: string;
-  level: 'info' | 'warn' | 'error';
-  text: string;
-};
 
 /** 会话模式选项；后续可在此追加 plan 等 */
 const AI_MODE_OPTIONS: Array<{ value: AiConversationMode; label: string; hint: string }> = [
@@ -765,47 +753,6 @@ function formatFileSize(size: number) {
   return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
 }
 
-function formatSpeed(bytesPerSec: number): string {
-  if (bytesPerSec <= 0) return '0 B/s';
-  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
-  const unitIndex = Math.min(Math.floor(Math.log(bytesPerSec) / Math.log(1024)), units.length - 1);
-  const value = bytesPerSec / 1024 ** unitIndex;
-  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
-}
-
-/** 传输任务状态文案：独立状态码，不依赖操作按钮颜色 */
-function transferKindLabel(direction: TransferRecord['direction']): string {
-  if (direction === 'download') return '下载';
-  if (direction === 'open') return '加载';
-  return '上传';
-}
-
-function transferStatusLabel(record: Pick<TransferRecord, 'direction' | 'status'>): string {
-  const kind = transferKindLabel(record.direction);
-  switch (record.status) {
-    case 'pending':
-    case 'uploading':
-      return `${kind}中`;
-    case 'success':
-      return `${kind}成功`;
-    case 'failed':
-      return `${kind}失败`;
-    case 'cancelled':
-      return `${kind}已取消`;
-  }
-}
-
-function transferStatusDetail(record: Pick<TransferRecord, 'status' | 'message'>): string {
-  if (record.status === 'failed' && record.message.trim()) return record.message.trim();
-  if (record.status === 'cancelled' && record.message.trim()) return record.message.trim();
-  return '';
-}
-
-function truncateStatus(text: string, max = 120): string {
-  if (text.length <= max) return text;
-  return text.slice(0, max) + '...';
-}
-
 function formatModifiedTime(modifiedMs?: number | null) {
   if (!modifiedMs) return '-';
   return new Intl.DateTimeFormat('zh-CN', {
@@ -1073,8 +1020,11 @@ export function App() {
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  /** 左侧栏宽度：拖动中只改 DOM，pointerup 再 commit 一次 */
   const [resourcePanelWidth, setResourcePanelWidth] = useState(40);
-  const [isResourceResizing, setIsResourceResizing] = useState(false);
+  const resourcePanelWidthRef = useRef(40);
+  const leftSidebarRef = useRef<HTMLDivElement | null>(null);
+  const sessionContentRef = useRef<HTMLElement | null>(null);
   // Left-side activity bar state — which panel is open
   const [leftActivity, setLeftActivity] = useState<'files' | 'monitor' | 'processes' | 'ai' | null>('files');
 
@@ -1198,12 +1148,8 @@ export function App() {
   const [mediaError, setMediaError] = useState('');
   const [sortKey, setSortKey] = useState<ResourceSortKey>('name');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
-  const [resourceBottomTab, setResourceBottomTab] = useState<ResourceBottomTab>('transfer');
-  const [resourceBottomPanelHeight, setResourceBottomPanelHeight] = useState(180);
-  const resourceBottomPanelRef = useRef<HTMLDivElement | null>(null);
-  const resourceBottomDragRef = useRef<{ startY: number; startHeight: number } | null>(null);
-  const [transferRecords, setTransferRecords] = useState<TransferRecord[]>([]);
-  const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
+  /** 递增以唤起底部面板本地终端 */
+  const [openLocalTerminalKey, setOpenLocalTerminalKey] = useState(0);
   const [clipboard, setClipboard] = useState<{ paths: string[]; operation: 'copy' | 'cut'; terminalId: string | null } | null>(null);
   const [newItemDialog, setNewItemDialog] = useState<{ type: 'file' | 'directory' } | null>(null);
   const [newItemName, setNewItemName] = useState('');
@@ -1218,7 +1164,6 @@ export function App() {
   } | null>(null);
   const [uploadConflictDialog, setUploadConflictDialog] = useState<UploadConflictDialogState | null>(null);
   const uploadConflictApplyAllRef = useRef<UploadConflictApplyAll | null>(null);
-  const [activeMenu, setActiveMenu] = useState<string | null>(null);
 
   useEffect(() => {
     if (!inlineRename || inlineRename.submitting) return;
@@ -1250,16 +1195,6 @@ export function App() {
       }
     };
   }, []);
-
-  // Close menubar dropdown when clicking outside
-  useEffect(() => {
-    if (!activeMenu) return;
-    const close = (e: MouseEvent) => {
-      if (!(e.target as HTMLElement).closest('.menubar-item')) setActiveMenu(null);
-    };
-    window.addEventListener('mousedown', close);
-    return () => window.removeEventListener('mousedown', close);
-  }, [activeMenu]);
 
   // AI 输入区模式/模型自定义菜单：点击外部或 Esc 关闭
   useEffect(() => {
@@ -1375,9 +1310,9 @@ export function App() {
   const pathEditInputRef = useRef<HTMLInputElement | null>(null);
   const uploadAbortRefs = useRef<Map<string, AbortController>>(new Map());
   const editorSaveGenerationRef = useRef<Map<string, number>>(new Map());
-  const localIpCacheRef = useRef<string | null>(null);
-  const [openingConnection, setOpeningConnection] = useState<{ session: Session; tabId: string; startedAt: number; seconds: number } | null>(null);
-  const [statusMessage, setStatusMessage] = useState('当前上下文：本地系统');
+  /** seconds 用 DOM 刷新，避免连接中每秒整 App 重渲 */
+  const [openingConnection, setOpeningConnection] = useState<{ session: Session; tabId: string; startedAt: number } | null>(null);
+  const openingSecondsRef = useRef<HTMLSpanElement | null>(null);
   const [localTerminalProfile, setLocalTerminalProfile] = useState<LocalTerminalProfile>(fallbackLocalTerminalProfile);
   const [terminalDragState, setTerminalDragState] = useState<TerminalDragState | null>(null);
   const terminalsRef = useRef<Map<string, Terminal>>(new Map());
@@ -1587,37 +1522,6 @@ export function App() {
     return true;
   }
 
-  function addLogEntry(level: LogEntry['level'], text: string) {
-    const entry: LogEntry = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-      level,
-      text,
-    };
-    setLogEntries((current) => [...current, entry].slice(-200));
-  }
-
-  function addTransferRecord(record: Omit<TransferRecord, 'id' | 'time' | 'progress' | 'transferred' | 'speed' | 'startTime'>): string {
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const full: TransferRecord = {
-      ...record,
-      id,
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-      progress: 0,
-      transferred: 0,
-      speed: 0,
-      startTime: Date.now(),
-    };
-    setTransferRecords((current) => [full, ...current].slice(0, 100));
-    return id;
-  }
-
-  function updateTransferRecord(id: string, patch: Partial<TransferRecord> | ((prev: TransferRecord) => Partial<TransferRecord>)) {
-    setTransferRecords((current) =>
-      current.map((r) => (r.id === id ? { ...r, ...(typeof patch === 'function' ? patch(r) : patch) } : r))
-    );
-  }
-
   function requestUploadConflictDecision(source: File, target: ResourceFile, existingNames: Set<string>): Promise<UploadConflictDecision | null> {
     const applyAll = uploadConflictApplyAllRef.current;
     if (applyAll) {
@@ -1657,15 +1561,15 @@ export function App() {
     return !name || name.includes('/') || name.includes('\\') || dialog.existingNames.includes(name);
   }
 
-  function deleteTransferRecord(id: string) {
-    setTransferRecords((current) => current.filter((r) => r.id !== id));
-  }
-
   function cancelUpload(id: string) {
     const abortCtrl = uploadAbortRefs.current.get(id);
     if (abortCtrl) {
       abortCtrl.abort();
       uploadAbortRefs.current.delete(id);
+    }
+    // 仅真正开传后才调后端取消；排队中的只本地标记
+    const row = getTransferLogSnapshot().transferRecords.find((item) => item.id === id);
+    if (row?.status === 'uploading') {
       void cancelTransfer(id).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
         addLogEntry('error', `取消传输失败：${message}`);
@@ -1764,14 +1668,6 @@ export function App() {
       setLastClickedIndex(-1);
       setMediaViewer(null);
       setMediaError('');
-      if (!localIpCacheRef.current) {
-        try {
-          localIpCacheRef.current = await getLocalIpv4();
-        } catch {
-          localIpCacheRef.current = '127.0.0.1';
-        }
-      }
-      setStatusMessage(localIpCacheRef.current);
       return listing;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1823,13 +1719,6 @@ export function App() {
       if (!listing) {
         throw new Error('远程终端尚未连接，无法浏览文件');
       }
-      if (local && !localIpCacheRef.current) {
-        try {
-          localIpCacheRef.current = await getLocalIpv4();
-        } catch {
-          localIpCacheRef.current = '127.0.0.1';
-        }
-      }
       if (!isCurrentRequest()) return;
 
       const nextFiles = listing.entries.map(toResourceFile);
@@ -1843,11 +1732,6 @@ export function App() {
       setLastClickedIndex(-1);
       setMediaViewer(null);
       setMediaError('');
-      if (local) {
-        setStatusMessage(localIpCacheRef.current || '127.0.0.1');
-      } else {
-        setStatusMessage(tab?.session.host ?? '');
-      }
 
       // Update per-pane navigation history.
       const entry = navHistoryRef.current.get(paneKey);
@@ -1926,6 +1810,11 @@ export function App() {
     return () => {
       isMounted = false;
     };
+  }, []);
+
+  // 空闲预热连接管理窗口与 chunk，降低菜单点击延迟
+  useEffect(() => {
+    preloadConnectionWindows();
   }, []);
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? null;
@@ -2009,34 +1898,38 @@ export function App() {
   useEffect(() => {
     if (!openingConnection) return;
 
-    const intervalId = window.setInterval(() => {
-      setOpeningConnection((current) => {
-        if (!current) return null;
-        const seconds = Math.floor((Date.now() - current.startedAt) / 1000);
-        if (seconds >= 20) {
-          const message = '连接超时：SSH 已启动但没有进入可用终端状态';
-          setTabs((tabsCurrent) =>
-            tabsCurrent.map((tab) => {
-              if (tab.id !== current.tabId || tab.status !== 'connecting') {
-                return tab;
-              }
-              cancelledConnectionTabIdsRef.current.add(tab.id);
-              return {
-                ...tab,
-                status: 'failed',
-                statusMessage: message,
-                output: [...tab.output, `\r\n${message}\r\n`],
-                activityLog: [...tab.activityLog, createActivity('error', message)].slice(-20),
-              };
-            }),
-          );
-          setStatusMessage(message);
-          return null;
-        }
-        return { ...current, seconds };
-      });
-    }, 1000);
+    const { tabId, startedAt } = openingConnection;
+    let timedOut = false;
 
+    const tick = () => {
+      const seconds = Math.floor((Date.now() - startedAt) / 1000);
+      if (openingSecondsRef.current) {
+        openingSecondsRef.current.textContent = String(seconds);
+      }
+      if (seconds < 20 || timedOut) return;
+      timedOut = true;
+      const message = '连接超时：SSH 已启动但没有进入可用终端状态';
+      setTabs((tabsCurrent) =>
+        tabsCurrent.map((tab) => {
+          if (tab.id !== tabId || tab.status !== 'connecting') {
+            return tab;
+          }
+          cancelledConnectionTabIdsRef.current.add(tab.id);
+          return {
+            ...tab,
+            status: 'failed',
+            statusMessage: message,
+            output: [...tab.output, `\r\n${message}\r\n`],
+            activityLog: [...tab.activityLog, createActivity('error', message)].slice(-20),
+          };
+        }),
+      );
+      setStatusMessage(message);
+      setOpeningConnection(null);
+    };
+
+    tick();
+    const intervalId = window.setInterval(tick, 1000);
     return () => window.clearInterval(intervalId);
   }, [openingConnection?.tabId, openingConnection?.startedAt]);
 
@@ -2111,25 +2004,26 @@ export function App() {
   }
 
   async function addTerminalTabToCurrentPane(session: Session) {
+    // 本地终端固定在底部面板，不再进入工作区 pane
+    if (session.id === localSession.id) {
+      pendingPaneTabIdRef.current = null;
+      setPendingPaneTabId(null);
+      openLocalTerminalInBottomPanel();
+      return;
+    }
+
     const targetPaneId = pendingPaneTabIdRef.current ?? activePaneIdRef.current;
     const ownerTab = targetPaneId ? findTerminalWorkspaceOwner(tabsRef.current, targetPaneId) : null;
     if (!targetPaneId || !ownerTab) {
       pendingPaneTabIdRef.current = null;
       setPendingPaneTabId(null);
-      if (session.id === localSession.id) {
-        const nextTab = createTerminalTab(localSession, '正在启动本地终端...');
-        setTabs((current) => [...current, nextTab]);
-        setActiveTabId(nextTab.id);
-        setStatusMessage('已新建本地终端');
-      } else {
-        await openRemoteTerminal(session);
-      }
+      await openRemoteTerminal(session);
       return;
     }
 
     const nextTab = createTerminalTab(
       session,
-      session.id === localSession.id ? '正在启动本地终端...' : '正在建立 SSH 连接...',
+      '正在建立 SSH 连接...',
       ownerTab.id,
     );
     const nextLayout = addTerminalTabToPane(ownerTab.layout ?? createDefaultTerminalLayout(ownerTab.id), targetPaneId, nextTab.id);
@@ -2142,14 +2036,14 @@ export function App() {
     setActiveTabId(ownerTab.id);
     setStatusMessage(`已添加到当前 pane：${session.name}`);
 
-    if (session.id !== localSession.id) {
+    {
       const terminalId = crypto.randomUUID();
       terminalIdToTabIdRef.current.set(terminalId, nextTab.id);
       setTabs((current) => current.map((item) => item.id === nextTab.id
         ? { ...item, terminalId }
         : item));
       try {
-        setOpeningConnection({ session, tabId: nextTab.id, startedAt: Date.now(), seconds: 0 });
+        setOpeningConnection({ session, tabId: nextTab.id, startedAt: Date.now() });
         await connectSession(session.id, terminalId);
         if (cancelledConnectionTabIdsRef.current.delete(nextTab.id)) {
           retireTerminalId(terminalId);
@@ -2217,6 +2111,11 @@ export function App() {
   }
 
   async function openRemoteTerminal(session: Session) {
+    if (session.id === localSession.id) {
+      openLocalTerminalInBottomPanel();
+      return;
+    }
+
     const terminalId = crypto.randomUUID();
     const nextTab = { ...createTerminalTab(session, '正在建立 SSH 连接...'), terminalId };
     const tabId = nextTab.id;
@@ -2224,7 +2123,7 @@ export function App() {
     terminalIdToTabIdRef.current.set(terminalId, tabId);
     activeTabRef.current = nextTab;
     activeTabIdRef.current = tabId;
-    setOpeningConnection({ session, tabId, startedAt: Date.now(), seconds: 0 });
+    setOpeningConnection({ session, tabId, startedAt: Date.now() });
     setTabs((current) => [...current, nextTab]);
     setActiveTabId(tabId);
     setStatusMessage(`正在连接：${session.username}@${session.host}:${session.port}`);
@@ -2264,6 +2163,11 @@ export function App() {
   }
 
   async function openConnectionPanelSession(session: Session) {
+    if (session.id === localSession.id) {
+      openLocalTerminalInBottomPanel();
+      return;
+    }
+
     const targetPaneId = getConnectionPanelTargetPaneId();
     if (targetPaneId) {
       await addTerminalTabToCurrentPane(session);
@@ -2273,17 +2177,9 @@ export function App() {
     await openRemoteTerminal(session);
   }
 
-  async function openLocalTerminalFromPanel() {
-    const targetPaneId = getConnectionPanelTargetPaneId();
-    if (targetPaneId) {
-      await addTerminalTabToCurrentPane(localSession);
-      return;
-    }
-
-    const nextTab = createTerminalTab(localSession, '正在启动本地终端...');
-    setTabs((current) => [...current, nextTab]);
-    setActiveTabId(nextTab.id);
-    setStatusMessage('已新建本地终端');
+  function openLocalTerminalInBottomPanel() {
+    setOpenLocalTerminalKey((key) => key + 1);
+    setStatusMessage('本地终端（底部面板）');
   }
 
   function openNewConnectionTab() {
@@ -2296,10 +2192,12 @@ export function App() {
     let connUnlisten: (() => void) | null = null;
     void listen<Session>('connection-window-connect-session', (event) => {
       const session = event.payload;
+      if (session.id === localSession.id) {
+        openLocalTerminalInBottomPanel();
+        return;
+      }
       if (pendingPaneTabIdRef.current) {
         void addTerminalTabToCurrentPane(session);
-      } else if (session.id === localSession.id) {
-        void openLocalTerminalFromPanel();
       } else {
         // Append the new connection as a terminal tab inside the active terminal
         // (same behavior as double-clicking an existing tab) instead of spawning
@@ -2918,27 +2816,33 @@ export function App() {
         },
       );
 
-      const uploadOne = async (item: { file: File; localPath?: string; relPath?: string }) => {
-        const { file, localPath, relPath } = item;
-        let fileDestDir = destDir;
-        let targetFileName = file.name;
-        let isRootTarget = true;
-        if (relPath) {
-          const { parent, name } = splitUploadRelativePath(relPath);
-          targetFileName = name || file.name;
-          isRootTarget = parent === '';
-          if (parent) {
-            fileDestDir = joinRemotePath(destDir, parent);
-          }
+      const uploadOne = async (job: {
+        file: File;
+        localPath?: string;
+        relPath?: string;
+        fileDestDir: string;
+        targetFileName: string;
+        displayFileName: string;
+        recordId: string;
+      }) => {
+        const { file, localPath, recordId } = job;
+        let { fileDestDir, targetFileName, displayFileName } = job;
+        const abortCtrl = uploadAbortRefs.current.get(recordId);
+        if (!abortCtrl || abortCtrl.signal.aborted) {
+          // 排队阶段已取消：记录已由 cancelUpload 标记
+          return;
         }
-        let displayFileName = relPath || file.name;
 
+        const isRootTarget = !job.relPath || splitUploadRelativePath(job.relPath).parent === '';
         if (!local && isRootTarget) {
           const existingTarget = resourceFiles.find((entry) => entry.name === targetFileName);
           if (existingTarget) {
             const decision = await requestUploadConflictDecision(file, existingTarget, plannedRootNames);
+            if (abortCtrl.signal.aborted) return;
             if (!decision || decision.action === 'skip') {
               skipped += 1;
+              uploadAbortRefs.current.delete(recordId);
+              updateTransferRecord(recordId, { status: 'cancelled', message: '已跳过' });
               addLogEntry('info', `已跳过上传：${displayFileName}`);
               return;
             }
@@ -2946,11 +2850,14 @@ export function App() {
               const nextName = decision.newName?.trim() ?? '';
               if (!nextName || nextName === '.' || nextName === '..' || nextName.includes('/') || nextName.includes('\\')) {
                 failed += `${displayFileName}: 无效的新文件名; `;
+                uploadAbortRefs.current.delete(recordId);
+                updateTransferRecord(recordId, { status: 'failed', message: '无效的新文件名' });
                 addLogEntry('error', `上传失败：${displayFileName} - 无效的新文件名`);
                 return;
               }
               targetFileName = nextName;
-              displayFileName = relPath ? targetFileName : nextName;
+              displayFileName = job.relPath ? targetFileName : nextName;
+              updateTransferRecord(recordId, { fileName: displayFileName });
             }
           }
           plannedRootNames.add(targetFileName);
@@ -2958,18 +2865,15 @@ export function App() {
 
         // 远程上传且有本地路径时，走流式上传，避免前端 base64 编码阻塞 UI。
         const useStreamUpload = !local && terminalId && localPath;
-        const recordId = addTransferRecord({
-          fileName: displayFileName,
-          direction: 'upload',
-          target: fileDestDir || destDir,
-          size: file.size,
-          status: 'uploading',
-          message: '上传中...',
-        });
-        const abortCtrl = new AbortController();
-        uploadAbortRefs.current.set(recordId, abortCtrl);
         const startTime = Date.now();
         speedTrackers.set(recordId, { startTime });
+        // 真正开传：等待 → 上传中；startTime 从现在算，排队不计入耗时
+        updateTransferRecord(recordId, {
+          status: 'uploading',
+          message: '上传中...',
+          startTime,
+          endTime: null,
+        });
         try {
           if (abortCtrl.signal.aborted) throw new DOMException('已取消', 'AbortError');
           if (useStreamUpload) {
@@ -3000,6 +2904,51 @@ export function App() {
         }
       };
 
+      // 全部先入队为「等待」，再由并发池开传；列表能看到尚未轮到的文件
+      type UploadJob = {
+        file: File;
+        localPath?: string;
+        relPath?: string;
+        fileDestDir: string;
+        targetFileName: string;
+        displayFileName: string;
+        recordId: string;
+      };
+      const preparedJobs: Omit<UploadJob, 'recordId'>[] = fileItems.map(({ file, localPath, relPath }) => {
+        let fileDestDir = destDir;
+        let targetFileName = file.name;
+        if (relPath) {
+          const { parent, name } = splitUploadRelativePath(relPath);
+          targetFileName = name || file.name;
+          if (parent) {
+            fileDestDir = joinRemotePath(destDir, parent);
+          }
+        }
+        return {
+          file,
+          localPath,
+          relPath,
+          fileDestDir,
+          targetFileName,
+          displayFileName: relPath || file.name,
+        };
+      });
+      const recordIds = addTransferRecords(
+        preparedJobs.map((job) => ({
+          fileName: job.displayFileName,
+          direction: 'upload' as const,
+          target: job.fileDestDir || destDir,
+          size: job.file.size,
+          status: 'pending' as const,
+          message: '等待上传...',
+        })),
+      );
+      const jobs: UploadJob[] = preparedJobs.map((job, index) => {
+        const recordId = recordIds[index];
+        uploadAbortRefs.current.set(recordId, new AbortController());
+        return { ...job, recordId };
+      });
+
       // Bounded concurrency pool — upload several files in parallel so the
       // per-file SSH round-trip latency is overlapped (like XShell's SFTP).
       // Pick the pool size from local CPU load: busy => 1, idle => 2.
@@ -3018,13 +2967,13 @@ export function App() {
       }
       let cursor = 0;
       const worker = async () => {
-        while (cursor < fileItems.length) {
+        while (cursor < jobs.length) {
           const idx = cursor++;
-          if (idx >= fileItems.length) break;
-          await uploadOne(fileItems[idx]);
+          if (idx >= jobs.length) break;
+          await uploadOne(jobs[idx]);
         }
       };
-      const poolSize = Math.min(CONCURRENCY, fileItems.length);
+      const poolSize = Math.min(CONCURRENCY, jobs.length);
       const workers: Promise<void>[] = [];
       for (let w = 0; w < poolSize; w++) workers.push(worker());
       await Promise.all(workers);
@@ -5667,15 +5616,20 @@ export function App() {
 
     event.preventDefault();
     const bounds = container.getBoundingClientRect();
-    setIsResourceResizing(true);
+    sessionContentRef.current?.classList.add('is-resizing');
 
     const handlePointerMove = (moveEvent: globalThis.PointerEvent) => {
-      const nextWidth = ((moveEvent.clientX - bounds.left) / bounds.width) * 100;
-      setResourcePanelWidth(clampPanelWidth(nextWidth));
+      const nextWidth = clampPanelWidth(((moveEvent.clientX - bounds.left) / bounds.width) * 100);
+      resourcePanelWidthRef.current = nextWidth;
+      // 拖动中只改 DOM，避免每帧整 App 重渲 + 终端 fit
+      if (leftSidebarRef.current) {
+        leftSidebarRef.current.style.width = `${nextWidth}%`;
+      }
     };
 
     const stopResize = () => {
-      setIsResourceResizing(false);
+      sessionContentRef.current?.classList.remove('is-resizing');
+      setResourcePanelWidth(resourcePanelWidthRef.current);
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', stopResize);
       window.removeEventListener('pointercancel', stopResize);
@@ -6402,76 +6356,33 @@ export function App() {
 
   return (
     <main className="ssh-workbench" onDragOver={handleGlobalDragOver} onDrop={handleGlobalDrop}>
-      <header className="top-strip">
-        <nav className="menubar" role="menubar">
-          <div className="menubar-item" role="menuitem" tabIndex={0}
-            onMouseEnter={() => { if (activeMenu) setActiveMenu('连接'); }}
-            onClick={() => setActiveMenu(activeMenu === '连接' ? null : '连接')}
-          >
-            <span className="menubar-label">连接<span className="menubar-accent">(F)</span></span>
-            {activeMenu === '连接' && (
-              <div className="menubar-dropdown" role="menu">
-                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); void openConnectionWindow('create'); }}>
-                  <Plus size={14} /><span>新建连接</span>
-                </button>
-                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); void openConnectionWindow('manage'); }}>
-                  <Server size={14} /><span>连接管理</span>
-                </button>
-              </div>
-            )}
-          </div>
-          <div className="menubar-item" role="menuitem" tabIndex={0}
-            onMouseEnter={() => { if (activeMenu) setActiveMenu('编辑'); }}
-            onClick={() => setActiveMenu(activeMenu === '编辑' ? null : '编辑')}
-          >
-            <span className="menubar-label">编辑<span className="menubar-accent">(E)</span></span>
-            {activeMenu === '编辑' && (
-              <div className="menubar-dropdown" role="menu">
-                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); openAiSettings(); }}>
-                  <Settings size={14} /><span>AI 设置</span>
-                </button>
-              </div>
-            )}
-          </div>
-          <div className="menubar-item" role="menuitem" tabIndex={0}
-            onMouseEnter={() => { if (activeMenu) setActiveMenu('查看'); }}
-            onClick={() => setActiveMenu(activeMenu === '查看' ? null : '查看')}
-          >
-            <span className="menubar-label">查看<span className="menubar-accent">(V)</span></span>
-            {activeMenu === '查看' && (
-              <div className="menubar-dropdown" role="menu">
-                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); setLeftActivity('files'); }}>
-                  <FolderOpen size={14} /><span>文件资源管理器</span>
-                </button>
-                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); setLeftActivity('monitor'); }}>
-                  <Cpu size={14} /><span>系统监控</span>
-                </button>
-                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); setLeftActivity('processes'); }}>
-                  <Activity size={14} /><span>进程列表</span>
-                </button>
-                <button className="menubar-menu-item" role="menuitem" onClick={() => { setActiveMenu(null); setLeftActivity('ai'); }}>
-                  <Bot size={14} /><span>AI 助手</span>
-                </button>
-              </div>
-            )}
-          </div>
-        </nav>
+      <TopMenubar
+        sessionLabel={activeSession ? `${activeSession.name} · ${activeSession.username}@${activeSession.host}` : ''}
+        onOpenConnectionCreate={() => {
+          void openConnectionWindow('create');
+        }}
+        onOpenConnectionManage={() => {
+          void openConnectionWindow('manage');
+        }}
+        onOpenAiSettings={() => openAiSettings()}
+        onSetLeftActivity={(panel) => setLeftActivity(panel)}
+      />
 
-        <div className="top-status">
-          {activeSession ? `${activeSession.name} · ${activeSession.username}@${activeSession.host}` : ''}
-        </div>
-      </header>
-
-      <section className={isResourceResizing ? 'session-content is-resizing' : 'session-content'}>
+      <section ref={sessionContentRef} className="session-content">
         {openingConnection && (
           <div className="connection-opening-overlay">
             <RefreshCw size={18} className="spin" />
             <span>
-              正在打开 {openingConnection.session.name || '连接'}... {openingConnection.seconds}s
+              正在打开 {openingConnection.session.name || '连接'}...{' '}
+              <span ref={openingSecondsRef}>0</span>s
             </span>
           </div>
         )}
-        <div className={`left-sidebar${leftActivity ? '' : ' collapsed'}`} style={leftActivity ? { width: `${resourcePanelWidth}%` } : { width: '48px' }}>
+        <div
+          ref={leftSidebarRef}
+          className={`left-sidebar${leftActivity ? '' : ' collapsed'}`}
+          style={leftActivity ? { width: `${resourcePanelWidth}%` } : { width: '48px' }}
+        >
           <div className="activity-bar">
             <button
               className={`activity-bar-icon${leftActivity === 'files' ? ' active' : ''}`}
@@ -6505,7 +6416,7 @@ export function App() {
           {leftActivity === 'files' && (
         <aside
           className={`file-panel${isDragOver ? ' is-drag-over' : ''}`}
-          style={{ gridTemplateRows: `42px auto minmax(0, 1fr) ${resourceBottomPanelHeight}px` }}
+          style={{ gridTemplateRows: '42px auto minmax(0, 1fr)' }}
           tabIndex={0}
           onKeyDown={handleResourceKeyDown}
           onDragOver={handleDragOver}
@@ -6731,161 +6642,6 @@ export function App() {
                     </div>
                   )}
                 </div>
-              </div>
-
-              <div
-                className="resource-bottom-panel"
-                ref={resourceBottomPanelRef}
-                style={{ height: resourceBottomPanelHeight }}
-              >
-                <div
-                  className="resource-bottom-resizer"
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-                    resourceBottomDragRef.current = { startY: e.clientY, startHeight: resourceBottomPanelHeight };
-                  }}
-                  onPointerMove={(e) => {
-                    const drag = resourceBottomDragRef.current;
-                    if (!drag) return;
-                    const delta = drag.startY - e.clientY; // 向上拖 = 增大高度
-                    const newHeight = Math.max(80, Math.min(drag.startHeight + delta, 500));
-                    setResourceBottomPanelHeight(newHeight);
-                  }}
-                  onPointerUp={() => {
-                    resourceBottomDragRef.current = null;
-                  }}
-                />
-                <div className="resource-bottom-tabs">
-                  <button
-                    className={resourceBottomTab === 'transfer' ? 'resource-bottom-tab active' : 'resource-bottom-tab'}
-                    onClick={() => setResourceBottomTab('transfer')}
-                  >
-                    传输
-                  </button>
-                  <button
-                    className={resourceBottomTab === 'log' ? 'resource-bottom-tab active' : 'resource-bottom-tab'}
-                    onClick={() => setResourceBottomTab('log')}
-                  >
-                    日志
-                  </button>
-                </div>
-                {resourceBottomTab === 'transfer' ? (
-                  <div className="resource-bottom-content transfer-table-wrap">
-                    {transferRecords.length === 0 ? (
-                      <div className="resource-bottom-empty">暂无传输任务</div>
-                    ) : (
-                      <table className="transfer-table">
-                        <thead>
-                          <tr>
-                            <th className="transfer-th-index">序号</th>
-                            <th className="transfer-th-direction">类型</th>
-                            <th className="transfer-th-name">文件名称</th>
-                            <th className="transfer-th-status">状态</th>
-                            <th className="transfer-th-size">文件大小</th>
-                            <th className="transfer-th-speed">速度</th>
-                            <th className="transfer-th-time">时间</th>
-                            <th className="transfer-th-action">操作</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {transferRecords.map((record, idx) => {
-                            const statusLabel = transferStatusLabel(record);
-                            const statusDetail = transferStatusDetail(record);
-                            return (
-                              <tr key={record.id} className={`transfer-row ${record.status}`}>
-                                <td className="transfer-td-index">{idx + 1}</td>
-                                <td className="transfer-td-direction">
-                                  <span className={`transfer-direction ${record.direction}`}>
-                                    {transferKindLabel(record.direction)}
-                                  </span>
-                                </td>
-                                <td className="transfer-td-name">
-                                  <div className="transfer-name-cell">
-                                    <span className="transfer-filename" title={record.fileName}>
-                                      {record.fileName}
-                                    </span>
-                                    {record.status === 'uploading' && record.progress >= 0 && (
-                                      <div className="transfer-progress-bar">
-                                        <div className="transfer-progress-fill" style={{ width: `${record.progress}%` }} />
-                                      </div>
-                                    )}
-                                  </div>
-                                </td>
-                                <td className="transfer-td-status">
-                                  <div className="transfer-status-cell">
-                                    <span
-                                      className={`transfer-status-badge ${record.status}`}
-                                      title={statusDetail || statusLabel}
-                                    >
-                                      {statusLabel}
-                                    </span>
-                                    {statusDetail && (
-                                      <span className="transfer-status-detail" title={statusDetail}>
-                                        {statusDetail}
-                                      </span>
-                                    )}
-                                  </div>
-                                </td>
-                                <td className="transfer-td-size">
-                                  {record.status === 'uploading' && record.progress >= 0 ? (
-                                    <span className="transfer-size-progress">
-                                      {formatFileSize(record.transferred)} / {formatFileSize(record.size)}
-                                    </span>
-                                  ) : (
-                                    formatFileSize(record.size)
-                                  )}
-                                </td>
-                                <td className="transfer-td-speed">
-                                  {record.status === 'uploading' && record.progress >= 0 && record.speed > 0 ? (
-                                    <span className="transfer-speed-active">{formatSpeed(record.speed)}</span>
-                                  ) : record.status === 'uploading' ? (
-                                    <span className="transfer-speed-none">-</span>
-                                  ) : record.status === 'success' && record.speed > 0 ? (
-                                    <span className="transfer-speed-avg">{formatSpeed(record.speed)}</span>
-                                  ) : (
-                                    <span className="transfer-speed-none">-</span>
-                                  )}
-                                </td>
-                                <td className="transfer-td-time">{record.time}</td>
-                                <td className="transfer-td-action">
-                                  {record.status === 'uploading' || record.status === 'pending' ? (
-                                    <button
-                                      className="transfer-btn transfer-btn-cancel"
-                                      onClick={() => cancelUpload(record.id)}
-                                      title={`取消${transferKindLabel(record.direction)}`}
-                                    >
-                                      取消
-                                    </button>
-                                  ) : (
-                                    <button
-                                      className="transfer-btn transfer-btn-remove"
-                                      onClick={() => deleteTransferRecord(record.id)}
-                                      title="删除记录"
-                                    >
-                                      删除
-                                    </button>
-                                  )}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-                ) : (
-                  <div className="resource-bottom-content resource-log-view">
-                    {logEntries.length === 0 ? (
-                      <div className="resource-bottom-empty">暂无日志</div>
-                    ) : logEntries.map((entry) => (
-                      <div key={entry.id} className={`resource-log-line ${entry.level}`}>
-                        <span className="resource-log-time">{entry.time}</span>
-                        <span className="resource-log-text">{entry.text}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
               </div>
         </aside>
         )}
@@ -7829,13 +7585,15 @@ export function App() {
           onPointerDown={startResourceResize}
         />
 
-        <section className={`terminal-panel${activeTab?.kind === 'terminal' ? ' terminal-panel-terminal-only' : ''}${activeTab?.kind !== 'terminal' && tabs.filter((tab) => !tab.parentTabId).length === 0 ? ' terminal-panel-no-tabs' : ''}`}>
-          {activeTab?.kind !== 'terminal' && tabs.filter((tab) => !tab.parentTabId).length > 0 && (
+        <section
+          className={`terminal-panel${activeTab?.kind === 'terminal' ? ' terminal-panel-terminal-only' : ''}${activeTab?.kind !== 'terminal' && tabs.filter((tab) => !tab.parentTabId && tab.session.id !== localSession.id).length === 0 ? ' terminal-panel-no-tabs' : ''}`}
+        >
+          {activeTab?.kind !== 'terminal' && tabs.filter((tab) => !tab.parentTabId && tab.session.id !== localSession.id).length > 0 && (
             <div className="workspace-tabs" ref={workspaceTabsRef} onDoubleClick={(event) => {
               if ((event.target as HTMLElement).closest('.workspace-tab, .workspace-tab-add')) return;
               openNewConnectionTab();
             }}>
-              {tabs.filter((tab) => !tab.parentTabId).map((tab) => (
+              {tabs.filter((tab) => !tab.parentTabId && tab.session.id !== localSession.id).map((tab) => (
                 <div
                   key={tab.id}
                   ref={(el) => {
@@ -7973,10 +7731,12 @@ export function App() {
             )}
           </div>
 
-          <footer className="status-bar">
-            <span title={statusMessage}>{truncateStatus(statusMessage)}</span>
-            <span>{tabs.length} 个标签页</span>
-          </footer>
+          <ResourceBottomPanel
+            onCancelTransfer={cancelUpload}
+            openLocalTerminalKey={openLocalTerminalKey}
+          />
+
+          <StatusBar tabCount={tabs.length} />
         </section>
       </section>
 

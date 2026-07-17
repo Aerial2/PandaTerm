@@ -7,7 +7,6 @@ import {
   Search,
   Server,
   X,
-  Monitor,
   Copy,
   ShieldCheck,
   LockKeyhole,
@@ -65,19 +64,6 @@ type ContextMenuState = {
   y: number;
   session: Session;
 } | null;
-
-const localSession: Session = {
-  id: 'local-system',
-  name: '本地终端',
-  group: 'Local',
-  host: 'localhost',
-  port: 0,
-  username: '',
-  auth: { type: 'agent' },
-  tags: ['local'],
-  last_connected_at: null,
-  reconnect: { enabled: false, max_attempts: 0, delay_ms: 0 },
-};
 
 export function ConnectionWindow() {
   const windowLabelRef = useRef<string>(initialWindowLabel);
@@ -224,7 +210,8 @@ export function ConnectionWindow() {
       }
     });
 
-    // Detect window label, apply dark mode, and show window
+    // Detect window label, apply dark mode, and show window (warm 预热时不主动显示)
+    const isWarm = new URLSearchParams(window.location.search).get('warm') === '1';
     import('@tauri-apps/api/webviewWindow').then(({ getCurrentWebviewWindow }) => {
       const win = getCurrentWebviewWindow();
       const label = win.label;
@@ -234,7 +221,7 @@ export function ConnectionWindow() {
       if (label === 'connection-create') {
         setMode('create');
       }
-      void win.show().then(async () => {
+      const afterVisible = async () => {
         try {
           const { invoke } = await import('@tauri-apps/api/core');
           await invoke('apply_window_dark_mode', { windowLabel: win.label });
@@ -242,7 +229,13 @@ export function ConnectionWindow() {
           // Non-critical — window border stays light on failure
           console.warn('Failed to apply dark mode:', e);
         }
-      });
+      };
+      if (isWarm) {
+        // 预热实例保持隐藏，等主窗口 openConnectionWindow 再 show
+        void afterVisible();
+        return;
+      }
+      void win.show().then(afterVisible);
     });
 
     // Add body class to override global min-width/min-height for this window
@@ -577,7 +570,8 @@ export function ConnectionWindow() {
     try {
       const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const win = getCurrentWebviewWindow();
-      await win.close();
+      // 隐藏复用，避免下次打开冷启动整个 Webview
+      await win.hide();
     } catch (e) {
       console.error('Failed to close window:', e);
     }
@@ -653,18 +647,6 @@ export function ConnectionWindow() {
 
             {/* Table */}
             <div className="connection-table-wrap">
-              {/* Local terminal card */}
-              <div
-                className={`connection-local-card ${selectedSessionId === localSession.id ? 'selected' : ''}`}
-                onClick={() => setSelectedSessionId(localSession.id)}
-                onDoubleClick={() => void emitConnectSession(localSession)}
-                onContextMenu={(e) => handleRowContextMenu(e, localSession)}
-              >
-                <Monitor size={18} className="connection-local-icon" />
-                <span className="connection-local-name">本地终端</span>
-                <span className="connection-local-desc">在本机打开一个终端</span>
-              </div>
-
               {filteredSessions.length > 0 ? (
                 <table className="connection-table" ref={connTableRef}>
                   <thead>
@@ -746,12 +728,8 @@ export function ConnectionWindow() {
                 </button>
                 <button className="connection-card-action" disabled={!selectedSessionId}
                   onClick={() => {
-                    if (selectedSessionId === localSession.id) {
-                      void emitConnectSession(localSession);
-                    } else {
-                      const s = sessions.find(s => s.id === selectedSessionId);
-                      if (s) void emitConnectSession(s);
-                    }
+                    const s = sessions.find(s => s.id === selectedSessionId);
+                    if (s) void emitConnectSession(s);
                   }}>
                   连接
                 </button>
@@ -909,22 +887,16 @@ export function ConnectionWindow() {
           <button className="connection-context-item" onClick={() => { void emitConnectSession(contextMenu.session); setContextMenu(null); }}>
             <Server size={14} /><span>连接</span>
           </button>
-          {contextMenu.session.id !== localSession.id && (
-            <button className="connection-context-item" onClick={() => { loadSessionToForm(contextMenu.session); setContextMenu(null); }}>
-              <Edit size={14} /><span>编辑</span>
-            </button>
-          )}
+          <button className="connection-context-item" onClick={() => { loadSessionToForm(contextMenu.session); setContextMenu(null); }}>
+            <Edit size={14} /><span>编辑</span>
+          </button>
           <button className="connection-context-item" onClick={() => { handleCopySessionInfo(contextMenu.session); setContextMenu(null); }}>
             <Copy size={14} /><span>复制信息</span>
           </button>
-          {contextMenu.session.id !== localSession.id && (
-            <>
-              <div className="connection-context-divider" />
-              <button className="connection-context-item danger" onClick={() => { void deleteConnectionSession(contextMenu.session); }}>
-                <Trash2 size={14} /><span>删除</span>
-              </button>
-            </>
-          )}
+          <div className="connection-context-divider" />
+          <button className="connection-context-item danger" onClick={() => { void deleteConnectionSession(contextMenu.session); }}>
+            <Trash2 size={14} /><span>删除</span>
+          </button>
         </div>
       )}
     </div>

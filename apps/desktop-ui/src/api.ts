@@ -12,71 +12,173 @@ export async function writeClipboardText(text: string): Promise<void> {
   await writeNativeClipboardText(text);
 }
 
-export async function openConnectionWindow(mode: 'manage' | 'create') {
-  const { WebviewWindow, getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-  const label = mode === 'create' ? 'connection-create' : 'connection-panel';
-  const payload = { mode, target: label };
+type ConnectionWindowMode = 'manage' | 'create';
 
-  // A rapid repeated click can reach this branch while the first window is
-  // still being created. Reuse that instance instead of creating duplicates.
-  const existing = await WebviewWindow.getByLabel(label);
-  if (existing) {
-    await existing.emit('connection-window-set-mode', payload);
-    await existing.show();
-    await existing.setFocus();
-    return;
-  }
+function connectionWindowLabel(mode: ConnectionWindowMode) {
+  return mode === 'create' ? 'connection-create' : 'connection-panel';
+}
 
-  const windowOpts = mode === 'create'
-    ? { width: 640, height: 520, minWidth: 520, minHeight: 420 }
-    : { width: 880, height: 560, minWidth: 720, minHeight: 480 };
+function connectionWindowUrl(mode: ConnectionWindowMode, warm = false) {
+  const connectionMode = `connectionMode=${mode}`;
+  const warmQuery = warm ? '&warm=1' : '';
+  return import.meta.env.DEV
+    ? `http://localhost:1420?mode=connection&${connectionMode}${warmQuery}`
+    : `index.html?mode=connection&${connectionMode}${warmQuery}`;
+}
 
-  // Position the new window centered over the window that opened it, so it
-  // shows up on the same monitor (and in the middle of that window) instead of
-  // snapping back to the primary display.
-  let windowPosition: { x: number; y: number } | { center: true };
+async function getWebviewWindowApi() {
+  return import('@tauri-apps/api/webviewWindow');
+}
+
+async function focusConnectionWindow(
+  win: { emit: (event: string, payload: unknown) => Promise<void>; show: () => Promise<void>; unminimize: () => Promise<void>; setFocus: () => Promise<void> },
+  mode: ConnectionWindowMode,
+  label: string,
+) {
+  await win.emit('connection-window-set-mode', { mode, target: label });
+  await win.show();
+  await win.unminimize().catch(() => undefined);
+  await win.setFocus();
+}
+
+async function resolveParentCenteredPosition(width: number, height: number) {
   try {
+    const { getCurrentWebviewWindow } = await getWebviewWindowApi();
     const parent = getCurrentWebviewWindow();
     const [scale, parentPos, parentSize] = await Promise.all([
       parent.scaleFactor(),
       parent.outerPosition(),
       parent.outerSize(),
     ]);
-    const logicalX = parentPos.x / scale;
-    const logicalY = parentPos.y / scale;
-    const logicalW = parentSize.width / scale;
-    const logicalH = parentSize.height / scale;
-    windowPosition = {
-      x: Math.round(logicalX + (logicalW - windowOpts.width) / 2),
-      y: Math.round(logicalY + (logicalH - windowOpts.height) / 2),
-    };
-  } catch (e) {
-    windowPosition = { center: true };
+    return {
+      x: Math.round(parentPos.x / scale + (parentSize.width / scale - width) / 2),
+      y: Math.round(parentPos.y / scale + (parentSize.height / scale - height) / 2),
+    } as const;
+  } catch {
+    return { center: true } as const;
+  }
+}
+
+/**
+ * 空闲时预热连接窗口（隐藏挂起），避免首次点击冷启动整页 Webview。
+ */
+export function preloadConnectionWindows() {
+  const run = () => {
+    void getWebviewWindowApi();
+    void import('./ConnectionWindow');
+    void warmConnectionWindow('manage').catch(() => undefined);
+  };
+  if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+    window.requestIdleCallback(() => run(), { timeout: 2500 });
+    return;
+  }
+  globalThis.setTimeout(run, 1800);
+}
+
+async function warmConnectionWindow(mode: ConnectionWindowMode) {
+  const { WebviewWindow } = await getWebviewWindowApi();
+  const label = connectionWindowLabel(mode);
+  if (await WebviewWindow.getByLabel(label)) return;
+
+  const creatingKey = mode === 'create' ? '__pandatermConnCreateWarm' : '__pandatermConnManageWarm';
+  const globalAny = globalThis as typeof globalThis & { [key: string]: Promise<void> | undefined };
+  if (globalAny[creatingKey]) {
+    await globalAny[creatingKey];
+    return;
   }
 
-  // Create new window
-  const connectionMode = `connectionMode=${mode}`;
-  const devUrl = import.meta.env.DEV
-    ? `http://localhost:1420?mode=connection&${connectionMode}`
-    : undefined;
-  const entry = import.meta.env.DEV
-    ? undefined
-    : `index.html?mode=connection&${connectionMode}`;
+  const windowOpts =
+    mode === 'create'
+      ? { width: 640, height: 520, minWidth: 520, minHeight: 420 }
+      : { width: 880, height: 560, minWidth: 720, minHeight: 480 };
 
-  const webviewWindow = new WebviewWindow(label, {
-    url: devUrl ?? entry!,
-    title: mode === 'create' ? '新建连接 — PandaTerm' : '连接管理 — PandaTerm',
-    ...windowOpts,
-    ...('x' in windowPosition ? windowPosition : { center: true }),
-    resizable: true,
-    decorations: false,
-    transparent: false,
-    visible: false,
-  });
+  globalAny[creatingKey] = (async () => {
+    const position = await resolveParentCenteredPosition(windowOpts.width, windowOpts.height);
+    // warm=1：页面不主动 show，保持隐藏挂起
+    new WebviewWindow(label, {
+      url: connectionWindowUrl(mode, true),
+      title: mode === 'create' ? '新建连接 — PandaTerm' : '连接管理 — PandaTerm',
+      ...windowOpts,
+      ...('x' in position ? position : { center: true }),
+      resizable: true,
+      decorations: false,
+      transparent: false,
+      visible: false,
+      backgroundColor: '#1e2227',
+    });
+  })();
 
-  webviewWindow.once('tauri://error', (e) => {
-    console.error('Connection window error:', e);
-  });
+  try {
+    await globalAny[creatingKey];
+  } finally {
+    globalAny[creatingKey] = undefined;
+  }
+}
+
+export async function openConnectionWindow(mode: ConnectionWindowMode) {
+  const { WebviewWindow } = await getWebviewWindowApi();
+  const label = connectionWindowLabel(mode);
+  const warmKey = mode === 'create' ? '__pandatermConnCreateWarm' : '__pandatermConnManageWarm';
+  const creatingKey = mode === 'create' ? '__pandatermConnCreateCreating' : '__pandatermConnManageCreating';
+  const globalAny = globalThis as typeof globalThis & { [key: string]: Promise<void> | undefined };
+
+  // 等待预热/创建中的实例，避免并发双开
+  if (globalAny[warmKey]) await globalAny[warmKey].catch(() => undefined);
+  if (globalAny[creatingKey]) {
+    await globalAny[creatingKey].catch(() => undefined);
+    const retryAfterCreate = await WebviewWindow.getByLabel(label);
+    if (retryAfterCreate) {
+      await focusConnectionWindow(retryAfterCreate, mode, label);
+      return;
+    }
+  }
+
+  const existing = await WebviewWindow.getByLabel(label);
+  if (existing) {
+    await focusConnectionWindow(existing, mode, label);
+    return;
+  }
+
+  const windowOpts =
+    mode === 'create'
+      ? { width: 640, height: 520, minWidth: 520, minHeight: 420 }
+      : { width: 880, height: 560, minWidth: 720, minHeight: 480 };
+
+  globalAny[creatingKey] = (async () => {
+    const position = await resolveParentCenteredPosition(windowOpts.width, windowOpts.height);
+    const connectionWindow = new WebviewWindow(label, {
+      url: connectionWindowUrl(mode, false),
+      title: mode === 'create' ? '新建连接 — PandaTerm' : '连接管理 — PandaTerm',
+      ...windowOpts,
+      ...('x' in position ? position : { center: true }),
+      resizable: true,
+      decorations: false,
+      transparent: false,
+      visible: false,
+      backgroundColor: '#1e2227',
+    });
+
+    connectionWindow.once('tauri://error', (e) => {
+      console.error('Connection window error:', e);
+    });
+
+    // 窗口进程创建后立刻显示，不等 React 首屏
+    await new Promise<void>((resolve) => {
+      const done = () => resolve();
+      connectionWindow.once('tauri://created', done);
+      window.setTimeout(done, 1200);
+    });
+
+    await connectionWindow.show().catch(() => undefined);
+    await connectionWindow.setFocus().catch(() => undefined);
+    await connectionWindow.emit('connection-window-set-mode', { mode, target: label }).catch(() => undefined);
+  })();
+
+  try {
+    await globalAny[creatingKey];
+  } finally {
+    globalAny[creatingKey] = undefined;
+  }
 }
 
 export async function openAiSettingsWindow(tab: 'models' | 'mcp' = 'models') {

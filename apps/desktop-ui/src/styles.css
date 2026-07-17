@@ -299,7 +299,7 @@ button:disabled {
 
 .file-panel {
   display: grid;
-  grid-template-rows: 42px auto minmax(0, 1fr) 148px;
+  grid-template-rows: 42px auto minmax(0, 1fr);
   flex: 1;
   min-width: 0;
   min-height: 0;
@@ -2395,6 +2395,19 @@ button:disabled {
   flex-direction: column;
 }
 
+.resource-bottom-panel.is-collapsed {
+  height: auto;
+  flex: 0 0 auto;
+}
+
+.resource-bottom-panel.is-collapsed .resource-bottom-tabs {
+  border-bottom: 0;
+}
+
+.resource-bottom-panel.is-collapsed .resource-bottom-resizer {
+  display: none;
+}
+
 .resource-bottom-resizer {
   height: 6px;
   cursor: row-resize;
@@ -2423,36 +2436,111 @@ button:disabled {
 }
 
 .resource-bottom-tabs {
+  /* 小圆角胶囊（形态同 Cursor），中性色而非高亮蓝底 */
   display: flex;
-  height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 30px;
   flex-shrink: 0;
+  padding: 0 8px 0 10px;
   border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
+}
+
+.resource-bottom-tabs-left {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.resource-bottom-tabs-left::-webkit-scrollbar {
+  display: none;
 }
 
 .resource-bottom-tab {
-  min-width: 76px;
+  min-width: 0;
+  height: 22px;
+  padding: 0 10px;
   border: 0;
-  border-right: 1px solid var(--border-subtle);
+  border-radius: 4px;
   background: transparent;
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 500;
-  transition: color var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
+  line-height: 22px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    color var(--t-fast) var(--ease),
+    background var(--t-fast) var(--ease);
 }
 
 .resource-bottom-tab:hover {
   color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .resource-bottom-tab.active {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.resource-bottom-collapse {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  margin-left: auto;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    color var(--t-fast) var(--ease),
+    background var(--t-fast) var(--ease);
+}
+
+.resource-bottom-collapse:hover {
   color: var(--text-secondary);
-  background: rgba(97, 175, 239, 0.04);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .resource-bottom-content {
   flex: 1;
   min-height: 0;
   overflow: auto;
+}
+
+.resource-local-terminal-wrap {
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-terminal, #1e1e1e);
+  padding: 0;
+}
+
+.resource-local-terminal-host {
+  position: absolute;
+  inset: 4px 8px;
+  width: auto;
+  height: auto;
+  min-height: 0;
+  cursor: text;
+}
+
+.resource-local-terminal-host .xterm {
+  width: 100%;
+  height: 100%;
+}
+
+.resource-local-terminal-host .xterm-viewport {
+  background: var(--bg-terminal, #1e1e1e) !important;
 }
 
 .resource-bottom-empty {
@@ -2498,6 +2586,8 @@ button:disabled {
 
 .transfer-table {
   width: 100%;
+  /* 主工作区宽度足够，仅保留轻微下限 */
+  min-width: 480px;
   border-collapse: collapse;
   table-layout: fixed;
   font-size: 12px;
@@ -2520,13 +2610,10 @@ button:disabled {
 }
 
 .transfer-th-index { width: 40px; text-align: center; }
-.transfer-th-direction { width: 56px; text-align: center; }
-.transfer-th-name { min-width: 0; }
-.transfer-th-status { width: 110px; }
-.transfer-th-size { width: 110px; }
-.transfer-th-speed { width: 78px; }
-.transfer-th-time { width: 86px; }
-.transfer-th-action { width: 68px; text-align: center; }
+.transfer-th-name { width: auto; min-width: 120px; }
+.transfer-th-metrics { width: 150px; }
+.transfer-th-time { width: 130px; }
+.transfer-th-kind { width: 130px; }
 
 .transfer-table td {
   padding: 8px 10px;
@@ -2538,69 +2625,14 @@ button:disabled {
   background: rgba(255, 255, 255, 0.03);
 }
 
+.transfer-table tbody tr {
+  cursor: context-menu;
+}
+
 .transfer-row.uploading .transfer-filename { color: var(--accent-blue); }
 .transfer-row.success .transfer-filename { color: var(--text-primary); }
 .transfer-row.failed .transfer-filename { color: var(--text-primary); }
 .transfer-row.cancelled .transfer-filename { color: var(--text-muted); }
-
-.transfer-td-status {
-  min-width: 0;
-}
-
-.transfer-status-cell {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.transfer-status-badge {
-  display: inline-flex;
-  align-items: center;
-  width: fit-content;
-  max-width: 100%;
-  padding: 2px 7px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1.3;
-  white-space: nowrap;
-}
-
-.transfer-status-badge.pending,
-.transfer-status-badge.uploading {
-  color: #61afef;
-  background: rgba(97, 175, 239, 0.14);
-}
-
-.transfer-status-badge.success {
-  color: #98c379;
-  background: rgba(152, 195, 121, 0.14);
-}
-
-.transfer-status-badge.failed {
-  color: #e06c75;
-  background: rgba(224, 108, 117, 0.14);
-}
-
-.transfer-status-badge.cancelled {
-  color: var(--text-muted);
-  background: rgba(108, 112, 134, 0.14);
-}
-
-.transfer-status-detail {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-muted);
-  font-size: 10px;
-  line-height: 1.3;
-}
-
-.transfer-row.failed .transfer-status-detail {
-  color: rgba(224, 108, 117, 0.9);
-}
 
 .transfer-td-index {
   text-align: center;
@@ -2608,69 +2640,72 @@ button:disabled {
   font-size: 11px;
 }
 
-.transfer-td-direction {
-  text-align: center;
+/* 统一左右纯文本：左 | 右 */
+.transfer-td-kind,
+.transfer-td-metrics,
+.transfer-td-time {
+  min-width: 0;
+  font-size: 11px;
   white-space: nowrap;
 }
 
-.transfer-direction {
+.transfer-inline-text {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  min-width: 34px;
-  padding: 2px 6px;
-  border-radius: 3px;
-  font-size: 10px;
-  line-height: 1.2;
+  gap: 6px;
+  max-width: 100%;
   color: var(--text-secondary);
-  background: rgba(255, 255, 255, 0.05);
+  font-variant-numeric: tabular-nums;
 }
 
-.transfer-direction.upload { color: var(--accent-blue); }
-.transfer-direction.download { color: var(--accent-green); }
-.transfer-direction.open { color: var(--text-muted); }
-
-.transfer-td-size {
-  color: var(--text-secondary);
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-.transfer-td-time {
+.transfer-inline-sep {
   color: var(--text-muted);
-  font-size: 11px;
-  white-space: nowrap;
+  opacity: 0.7;
+  flex-shrink: 0;
 }
 
-.transfer-td-action {
-  text-align: center;
+.transfer-inline-value {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.transfer-td-speed {
-  font-size: 11px;
-  white-space: nowrap;
-  text-align: right;
+.transfer-inline-value.is-muted {
+  color: var(--text-muted);
 }
 
-.transfer-speed-active {
+.transfer-inline-value.is-active {
   color: var(--accent-blue);
   font-weight: 500;
-  font-variant-numeric: tabular-nums;
 }
 
-.transfer-speed-avg {
-  color: var(--accent-green);
-  font-variant-numeric: tabular-nums;
+.transfer-inline-value.is-avg {
+  color: var(--accent-green, #98c379);
 }
 
-.transfer-speed-none {
+.transfer-kind-status {
+  color: var(--text-primary);
+}
+
+.transfer-kind-status.failed {
+  color: var(--accent-red, #e06c75);
+}
+
+.transfer-kind-status.cancelled {
   color: var(--text-muted);
-  opacity: 0.5;
 }
 
-.transfer-size-progress {
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
+.transfer-kind-status.pending,
+.transfer-kind-status.uploading {
+  color: var(--accent-blue);
+}
+
+.transfer-kind-status.success {
+  color: var(--accent-green, #98c379);
+}
+
+.transfer-td-name {
+  min-width: 120px;
 }
 
 .transfer-name-cell {
@@ -2688,6 +2723,15 @@ button:disabled {
   font-weight: 500;
 }
 
+.transfer-target {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.25;
+}
+
 .transfer-progress-bar {
   height: 4px;
   background: rgba(255, 255, 255, 0.08);
@@ -2703,54 +2747,38 @@ button:disabled {
   transition: width 0.15s ease-out;
 }
 
-/* Transfer action buttons */
-.transfer-btn {
-  padding: 3px 10px;
-  border: none;
-  border-radius: 4px;
-  font-size: 11px;
-  cursor: pointer;
-  transition: all var(--t-fast) var(--ease);
-  white-space: nowrap;
-}
-
-.transfer-btn-cancel {
-  background: rgba(229, 192, 123, 0.12);
-  color: #e5c07b;
-}
-.transfer-btn-cancel:hover {
-  background: rgba(229, 192, 123, 0.22);
-}
-
-/* 删除记录：中性按钮，状态由「状态」列表达，不靠按钮颜色暗示成败 */
-.transfer-btn-remove {
-  background: rgba(108, 112, 134, 0.12);
-  color: var(--text-secondary);
-}
-.transfer-btn-remove:hover {
-  background: rgba(108, 112, 134, 0.22);
-  color: var(--text-primary);
-}
-
 /* ============================================================
    Terminal Panel — Right side
    ============================================================ */
 
 .terminal-panel {
-  display: grid;
-  grid-template-rows: 40px minmax(0, 1fr) 28px;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   min-height: 0;
   flex: 1;
   background: var(--bg-terminal);
 }
 
-.terminal-panel-terminal-only {
-  grid-template-rows: minmax(0, 1fr) 28px;
+.terminal-panel-terminal-only .workspace-tabs,
+.terminal-panel-no-tabs .workspace-tabs {
+  display: none;
 }
 
-.terminal-panel-no-tabs {
-  grid-template-rows: minmax(0, 1fr) 28px;
+/* 终端 / 编辑器主区占满剩余高度 */
+.terminal-panel > .workspace-body {
+  flex: 1;
+  min-height: 0;
+}
+
+/* 传输/日志：贴在 workspace-body 下方、状态栏上方 */
+.terminal-panel > .resource-bottom-panel {
+  flex: 0 0 auto;
+  width: 100%;
+}
+
+.terminal-panel > .status-bar {
+  flex: 0 0 auto;
 }
 
 /* Tabs — One Dark style: no border, bottom accent line */
@@ -3283,8 +3311,9 @@ body.terminal-split-resizing-vertical .terminal-split-horizontal > .terminal-spl
 }
 
 .terminal-split-pane.active {
-  border-color: rgba(97, 175, 239, 0.55);
+  /* border-color: rgba(97, 175, 239, 0.55); */
   box-shadow: inset 0 0 0 1px rgba(97, 175, 239, 0.2);
+  border-radius: 6px;
 }
 
 .terminal-split-pane.active .terminal-pane-tabbar {
