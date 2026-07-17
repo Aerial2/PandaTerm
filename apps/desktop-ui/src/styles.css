@@ -2518,6 +2518,10 @@ button:disabled {
   overflow: auto;
 }
 
+.resource-bottom-content .xterm-scrollable-element {
+  background-color: #23272E!important;
+}
+
 .resource-local-terminal-wrap {
   position: relative;
   overflow: hidden;
