@@ -3,14 +3,46 @@ import {
   Activity,
   Bot,
   Cpu,
+  Eye,
+  EyeOff,
   FolderOpen,
   Plus,
   Server,
   Settings,
 } from 'lucide-react';
 
+const SHOW_IP_STORAGE_KEY = 'pandaterm.topStatus.showIp';
+
+function readShowIpPreference(): boolean {
+  try {
+    const value = localStorage.getItem(SHOW_IP_STORAGE_KEY);
+    if (value === null) return true;
+    return value === '1';
+  } catch {
+    return true;
+  }
+}
+
+function writeShowIpPreference(show: boolean) {
+  try {
+    localStorage.setItem(SHOW_IP_STORAGE_KEY, show ? '1' : '0');
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+/** 隐藏主机：保留长度感，避免直接露出 IP / 域名 */
+function maskHost(host: string): string {
+  if (!host) return '••••';
+  const len = Math.min(Math.max(host.length, 4), 16);
+  return '•'.repeat(len);
+}
+
 type TopMenubarProps = {
-  sessionLabel: string;
+  /** 会话名；空则不渲染状态区文字 */
+  sessionName?: string;
+  sessionUser?: string;
+  sessionHost?: string;
   onOpenConnectionCreate: () => void;
   onOpenConnectionManage: () => void;
   onOpenAiSettings: () => void;
@@ -21,13 +53,22 @@ type TopMenubarProps = {
  * 顶部菜单独立 state，避免 activeMenu 切换拖垮整个 App 重渲染。
  */
 export function TopMenubar({
-  sessionLabel,
+  sessionName = '',
+  sessionUser = '',
+  sessionHost = '',
   onOpenConnectionCreate,
   onOpenConnectionManage,
   onOpenAiSettings,
   onSetLeftActivity,
 }: TopMenubarProps) {
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
+  const [showIp, setShowIp] = useState(readShowIpPreference);
+
+  const hasSession = Boolean(sessionName || sessionUser || sessionHost);
+  const displayHost = showIp ? sessionHost : maskHost(sessionHost);
+  const statusText = hasSession
+    ? `${sessionName}${sessionName && (sessionUser || sessionHost) ? ' · ' : ''}${sessionUser}${sessionUser || sessionHost ? '@' : ''}${displayHost}`
+    : '';
 
   useEffect(() => {
     if (!activeMenu) return;
@@ -41,6 +82,14 @@ export function TopMenubar({
   function runAndClose(action: () => void) {
     setActiveMenu(null);
     action();
+  }
+
+  function toggleShowIp() {
+    setShowIp((current) => {
+      const next = !current;
+      writeShowIpPreference(next);
+      return next;
+    });
   }
 
   return (
@@ -155,7 +204,28 @@ export function TopMenubar({
         </div>
       </nav>
 
-      <div className="top-status">{sessionLabel}</div>
+      <div className="top-status">
+        {hasSession && (
+          <>
+            <span
+              className="top-status-text"
+              title={showIp ? statusText : undefined}
+            >
+              {statusText}
+            </span>
+            <button
+              type="button"
+              className="top-status-ip-toggle"
+              onClick={toggleShowIp}
+              title={showIp ? '隐藏 IP' : '显示 IP'}
+              aria-label={showIp ? '隐藏 IP' : '显示 IP'}
+              aria-pressed={showIp}
+            >
+              {showIp ? <Eye size={14} /> : <EyeOff size={14} />}
+            </button>
+          </>
+        )}
+      </div>
     </header>
   );
 }

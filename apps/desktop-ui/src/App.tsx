@@ -353,6 +353,8 @@ export function App() {
     ?? aiConversations[0];
   const aiMessages = activeAiConversation?.messages ?? [];
   const [aiInput, setAiInput] = useState('');
+  /** AI 主输入框：按内容撑高，上限后内部滚动 */
+  const aiInputRef = useRef<HTMLTextAreaElement | null>(null);
   const [editingUserMessageId, setEditingUserMessageId] = useState<string | null>(null);
   const [editingUserMessageDraft, setEditingUserMessageDraft] = useState('');
   const [isAiGenerating, setIsAiGenerating] = useState(false);
@@ -535,6 +537,14 @@ export function App() {
       window.removeEventListener('scroll', onScroll, true);
     };
   }, [aiComposerMenu]);
+
+  // Cursor 风格：输入框随内容增高，清空/程序改值时同步收起
+  useEffect(() => {
+    const el = aiInputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }, [aiInput]);
 
   useEffect(() => {
     if (isAiSettingsOpen) return;
@@ -4124,76 +4134,74 @@ export function App() {
     setAiInput((current) => current.replace(/(^|\s)@[^\s@]*$/, '$1'));
   }
 
-  function requestAiContext(kind: AiContextKind, resource?: ResourceFile) {
+  async function requestAiContext(kind: AiContextKind, resource?: ResourceFile) {
     const terminalTabId = activePaneTabRef.current?.id ?? null;
     const editorTabId = activeEditorTabId;
     const targetTerminalId = activePaneTabRef.current?.terminalId ?? null;
     const targetIsLocal = isLocalResourceTab(activePaneTabRef.current);
     const label = resource?.name
       ?? (kind === 'terminal' ? '当前终端输出' : kind === 'selection' ? '终端选中文本' : '当前编辑器文件');
-    setConfirmDialog({
-      title: '允许 AI 读取上下文',
-      message: `PandaTerm AI 将读取“${label}”并仅用于本次消息。原始内容不会写入会话历史文件。`,
-      confirmLabel: '允许读取',
-      onConfirm: async () => {
-        if (resource) {
-          const preview = targetIsLocal
-            ? await readLocalFileFull(resource.path)
-            : targetTerminalId
-              ? await readRemoteFileFull(targetTerminalId, resource.path)
-              : null;
-          if (!preview) throw new Error('目标终端已经不可用');
-          addPendingAiContext({
-            kind: 'file',
-            label: resource.name,
-            source: resource.path,
-            preview: preview.content.slice(0, 8000),
-            isRemote: !targetIsLocal,
-            terminalId: targetTerminalId ?? undefined,
-          });
-          return;
-        }
-        if (kind === 'terminal') {
-          const tab = tabsRef.current.find((item) => item.id === terminalTabId);
-          if (!tab) throw new Error('目标终端已经关闭');
-          const recentOutput = tab.output.join('').slice(-6000).trim();
-          addPendingAiContext({
-            kind,
-            label: tab.title || tab.session.name,
-            source: tab.id,
-            preview: recentOutput || `${tab.statusMessage}\n状态：${tab.status}`,
-            isRemote: !targetIsLocal,
-            terminalId: targetTerminalId ?? undefined,
-          });
-          return;
-        }
-        if (kind === 'selection') {
-          const selection = terminalTabId
-            ? terminalsRef.current.get(terminalTabId)?.getSelection().trim() ?? ''
-            : '';
-          if (!selection) throw new Error('终端选中文本已经不可用');
-          addPendingAiContext({
-            kind,
-            label,
-            source: terminalTabId ?? undefined,
-            preview: selection.slice(0, 4000),
-            isRemote: !targetIsLocal,
-            terminalId: targetTerminalId ?? undefined,
-          });
-          return;
-        }
-        const editorTab = editorTabs.find((tab) => tab.id === editorTabId);
-        if (!editorTab) throw new Error('目标编辑器文件已经关闭');
+
+    try {
+      if (resource) {
+        const preview = targetIsLocal
+          ? await readLocalFileFull(resource.path)
+          : targetTerminalId
+            ? await readRemoteFileFull(targetTerminalId, resource.path)
+            : null;
+        if (!preview) throw new Error('目标终端已经不可用');
+        addPendingAiContext({
+          kind: 'file',
+          label: resource.name,
+          source: resource.path,
+          preview: preview.content.slice(0, 8000),
+          isRemote: !targetIsLocal,
+          terminalId: targetTerminalId ?? undefined,
+        });
+        return;
+      }
+      if (kind === 'terminal') {
+        const tab = tabsRef.current.find((item) => item.id === terminalTabId);
+        if (!tab) throw new Error('目标终端已经关闭');
+        const recentOutput = tab.output.join('').slice(-6000).trim();
         addPendingAiContext({
           kind,
-          label: editorTab.name,
-          source: editorTab.path,
-          preview: editorTab.content.slice(0, 8000),
-          isRemote: editorTab.isRemote,
-          terminalId: editorTab.terminalId,
+          label: tab.title || tab.session.name,
+          source: tab.id,
+          preview: recentOutput || `${tab.statusMessage}\n状态：${tab.status}`,
+          isRemote: !targetIsLocal,
+          terminalId: targetTerminalId ?? undefined,
         });
-      },
-    });
+        return;
+      }
+      if (kind === 'selection') {
+        const selection = terminalTabId
+          ? terminalsRef.current.get(terminalTabId)?.getSelection().trim() ?? ''
+          : '';
+        if (!selection) throw new Error('终端选中文本已经不可用');
+        addPendingAiContext({
+          kind,
+          label,
+          source: terminalTabId ?? undefined,
+          preview: selection.slice(0, 4000),
+          isRemote: !targetIsLocal,
+          terminalId: targetTerminalId ?? undefined,
+        });
+        return;
+      }
+      const editorTab = editorTabs.find((tab) => tab.id === editorTabId);
+      if (!editorTab) throw new Error('目标编辑器文件已经关闭');
+      addPendingAiContext({
+        kind,
+        label: editorTab.name,
+        source: editorTab.path,
+        preview: editorTab.content.slice(0, 8000),
+        isRemote: editorTab.isRemote,
+        terminalId: editorTab.terminalId,
+      });
+    } catch (error) {
+      setAiConversationError(error instanceof Error ? error.message : String(error));
+    }
   }
 
   function beginAiGeneration(
@@ -5620,7 +5628,9 @@ export function App() {
   return (
     <main className="ssh-workbench" onDragOver={handleGlobalDragOver} onDrop={handleGlobalDrop}>
       <TopMenubar
-        sessionLabel={activeSession ? `${activeSession.name} · ${activeSession.username}@${activeSession.host}` : ''}
+        sessionName={activeSession?.name ?? ''}
+        sessionUser={activeSession?.username ?? ''}
+        sessionHost={activeSession?.host ?? ''}
         onOpenConnectionCreate={() => {
           void openConnectionWindow('create');
         }}
@@ -6399,13 +6409,18 @@ export function App() {
               )}
               <div className="ai-input-shell">
                 <textarea
+                  ref={aiInputRef}
                   value={aiInput}
-                  rows={3}
+                  rows={1}
                   placeholder="向 PandaTerm AI 提问，输入 @ 添加上下文"
                   onChange={(event) => {
-                    const value = event.target.value;
+                    const el = event.target;
+                    const value = el.value;
                     setAiInput(value);
                     setIsAiMentionOpen(/(^|\s)@[^\s@]*$/.test(value));
+                    // 先收再撑，才能正确收缩/增高
+                    el.style.height = 'auto';
+                    el.style.height = `${el.scrollHeight}px`;
                   }}
                   onKeyDown={(event) => {
                     if (event.key === 'Escape') setIsAiMentionOpen(false);
