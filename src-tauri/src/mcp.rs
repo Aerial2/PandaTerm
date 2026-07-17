@@ -1,7 +1,8 @@
 //! Model Context Protocol (MCP) client for PandaTerm.
 //!
 //! Cursor-compatible config shape under `~/.pandaterm/mcp.json`.
-//! Runtime: stdio (JSON-RPC + Content-Length) and streamable-http (JSON / SSE responses).
+//! Runtime: stdio (newline-delimited JSON-RPC) and streamable-http (JSON / SSE responses).
+//! Legacy Content-Length framing is still accepted on read for older servers.
 //! Legacy pure SSE (GET event stream) is not implemented; URL transports use streamable-http client.
 
 use std::collections::HashMap;
@@ -23,7 +24,8 @@ pub const MCP_CONFIG_VERSION: u8 = 1;
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MCP_HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const MCP_INIT_TIMEOUT: Duration = Duration::from_secs(20);
+/// uvx/npx 首次拉包可能较慢，initialize 给更宽裕窗口
+const MCP_INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_MCP_SERVERS: usize = 40;
 const MAX_MCP_TOOLS: usize = 200;
 const MAX_ENV_ENTRIES: usize = 64;
@@ -807,17 +809,21 @@ fn snapshot_server(
 }
 
 // ── Framing ─────────────────────────────────────────────────────────────
+//
+// MCP stdio transport（现行规范）：每条消息为单行 JSON-RPC，以 `\n` 分隔，消息体内禁止换行。
+// 写入统一使用 NDJSON；读取同时兼容少数旧实现的 Content-Length 帧。
 
 fn encode_mcp_message(body: &Value) -> Result<Vec<u8>, String> {
-    let json = serde_json::to_vec(body).map_err(|error| format!("MCP 请求序列化失败：{error}"))?;
-    let header = format!("Content-Length: {}\r\n\r\n", json.len());
-    let mut frame = header.into_bytes();
-    frame.extend_from_slice(&json);
-    Ok(frame)
+    let mut json = serde_json::to_vec(body).map_err(|error| format!("MCP 请求序列化失败：{error}"))?;
+    // 规范要求消息不得嵌入换行；serde 默认紧凑序列化已满足
+    if json.iter().any(|b| *b == b'\n' || *b == b'\r') {
+        return Err("MCP 请求 JSON 含非法换行".to_string());
+    }
+    json.push(b'\n');
+    Ok(json)
 }
 
 async fn read_mcp_message(reader: &mut BufReader<ChildStdout>) -> Result<Value, String> {
-    let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
         let n = reader
@@ -829,29 +835,54 @@ async fn read_mcp_message(reader: &mut BufReader<ChildStdout>) -> Result<Value, 
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
-            break;
+            continue;
         }
+
+        // 兼容旧 Content-Length 帧（LSP 风格）
         if let Some(rest) = trimmed
             .strip_prefix("Content-Length:")
             .or_else(|| trimmed.strip_prefix("content-length:"))
         {
-            content_length = Some(
-                rest.trim()
-                    .parse::<usize>()
-                    .map_err(|_| "MCP Content-Length 无效".to_string())?,
-            );
+            let length = rest
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "MCP Content-Length 无效".to_string())?;
+            // 读完剩余 header 直到空行
+            loop {
+                let mut header_line = String::new();
+                let hn = reader
+                    .read_line(&mut header_line)
+                    .await
+                    .map_err(|error| format!("MCP 响应读取失败：{error}"))?;
+                if hn == 0 {
+                    return Err("MCP 进程已退出".to_string());
+                }
+                if header_line.trim_end_matches(['\r', '\n']).is_empty() {
+                    break;
+                }
+            }
+            if length > 8 * 1024 * 1024 {
+                return Err("MCP 响应体过大".to_string());
+            }
+            let mut body = vec![0u8; length];
+            reader
+                .read_exact(&mut body)
+                .await
+                .map_err(|error| format!("MCP 响应体读取失败：{error}"))?;
+            return serde_json::from_slice(&body)
+                .map_err(|error| format!("MCP 响应 JSON 无效：{error}"));
+        }
+
+        // 现行 NDJSON：整行即一条 JSON-RPC 消息
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => return Ok(value),
+            Err(_) => {
+                // 个别服务器会把日志误打到 stdout，跳过非 JSON 行
+                eprintln!("[MCP] skip non-json stdio line: {}", trimmed.chars().take(200).collect::<String>());
+                continue;
+            }
         }
     }
-    let length = content_length.ok_or_else(|| "MCP 响应缺少 Content-Length".to_string())?;
-    if length > 8 * 1024 * 1024 {
-        return Err("MCP 响应体过大".to_string());
-    }
-    let mut body = vec![0u8; length];
-    reader
-        .read_exact(&mut body)
-        .await
-        .map_err(|error| format!("MCP 响应体读取失败：{error}"))?;
-    serde_json::from_slice(&body).map_err(|error| format!("MCP 响应 JSON 无效：{error}"))
 }
 
 // ── Runtime ops ─────────────────────────────────────────────────────────
@@ -1040,6 +1071,21 @@ impl McpRuntime {
         }
         for (key, value) in &config.env {
             command.env(key, value);
+        }
+        // Windows 上 Python MCP（如 mcp-server-fetch）无 UTF-8 时可能异常；补默认编码
+        #[cfg(windows)]
+        {
+            let has_ioencoding = config
+                .env
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("PYTHONIOENCODING"));
+            let has_utf8 = config.env.keys().any(|k| k.eq_ignore_ascii_case("PYTHONUTF8"));
+            if !has_ioencoding {
+                command.env("PYTHONIOENCODING", "utf-8");
+            }
+            if !has_utf8 {
+                command.env("PYTHONUTF8", "1");
+            }
         }
         if let Some(cwd) = config.cwd.as_ref() {
             command.current_dir(cwd);
@@ -1909,6 +1955,17 @@ mod tests {
         let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
         let sse_result = parse_sse_jsonrpc_result(sse, &id).expect("sse");
         assert_eq!(sse_result["ok"], true);
+    }
+
+    #[test]
+    fn encode_mcp_message_uses_ndjson() {
+        let frame = encode_mcp_message(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).expect("encode");
+        let text = String::from_utf8(frame).expect("utf8");
+        assert!(text.ends_with('\n'));
+        assert!(!text.contains("Content-Length"));
+        let line = text.trim_end_matches('\n');
+        let value: Value = serde_json::from_str(line).expect("json line");
+        assert_eq!(value["method"], "initialize");
     }
 
     #[test]

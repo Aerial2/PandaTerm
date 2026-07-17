@@ -79,6 +79,88 @@ export async function openConnectionWindow(mode: 'manage' | 'create') {
   });
 }
 
+export async function openAiSettingsWindow(tab: 'models' | 'mcp' = 'models') {
+  const { WebviewWindow, getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+  const label = 'ai-settings';
+  const existing = await WebviewWindow.getByLabel(label);
+  if (existing) {
+    await existing.emit('ai-settings-set-tab', { tab });
+    await existing.show();
+    await existing.unminimize().catch(() => undefined);
+    await existing.setFocus();
+    return;
+  }
+
+  // 防止连点时并发创建多个 webview（首开窗口尚未就绪时 getByLabel 仍为空）
+  const creatingKey = '__pandatermAiSettingsCreating';
+  const globalAny = globalThis as typeof globalThis & { [creatingKey]?: Promise<void> };
+  if (globalAny[creatingKey]) {
+    await globalAny[creatingKey];
+    const retry = await WebviewWindow.getByLabel(label);
+    if (retry) {
+      await retry.emit('ai-settings-set-tab', { tab });
+      await retry.show();
+      await retry.unminimize().catch(() => undefined);
+      await retry.setFocus();
+    }
+    return;
+  }
+
+  const windowOpts = { width: 980, height: 700, minWidth: 760, minHeight: 520 };
+  let position: { x: number; y: number } | { center: true };
+  try {
+    const parent = getCurrentWebviewWindow();
+    const [scale, parentPos, parentSize] = await Promise.all([
+      parent.scaleFactor(),
+      parent.outerPosition(),
+      parent.outerSize(),
+    ]);
+    position = {
+      x: Math.round(parentPos.x / scale + (parentSize.width / scale - windowOpts.width) / 2),
+      y: Math.round(parentPos.y / scale + (parentSize.height / scale - windowOpts.height) / 2),
+    };
+  } catch {
+    position = { center: true };
+  }
+
+  const query = `mode=ai-settings&tab=${tab}`;
+  const url = import.meta.env.DEV
+    ? `http://localhost:1420?${query}`
+    : `index.html?${query}`;
+
+  globalAny[creatingKey] = (async () => {
+    // 使用系统原生标题栏；页面内不再绘制第二套 titlebar
+    const settingsWindow = new WebviewWindow(label, {
+      url,
+      title: 'AI 设置 — PandaTerm',
+      ...windowOpts,
+      ...('x' in position ? position : { center: true }),
+      resizable: true,
+      decorations: true,
+      transparent: false,
+      visible: false,
+      backgroundColor: '#1e2227',
+    });
+
+    settingsWindow.once('tauri://error', (event) => {
+      console.error('AI settings window error:', event);
+    });
+
+    // 轻量窗口就绪后立刻显示，避免“点了没反应”
+    await new Promise<void>((resolve) => {
+      const done = () => resolve();
+      settingsWindow.once('tauri://created', done);
+      window.setTimeout(done, 1500);
+    });
+  })();
+
+  try {
+    await globalAny[creatingKey];
+  } finally {
+    globalAny[creatingKey] = undefined;
+  }
+}
+
 export type AuthType =
   | { type: 'password'; secret_id: string }
   | { type: 'private_key'; key_id: string; passphrase_secret_id?: string | null }
@@ -593,8 +675,16 @@ export async function readLocalFileFull(path: string): Promise<LocalFilePreview>
   return await invoke<LocalFilePreview>('read_local_file_full', { path });
 }
 
-export async function readRemoteFileFull(terminalId: string, path: string): Promise<LocalFilePreview> {
-  return await invoke<LocalFilePreview>('read_remote_file_full', { terminalId, path });
+export async function readRemoteFileFull(
+  terminalId: string,
+  path: string,
+  transferId?: string | null,
+): Promise<LocalFilePreview> {
+  return await invoke<LocalFilePreview>('read_remote_file_full', {
+    terminalId,
+    path,
+    transferId: transferId ?? null,
+  });
 }
 
 export async function writeLocalFileChecked(path: string, expectedContent: string, content: string): Promise<void> {

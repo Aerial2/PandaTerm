@@ -2339,6 +2339,25 @@ button:disabled {
   white-space: nowrap;
 }
 
+.file-inline-rename-input {
+  width: min(320px, 100%);
+  min-width: 80px;
+  height: 24px;
+  border: 1px solid var(--accent-blue);
+  border-radius: 2px;
+  padding: 1px 5px;
+  outline: 0;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font: inherit;
+  line-height: 20px;
+  box-shadow: 0 0 0 1px rgba(97, 175, 239, 0.18);
+}
+
+.file-inline-rename-input:disabled {
+  opacity: 0.65;
+}
+
 .folder-icon {
   color: var(--accent-blue);
 }
@@ -2500,13 +2519,14 @@ button:disabled {
   white-space: nowrap;
 }
 
-.transfer-th-index { width: 44px; text-align: center; }
-.transfer-th-direction { width: 64px; text-align: center; }
+.transfer-th-index { width: 40px; text-align: center; }
+.transfer-th-direction { width: 56px; text-align: center; }
 .transfer-th-name { min-width: 0; }
-.transfer-th-size { width: 130px; }
-.transfer-th-speed { width: 90px; }
-.transfer-th-time { width: 95px; }
-.transfer-th-action { width: 80px; text-align: center; }
+.transfer-th-status { width: 110px; }
+.transfer-th-size { width: 110px; }
+.transfer-th-speed { width: 78px; }
+.transfer-th-time { width: 86px; }
+.transfer-th-action { width: 68px; text-align: center; }
 
 .transfer-table td {
   padding: 8px 10px;
@@ -2518,10 +2538,69 @@ button:disabled {
   background: rgba(255, 255, 255, 0.03);
 }
 
-.transfer-row.uploading .transfer-td-name { color: var(--accent-blue); }
-.transfer-row.success .transfer-td-name { color: var(--accent-green); }
-.transfer-row.failed .transfer-td-name { color: var(--accent-red); }
-.transfer-row.cancelled .transfer-td-name { color: var(--text-muted); }
+.transfer-row.uploading .transfer-filename { color: var(--accent-blue); }
+.transfer-row.success .transfer-filename { color: var(--text-primary); }
+.transfer-row.failed .transfer-filename { color: var(--text-primary); }
+.transfer-row.cancelled .transfer-filename { color: var(--text-muted); }
+
+.transfer-td-status {
+  min-width: 0;
+}
+
+.transfer-status-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.transfer-status-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.transfer-status-badge.pending,
+.transfer-status-badge.uploading {
+  color: #61afef;
+  background: rgba(97, 175, 239, 0.14);
+}
+
+.transfer-status-badge.success {
+  color: #98c379;
+  background: rgba(152, 195, 121, 0.14);
+}
+
+.transfer-status-badge.failed {
+  color: #e06c75;
+  background: rgba(224, 108, 117, 0.14);
+}
+
+.transfer-status-badge.cancelled {
+  color: var(--text-muted);
+  background: rgba(108, 112, 134, 0.14);
+}
+
+.transfer-status-detail {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.transfer-row.failed .transfer-status-detail {
+  color: rgba(224, 108, 117, 0.9);
+}
 
 .transfer-td-index {
   text-align: center;
@@ -2594,14 +2673,6 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
-.transfer-status-msg {
-  font-size: 10px;
-  color: var(--text-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .transfer-name-cell {
   display: flex;
   flex-direction: column;
@@ -2651,28 +2722,14 @@ button:disabled {
   background: rgba(229, 192, 123, 0.22);
 }
 
-.transfer-btn-success {
-  background: rgba(152, 195, 121, 0.12);
-  color: #98c379;
-}
-.transfer-btn-success:hover {
-  background: rgba(152, 195, 121, 0.22);
-}
-
-.transfer-btn-delete {
-  background: rgba(224, 108, 117, 0.12);
-  color: #e06c75;
-}
-.transfer-btn-delete:hover {
-  background: rgba(224, 108, 117, 0.22);
-}
-
-.transfer-btn-cancelled {
+/* 删除记录：中性按钮，状态由「状态」列表达，不靠按钮颜色暗示成败 */
+.transfer-btn-remove {
   background: rgba(108, 112, 134, 0.12);
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
-.transfer-btn-cancelled:hover {
-  background: rgba(108, 112, 134, 0.2);
+.transfer-btn-remove:hover {
+  background: rgba(108, 112, 134, 0.22);
+  color: var(--text-primary);
 }
 
 /* ============================================================
@@ -4579,6 +4636,36 @@ body.connection-reordering {
   font-size: 14px;
 }
 
+.editor-load-progress {
+  display: grid;
+  gap: 8px;
+  width: min(420px, 70%);
+  margin-top: 14px;
+}
+
+.editor-load-progress-track {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+}
+
+.editor-load-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-blue);
+  transition: width 80ms linear;
+}
+
+.editor-load-progress-meta {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
 .editor-error h3 {
   color: var(--text-secondary);
   margin-bottom: 8px;
@@ -4722,15 +4809,73 @@ body.connection-reordering {
   backdrop-filter: blur(6px);
 }
 
+body.has-ai-settings-window,
+html.ai-settings-window-html {
+  min-width: unset;
+  min-height: unset;
+  overflow: hidden;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
+
+/* 原生系统标题栏；页面只铺内容区 */
+.ai-settings-window-root {
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
+
+.ai-settings-window-body {
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex: 1;
+  background: var(--bg-secondary);
+}
+
+.ai-settings-window-body > .ai-settings-panel.ai-settings-panel-cursor {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: var(--bg-secondary);
+}
+
+body.has-ai-settings-window .ssh-workbench > :not(.ai-settings-backdrop):not(.dialog-backdrop) {
+  display: none;
+}
+
+.ai-settings-backdrop.native-window {
+  padding: 0;
+  background: var(--bg-secondary);
+  backdrop-filter: none;
+}
+
+.ai-settings-backdrop.native-window .ai-settings-panel.ai-settings-panel-cursor {
+  width: 100vw;
+  height: 100vh;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: var(--bg-secondary);
+}
+
 .ai-settings-panel {
   display: flex;
   width: min(560px, calc(100vw - 32px));
   max-height: min(720px, calc(100vh - 48px));
   flex-direction: column;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
   border-radius: 12px;
-  background: #1a1b1e;
+  background: var(--bg-secondary);
   box-shadow:
     0 0 0 1px rgba(0, 0, 0, 0.35),
     0 24px 64px rgba(0, 0, 0, 0.55);
@@ -5163,9 +5308,9 @@ body.connection-reordering {
   max-height: min(760px, calc(100vh - 48px));
   flex-direction: row;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
   border-radius: 12px;
-  background: #141518;
+  background: var(--bg-secondary);
   box-shadow:
     0 0 0 1px rgba(0, 0, 0, 0.4),
     0 28px 80px rgba(0, 0, 0, 0.62);
@@ -5178,8 +5323,8 @@ body.connection-reordering {
   flex-direction: column;
   gap: 12px;
   padding: 14px 10px 16px;
-  border-right: 1px solid rgba(255, 255, 255, 0.06);
-  background: #111214;
+  border-right: 1px solid var(--border-subtle);
+  background: var(--bg-tertiary);
 }
 
 .ai-settings-sidebar-top {
@@ -5686,6 +5831,147 @@ body.connection-reordering {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
+}
+
+.ai-settings-mcp-market {
+  display: grid;
+  gap: 10px;
+  margin: 0 14px 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(110, 180, 255, 0.2);
+  border-radius: 10px;
+  background: rgba(80, 140, 220, 0.07);
+}
+
+.ai-settings-mcp-market-toolbar {
+  display: grid;
+  gap: 8px;
+}
+
+.ai-settings-mcp-market-cats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ai-settings-mcp-market-cat {
+  padding: 3px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  color: var(--text-muted);
+  background: rgba(0, 0, 0, 0.16);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.ai-settings-mcp-market-cat:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: rgba(110, 180, 255, 0.35);
+}
+
+.ai-settings-mcp-market-cat.active {
+  color: #b7d8ff;
+  border-color: rgba(110, 180, 255, 0.45);
+  background: rgba(110, 180, 255, 0.14);
+}
+
+.ai-settings-mcp-market-cat:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.ai-settings-mcp-market-list {
+  display: grid;
+  gap: 8px;
+  max-height: 280px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
+.ai-settings-mcp-market-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  padding: 10px 11px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 9px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.ai-settings-mcp-market-card.installed {
+  border-color: rgba(120, 200, 140, 0.28);
+  background: rgba(60, 140, 90, 0.08);
+}
+
+.ai-settings-mcp-market-card-main {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.ai-settings-mcp-market-card-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.ai-settings-mcp-market-card-title strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.ai-settings-mcp-market-card-title em {
+  color: #9ec5ef;
+  font-size: 10.5px;
+  font-style: normal;
+  font-weight: 500;
+}
+
+.ai-settings-mcp-market-tag {
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 10px;
+}
+
+.ai-settings-mcp-market-card-main p {
+  margin: 0;
+  color: var(--text-secondary, #b0b4bc);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.ai-settings-mcp-market-card-main code {
+  display: block;
+  overflow: hidden;
+  color: #8b919c;
+  font-family: Consolas, "Cascadia Mono", "SFMono-Regular", Menlo, Monaco, monospace;
+  font-size: 10.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ai-settings-mcp-market-card-main small {
+  color: #c9a86c;
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.ai-settings-mcp-market-foot {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.ai-settings-mcp-market-link {
+  color: #9ec5ef;
 }
 
 .ai-settings-mcp-import-candidates {

@@ -21,6 +21,11 @@ export type EditorTab = {
   isRemote: boolean;
   terminalId?: string;
   loading: boolean;
+  loadProgress?: {
+    transferred: number;
+    total: number;
+    speed: number;
+  };
   error: string;
   isUntitled?: boolean;
 };
@@ -57,6 +62,12 @@ function detectLanguage(path: string): string {
 export { detectLanguage };
 
 const DARK_THEME = 'pandaterm-dark';
+
+function formatLoadingBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 export function EditorPanel({
   tabs,
@@ -118,6 +129,10 @@ export function EditorPanel({
   }, [activeTabId]);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
+  const activeLoadProgress = activeTab?.loadProgress;
+  const activeLoadPercent = activeLoadProgress && activeLoadProgress.total > 0
+    ? Math.min(100, Math.round((activeLoadProgress.transferred / activeLoadProgress.total) * 100))
+    : null;
 
   // Register save handler for the active tab so Ctrl+S works.
   useEffect(() => {
@@ -187,7 +202,25 @@ export function EditorPanel({
       </div>
       <div className="editor-body">
         {activeTab?.loading ? (
-          <div className="editor-loading">正在加载文件...</div>
+          <div className="editor-loading">
+            <div>正在加载文件...</div>
+            {activeLoadProgress && activeLoadPercent !== null && (
+              <div className="editor-load-progress" aria-label={`文件加载进度 ${activeLoadPercent}%`}>
+                <div className="editor-load-progress-track">
+                  <div className="editor-load-progress-fill" style={{ width: `${activeLoadPercent}%` }} />
+                </div>
+                <div className="editor-load-progress-meta">
+                  <span>{activeLoadPercent}%</span>
+                  <span>
+                    {formatLoadingBytes(activeLoadProgress.transferred)} / {formatLoadingBytes(activeLoadProgress.total)}
+                  </span>
+                  {activeLoadProgress.speed > 0 && (
+                    <span>{formatLoadingBytes(activeLoadProgress.speed)}/s</span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
         ) : activeTab?.error ? (
           <div className="editor-error">
             <h3>无法打开文件</h3>

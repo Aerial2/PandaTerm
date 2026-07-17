@@ -13,6 +13,12 @@ async function bootstrap() {
     return;
   }
 
+  if (windowMode === 'ai-settings') {
+    const { AiSettingsWindow } = await import('./AiSettingsWindow');
+    root.render(<AiSettingsWindow />);
+    return;
+  }
+
   const { default: App } = await import('./App');
   root.render(
     <React.StrictMode>

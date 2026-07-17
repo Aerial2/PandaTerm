@@ -1863,6 +1863,78 @@ async fn exec_remote_command_full_cancellable(
     Ok((stdout, stderr, exit_code))
 }
 
+fn emit_file_open_progress(app: &AppHandle, transfer_id: &str, transferred: usize, total: u64) {
+    let _ = app.emit(
+        "file-open-progress",
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "transferred": transferred,
+            "total": total,
+        }),
+    );
+}
+
+async fn exec_remote_command_full_with_progress(
+    handle: &russh::client::Handle<SshHandler>,
+    command: &str,
+    app: &AppHandle,
+    transfer_id: &str,
+    total: u64,
+    cancellation: &AtomicBool,
+) -> Result<(Vec<u8>, Vec<u8>, Option<i32>), String> {
+    if cancellation.load(Ordering::SeqCst) {
+        return Err("传输已取消".to_string());
+    }
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|error| format!("SSH exec 失败：{error}"))?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code = None;
+    let mut last_progress_emit = Instant::now();
+    emit_file_open_progress(app, transfer_id, 0, total);
+
+    loop {
+        if cancellation.load(Ordering::SeqCst) {
+            let _ = channel.eof().await;
+            let _ = channel.close().await;
+            return Err("传输已取消".to_string());
+        }
+        let message = tokio::select! {
+            message = channel.wait() => message,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                continue;
+            }
+        };
+        match message {
+            Some(ChannelMsg::Data { ref data }) => {
+                stdout.extend_from_slice(data);
+                if last_progress_emit.elapsed() >= Duration::from_millis(80)
+                    || (total > 0 && stdout.len() as u64 >= total)
+                {
+                    emit_file_open_progress(app, transfer_id, stdout.len(), total);
+                    last_progress_emit = Instant::now();
+                }
+            }
+            Some(ChannelMsg::ExtendedData { ref data, .. }) => stderr.extend_from_slice(data),
+            Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status as i32),
+            Some(ChannelMsg::Eof) => {}
+            Some(ChannelMsg::Close) | None => break,
+            _ => {}
+        }
+    }
+    let _ = channel.eof().await;
+    let _ = channel.close().await;
+    emit_file_open_progress(app, transfer_id, stdout.len(), total);
+    Ok((stdout, stderr, exit_code))
+}
+
 /// Parse the structured output produced by the remote `find` listing command.
 fn parse_remote_listing(text: &str) -> Result<LocalDirectoryListing, String> {
     let mut lines = text.lines();
@@ -2429,64 +2501,84 @@ async fn read_remote_file_preview(
 async fn read_remote_file_full(
     terminal_id: Uuid,
     path: String,
+    transfer_id: Option<String>,
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<LocalFilePreview, String> {
-    let handle = {
-        let terminals = state.remote_terminals.lock().await;
-        terminals
-            .get(&terminal_id)
-            .map(|session| Arc::clone(&session.handle))
-            .ok_or_else(|| format!("terminal is not connected: {terminal_id}"))?
+    let cancellation = if let Some(id) = transfer_id.as_deref() {
+        Some(register_transfer_cancellation(&state, id).await)
+    } else {
+        None
     };
 
-    let quoted = shell_quote(&path);
-    // Check size first to avoid pulling huge files through the SSH channel.
-    let (size_output, size_stderr, size_code) = exec_remote_command_full(
-        &handle,
-        &format!(
-            "stat -c %s {quoted} 2>/dev/null || stat -f %z {quoted} 2>/dev/null || wc -c < {quoted} 2>/dev/null"
-        ),
-    )
-    .await?;
-    if size_code != Some(0) {
-        return Err(format!(
-            "远程文件大小读取失败（退出码 {size_code:?}）：{}",
-            String::from_utf8_lossy(&size_stderr).trim()
-        ));
-    }
-    let size_str = String::from_utf8_lossy(&size_output);
-    let size: u64 = size_str
-        .split_whitespace()
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if size > REMOTE_FILE_FULL_LIMIT {
-        return Err(format!(
-            "文件过大（{} 字节），编辑器最多支持 {} 字节的文件",
+    let result = async {
+        let handle = {
+            let terminals = state.remote_terminals.lock().await;
+            terminals
+                .get(&terminal_id)
+                .map(|session| Arc::clone(&session.handle))
+                .ok_or_else(|| format!("terminal is not connected: {terminal_id}"))?
+        };
+
+        let quoted = shell_quote(&path);
+        // Check size first to avoid pulling huge files through the SSH channel.
+        let (size_output, size_stderr, size_code) = exec_remote_command_full(
+            &handle,
+            &format!(
+                "stat -c %s {quoted} 2>/dev/null || stat -f %z {quoted} 2>/dev/null || wc -c < {quoted} 2>/dev/null"
+            ),
+        )
+        .await?;
+        if size_code != Some(0) {
+            return Err(format!(
+                "远程文件大小读取失败（退出码 {size_code:?}）：{}",
+                String::from_utf8_lossy(&size_stderr).trim()
+            ));
+        }
+        let size_str = String::from_utf8_lossy(&size_output);
+        let size: u64 = size_str
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if size > REMOTE_FILE_FULL_LIMIT {
+            return Err(format!(
+                "文件过大（{} 字节），编辑器最多支持 {} 字节的文件",
+                size, REMOTE_FILE_FULL_LIMIT
+            ));
+        }
+
+        let command = format!("cat {quoted}");
+        let (output, stderr, exit_code) = match (transfer_id.as_deref(), cancellation.as_deref()) {
+            (Some(id), Some(signal)) => {
+                exec_remote_command_full_with_progress(&handle, &command, &app, id, size, signal).await?
+            }
+            _ => exec_remote_command_full(&handle, &command).await?,
+        };
+        if exit_code != Some(0) {
+            return Err(format!(
+                "远程文件读取失败（退出码 {exit_code:?}）：{}",
+                String::from_utf8_lossy(&stderr).trim()
+            ));
+        }
+        let content = String::from_utf8(output)
+            .map_err(|_| "暂不支持编辑二进制文件".to_string())?;
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+
+        Ok(LocalFilePreview {
+            path,
+            name,
             size,
-            REMOTE_FILE_FULL_LIMIT
-        ));
+            content,
+            truncated: false,
+        })
     }
+    .await;
 
-    let (output, stderr, exit_code) =
-        exec_remote_command_full(&handle, &format!("cat {quoted}")).await?;
-    if exit_code != Some(0) {
-        return Err(format!(
-            "远程文件读取失败（退出码 {exit_code:?}）：{}",
-            String::from_utf8_lossy(&stderr).trim()
-        ));
+    if let (Some(id), Some(signal)) = (transfer_id.as_deref(), cancellation.as_ref()) {
+        finish_transfer_cancellation(&state, id, signal).await;
     }
-    let content = String::from_utf8(output)
-        .map_err(|_| "暂不支持编辑二进制文件".to_string())?;
-    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-
-    Ok(LocalFilePreview {
-        path,
-        name,
-        size,
-        content,
-        truncated: false,
-    })
+    result
 }
 
 const REMOTE_UPLOAD_COMPLETION_MARKER: &[u8] = b"__PANDATERM_UPLOAD_COMPLETE__";

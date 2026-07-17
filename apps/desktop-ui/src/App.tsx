@@ -50,6 +50,7 @@ import {
   Square,
   RotateCcw,
   MessageSquarePlus,
+  Store,
 } from 'lucide-react';
 import {
   connectSession,
@@ -112,6 +113,7 @@ import {
   stopLocalTerminal,
   terminalWrite,
   openConnectionWindow,
+  openAiSettingsWindow,
 } from './api';
 import type { AiChatMessage, AiChatStreamEvent, AiProviderConfig, LocalDirectoryEntry, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, TerminalStatusEvent, SystemMonitorData } from './api';
 import {
@@ -156,6 +158,15 @@ import {
   type AiConversationState,
   type AiMessage,
 } from './aiRuntime';
+import {
+  MCP_MARKET_CATALOG,
+  MCP_MARKET_CATEGORIES,
+  filterMcpMarketItems,
+  marketItemToServerConfig,
+  mcpMarketCategoryLabel,
+  type McpMarketCategoryId,
+  type McpMarketItem,
+} from './mcpMarketplace';
 
 type TabKind = 'terminal' | 'sftp';
 
@@ -289,6 +300,15 @@ type UploadConflictApplyAll = {
 
 type ResourceSortKey = 'name' | 'size' | 'modifiedTime';
 type ResourceBottomTab = 'transfer' | 'log';
+type InlineRenameState = {
+  path: string;
+  originalName: string;
+  value: string;
+  type: ResourceFile['type'];
+  submitting: boolean;
+};
+
+const RESOURCE_RENAME_SECOND_CLICK_DELAY_MS = 500;
 
 type TransferRecord = {
   id: string;
@@ -753,6 +773,34 @@ function formatSpeed(bytesPerSec: number): string {
   return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
 }
 
+/** 传输任务状态文案：独立状态码，不依赖操作按钮颜色 */
+function transferKindLabel(direction: TransferRecord['direction']): string {
+  if (direction === 'download') return '下载';
+  if (direction === 'open') return '加载';
+  return '上传';
+}
+
+function transferStatusLabel(record: Pick<TransferRecord, 'direction' | 'status'>): string {
+  const kind = transferKindLabel(record.direction);
+  switch (record.status) {
+    case 'pending':
+    case 'uploading':
+      return `${kind}中`;
+    case 'success':
+      return `${kind}成功`;
+    case 'failed':
+      return `${kind}失败`;
+    case 'cancelled':
+      return `${kind}已取消`;
+  }
+}
+
+function transferStatusDetail(record: Pick<TransferRecord, 'status' | 'message'>): string {
+  if (record.status === 'failed' && record.message.trim()) return record.message.trim();
+  if (record.status === 'cancelled' && record.message.trim()) return record.message.trim();
+  return '';
+}
+
 function truncateStatus(text: string, max = 120): string {
   if (text.length <= max) return text;
   return text.slice(0, max) + '...';
@@ -1017,6 +1065,10 @@ function findTerminalWorkspaceOwner(tabs: WorkspaceTab[], paneTabId: string): Wo
   ) ?? null;
 }
 
+const appWindowParams = new URLSearchParams(window.location.search);
+const isAiSettingsWindow = false;
+const initialAiSettingsTab: 'models' | 'mcp' = 'models';
+
 export function App() {
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -1056,9 +1108,9 @@ export function App() {
     enabled_models: ['gpt-4o-mini'] as string[],
     use_api_key: true,
   });
-  const [isAiSettingsOpen, setIsAiSettingsOpen] = useState(false);
+  const [isAiSettingsOpen, setIsAiSettingsOpen] = useState(isAiSettingsWindow);
   /** 设置弹窗分区：Models（供应商/模型）| MCP（Cursor 风格服务器列表） */
-  const [aiSettingsTab, setAiSettingsTab] = useState<'models' | 'mcp'>('models');
+  const [aiSettingsTab, setAiSettingsTab] = useState<'models' | 'mcp'>(initialAiSettingsTab);
   /** Cursor 设置左侧导航过滤 */
   const [aiSettingsNavQuery, setAiSettingsNavQuery] = useState('');
   /** Models 列表过滤（长列表） */
@@ -1073,6 +1125,9 @@ export function App() {
   const aiApiKeyBaselineRef = useRef('');
   const aiApiKeyInputRef = useRef<HTMLInputElement | null>(null);
   const isAiSettingsOpenRef = useRef(false);
+  const aiSettingsAllowCloseRef = useRef(false);
+  const openAiSettingsRef = useRef<(tab?: 'models' | 'mcp') => void>(() => {});
+  const requestCloseAiSettingsRef = useRef<() => void>(() => {});
   isAiSettingsOpenRef.current = isAiSettingsOpen;
   const aiConfigRefreshGenerationRef = useRef(0);
   /** MCP 设置：草稿 + 运行时快照（status/tools） */
@@ -1094,6 +1149,10 @@ export function App() {
   const [mcpImportStrategy, setMcpImportStrategy] = useState<'overwrite' | 'skip'>('overwrite');
   const [isMcpImporting, setIsMcpImporting] = useState(false);
   const [isMcpExporting, setIsMcpExporting] = useState(false);
+  /** MCP 市场：精选目录搜索 / 一键添加 */
+  const [mcpMarketOpen, setMcpMarketOpen] = useState(false);
+  const [mcpMarketQuery, setMcpMarketQuery] = useState('');
+  const [mcpMarketCategory, setMcpMarketCategory] = useState<McpMarketCategoryId>('all');
   const mcpRefreshGenerationRef = useRef(0);
   const [pendingAiContexts, setPendingAiContexts] = useState<AiContextItem[]>([]);
   const [isAiMentionOpen, setIsAiMentionOpen] = useState(false);
@@ -1130,6 +1189,10 @@ export function App() {
   const [fileSearchQuery, setFileSearchQuery] = useState('');
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
   const [lastClickedIndex, setLastClickedIndex] = useState<number>(-1);
+  const [inlineRename, setInlineRename] = useState<InlineRenameState | null>(null);
+  const inlineRenameInputRef = useRef<HTMLInputElement | null>(null);
+  const lastPlainFileClickRef = useRef<{ path: string; at: number } | null>(null);
+  const pendingInlineRenameTimerRef = useRef<number | null>(null);
   const [mediaViewer, setMediaViewer] = useState<{ url: string; name: string; kind: 'image' | 'video' | 'audio' } | null>(null);
   const [isLoadingMedia, setIsLoadingMedia] = useState(false);
   const [mediaError, setMediaError] = useState('');
@@ -1156,6 +1219,37 @@ export function App() {
   const [uploadConflictDialog, setUploadConflictDialog] = useState<UploadConflictDialogState | null>(null);
   const uploadConflictApplyAllRef = useRef<UploadConflictApplyAll | null>(null);
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!inlineRename || inlineRename.submitting) return;
+    const frameId = window.requestAnimationFrame(() => {
+      const input = inlineRenameInputRef.current;
+      if (!input) return;
+      input.focus();
+      const extensionIndex = inlineRename.type === 'file' ? inlineRename.value.lastIndexOf('.') : -1;
+      input.setSelectionRange(0, extensionIndex > 0 ? extensionIndex : inlineRename.value.length);
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [inlineRename?.path, inlineRename?.submitting]);
+
+  useEffect(() => {
+    const cancelPendingRenameOutsideFileRow = (event: globalThis.PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest('.file-item')) return;
+      if (pendingInlineRenameTimerRef.current !== null) {
+        window.clearTimeout(pendingInlineRenameTimerRef.current);
+        pendingInlineRenameTimerRef.current = null;
+      }
+      lastPlainFileClickRef.current = null;
+    };
+    window.addEventListener('pointerdown', cancelPendingRenameOutsideFileRow, true);
+    return () => {
+      window.removeEventListener('pointerdown', cancelPendingRenameOutsideFileRow, true);
+      if (pendingInlineRenameTimerRef.current !== null) {
+        window.clearTimeout(pendingInlineRenameTimerRef.current);
+      }
+    };
+  }, []);
 
   // Close menubar dropdown when clicking outside
   useEffect(() => {
@@ -1213,6 +1307,9 @@ export function App() {
     setMcpImportPath('');
     setMcpImportStrategy('overwrite');
     setIsMcpImporting(false);
+    setMcpMarketOpen(false);
+    setMcpMarketQuery('');
+    setMcpMarketCategory('all');
     setIsMcpExporting(false);
     setMcpNotice('');
   }, [isAiSettingsOpen]);
@@ -1709,6 +1806,12 @@ export function App() {
         && (currentTab?.id ?? '__local__') === paneKey;
     };
     const local = isLocalResourceTab(tab);
+    setInlineRename(null);
+    lastPlainFileClickRef.current = null;
+    if (pendingInlineRenameTimerRef.current !== null) {
+      window.clearTimeout(pendingInlineRenameTimerRef.current);
+      pendingInlineRenameTimerRef.current = null;
+    }
     setIsLoadingFiles(true);
     setFileListError('');
     try {
@@ -2573,9 +2676,9 @@ export function App() {
     setActiveEditorTabId(tabId);
     setShowEditor(true);
 
-    // For remote files, add a transfer record so the user can see loading status
     let transferId: string | null = null;
-    let progressTimer: ReturnType<typeof setInterval> | null = null;
+    let progressUnlisten: (() => void) | null = null;
+    let openAbortController: AbortController | null = null;
     const openStartTime = Date.now();
     if (!local && terminalId) {
       transferId = addTransferRecord({
@@ -2586,46 +2689,83 @@ export function App() {
         status: 'uploading',
         message: '正在读取...',
       });
-      progressTimer = setInterval(() => {
-        if (!transferId) return;
-        updateTransferRecord(transferId, (prev) => {
-          const elapsedSec = Math.floor((Date.now() - openStartTime) / 1000);
-          return { progress: -1, transferred: 0, speed: 0, message: `正在读取... (${elapsedSec}s)` };
+      const activeTransferId = transferId;
+      openAbortController = new AbortController();
+      uploadAbortRefs.current.set(activeTransferId, openAbortController);
+      try {
+        progressUnlisten = await listen<{
+          transfer_id: string;
+          transferred: number;
+          total: number;
+        }>('file-open-progress', (event) => {
+          if (event.payload.transfer_id !== activeTransferId || openAbortController?.signal.aborted) return;
+          const transferred = Math.max(0, event.payload.transferred);
+          const total = Math.max(0, event.payload.total || file.sizeBytes);
+          const elapsed = (Date.now() - openStartTime) / 1000;
+          const progress = total > 0 ? Math.min((transferred / total) * 100, 100) : 0;
+          const speed = elapsed > 0 ? transferred / elapsed : 0;
+          updateTransferRecord(activeTransferId, {
+            progress,
+            transferred,
+            size: total,
+            speed,
+            message: total > 0 ? `正在读取... ${Math.round(progress)}%` : '正在读取...',
+          });
+          setEditorTabs((current) => current.map((item) => item.id === tabId
+            ? { ...item, loadProgress: { transferred, total, speed } }
+            : item));
         });
-      }, 1000);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        addLogEntry('warn', `文件进度监听不可用：${message}`);
+      }
     }
 
     try {
       const full = local
         ? await readLocalFileFull(file.path)
         : terminalId
-          ? await readRemoteFileFull(terminalId, file.path)
+          ? await readRemoteFileFull(terminalId, file.path, transferId)
           : null;
-      if (progressTimer) clearInterval(progressTimer);
+      if (openAbortController?.signal.aborted) {
+        throw new DOMException('文件打开已取消', 'AbortError');
+      }
       if (!full) {
         throw new Error('远程终端尚未连接，无法读取文件');
       }
       if (transferId) {
         const elapsed = (Date.now() - openStartTime) / 1000;
-        const avgSpeed = elapsed > 0 ? file.sizeBytes / elapsed : 0;
-        updateTransferRecord(transferId, { status: 'success', progress: 100, transferred: file.sizeBytes, speed: avgSpeed, message: '已打开' });
+        const avgSpeed = elapsed > 0 ? full.size / elapsed : 0;
+        updateTransferRecord(transferId, {
+          status: 'success',
+          progress: 100,
+          transferred: full.size,
+          size: full.size,
+          speed: avgSpeed,
+          message: '已打开',
+        });
       }
       setEditorTabs((current) => current.map((t) =>
         t.id === tabId
-          ? { ...t, content: full.content, originalContent: full.content, loading: false }
+          ? { ...t, content: full.content, originalContent: full.content, loading: false, loadProgress: undefined }
           : t,
       ));
       setStatusMessage(`已打开文件：${file.path}`);
     } catch (error) {
-      if (progressTimer) clearInterval(progressTimer);
+      const cancelled = openAbortController?.signal.aborted ?? false;
       const message = error instanceof Error ? error.message : String(error);
-      if (transferId) {
+      if (transferId && !cancelled) {
         updateTransferRecord(transferId, { status: 'failed', message });
       }
       setEditorTabs((current) => current.map((t) =>
-        t.id === tabId ? { ...t, loading: false, error: message } : t,
+        t.id === tabId
+          ? { ...t, loading: false, loadProgress: undefined, error: cancelled ? '文件打开已取消' : message }
+          : t,
       ));
-      setStatusMessage(`打开文件失败：${message}`);
+      setStatusMessage(cancelled ? `已取消打开：${file.name}` : `打开文件失败：${message}`);
+    } finally {
+      progressUnlisten?.();
+      if (transferId) uploadAbortRefs.current.delete(transferId);
     }
   }
 
@@ -3286,9 +3426,38 @@ export function App() {
   }
 
   // ── Multi-selection helpers ──────────────────────────────
+  function clearPendingInlineRename() {
+    if (pendingInlineRenameTimerRef.current !== null) {
+      window.clearTimeout(pendingInlineRenameTimerRef.current);
+      pendingInlineRenameTimerRef.current = null;
+    }
+  }
+
   function handleFileClick(event: React.MouseEvent, file: ResourceFile, index: number) {
     const ctrl = event.ctrlKey || event.metaKey; // metaKey for macOS
     const shift = event.shiftKey;
+    const plainClick = !ctrl && !shift;
+    const clickedName = Boolean((event.target as HTMLElement).closest('.file-name'));
+    const wasOnlySelected = selectedFiles.size === 1 && selectedFiles.has(file.name);
+    const now = Date.now();
+    const previousClick = lastPlainFileClickRef.current;
+
+    clearPendingInlineRename();
+    if (
+      plainClick
+      && clickedName
+      && !inlineRename
+      && wasOnlySelected
+      && previousClick?.path === file.path
+      && now - previousClick.at >= RESOURCE_RENAME_SECOND_CLICK_DELAY_MS
+    ) {
+      pendingInlineRenameTimerRef.current = window.setTimeout(() => {
+        pendingInlineRenameTimerRef.current = null;
+        beginInlineRename(file);
+      }, 260);
+    }
+
+    lastPlainFileClickRef.current = plainClick ? { path: file.path, at: now } : null;
 
     if (ctrl) {
       // Toggle individual item
@@ -3312,6 +3481,13 @@ export function App() {
     }
   }
 
+  function handleFileDoubleClick(file: ResourceFile) {
+    clearPendingInlineRename();
+    lastPlainFileClickRef.current = null;
+    if (inlineRename?.path === file.path) setInlineRename(null);
+    void openSelectedFile(file);
+  }
+
   function getSelectedResourceFiles(): ResourceFile[] {
     return visibleFiles.filter((f) => selectedFiles.has(f.name));
   }
@@ -3323,6 +3499,12 @@ export function App() {
   function handleResourceKeyDown(event: React.KeyboardEvent) {
     const ctrl = event.ctrlKey || event.metaKey;
     const selectedItems = getSelectedResourceFiles();
+
+    if (event.key === 'F2' && selectedItems.length === 1) {
+      event.preventDefault();
+      beginInlineRename(selectedItems[0]);
+      return;
+    }
 
     // Delete key — delete selected files
     if (event.key === 'Delete' && selectedItems.length > 0) {
@@ -3361,6 +3543,9 @@ export function App() {
   function handleFileContextMenu(event: React.MouseEvent, file: ResourceFile) {
     event.preventDefault();
     event.stopPropagation();
+    clearPendingInlineRename();
+    lastPlainFileClickRef.current = null;
+    setInlineRename(null);
     // If the right-clicked file is not in the current selection,
     // switch to single-select it so context-menu actions are intuitive.
     if (!selectedFiles.has(file.name)) {
@@ -3373,6 +3558,9 @@ export function App() {
   function handleBlankContextMenu(event: React.MouseEvent) {
     event.preventDefault();
     event.stopPropagation();
+    clearPendingInlineRename();
+    lastPlainFileClickRef.current = null;
+    setInlineRename(null);
     setContextMenu({ x: event.clientX, y: event.clientY, file: null });
   }
 
@@ -3678,32 +3866,78 @@ export function App() {
   }
 
   function openRenameDialog(file: ResourceFile) {
+    clearPendingInlineRename();
+    setInlineRename(null);
+    lastPlainFileClickRef.current = null;
     setRenameValue(file.name);
     setRenameDialog(file.path);
   }
 
-  async function handleRename() {
-    if (!renameDialog || !renameValue.trim()) return;
-    const newName = renameValue.trim();
-    const currentName = resourceBaseName(renameDialog);
-    if (newName === currentName) {
-      setRenameDialog(null);
-      return;
+  async function renameResource(path: string, requestedName: string): Promise<boolean> {
+    const newName = requestedName.trim();
+    const currentName = resourceBaseName(path);
+    if (!newName || newName === '.' || newName === '..' || newName.includes('/') || newName.includes('\\')) {
+      setStatusMessage('重命名失败：文件名无效');
+      return false;
     }
+    if (newName === currentName) return true;
+
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
-    const parent = currentPathRef.current || resourceParentPath(renameDialog, local);
+    const parent = currentPathRef.current || resourceParentPath(path, local);
     setStatusMessage(`正在重命名：${newName}...`);
     try {
-      await movePath(renameDialog, parent, local ? null : tab?.terminalId ?? null, newName);
+      await movePath(path, parent, local ? null : tab?.terminalId ?? null, newName);
       setStatusMessage(`已重命名为：${newName}`);
-      addLogEntry('info', `已重命名：${newName}`);
-      setRenameDialog(null);
+      addLogEntry('info', `已重命名：${currentName} → ${newName}`);
       await loadResourceDirectory(currentPathRef.current || null, false);
+      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatusMessage(`重命名失败：${message}`);
       addLogEntry('error', `重命名失败：${message}`);
+      return false;
+    }
+  }
+
+  async function handleRename() {
+    if (!renameDialog) return;
+    if (await renameResource(renameDialog, renameValue)) {
+      setRenameDialog(null);
+    }
+  }
+
+  function beginInlineRename(file: ResourceFile) {
+    clearPendingInlineRename();
+    setRenameDialog(null);
+    setInlineRename({
+      path: file.path,
+      originalName: file.name,
+      value: file.name,
+      type: file.type,
+      submitting: false,
+    });
+  }
+
+  function cancelInlineRename() {
+    clearPendingInlineRename();
+    setInlineRename(null);
+    lastPlainFileClickRef.current = null;
+  }
+
+  async function submitInlineRename() {
+    if (!inlineRename || inlineRename.submitting) return;
+    const nextName = inlineRename.value.trim();
+    if (nextName === inlineRename.originalName) {
+      cancelInlineRename();
+      return;
+    }
+    setInlineRename((current) => current ? { ...current, submitting: true } : null);
+    const renamed = await renameResource(inlineRename.path, nextName);
+    if (renamed) {
+      setInlineRename(null);
+    } else {
+      setInlineRename((current) => current ? { ...current, submitting: false } : null);
     }
   }
 
@@ -3775,6 +4009,15 @@ export function App() {
       void refreshAiProviderConfig();
     }
   }, [leftActivity, aiProviderConfig, isAiConfigLoading, aiConfigError]);
+
+  useEffect(() => {
+    if (isAiSettingsWindow) return;
+    let removeListener: (() => void) | null = null;
+    void listen('ai-provider-config-changed', () => {
+      void refreshAiProviderConfig();
+    }).then((remove) => { removeListener = remove; });
+    return () => removeListener?.();
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -4097,31 +4340,12 @@ export function App() {
   }
 
   function openAiSettings(tab: 'models' | 'mcp' = 'models') {
-    // 禁止把 React 事件对象当 tab（勿写 onClick={openAiSettings}）
-    const nextTab: 'models' | 'mcp' = tab === 'mcp' ? 'mcp' : 'models';
-    if (aiProviderConfig) {
-      const catalog = resolveAiModelCatalog(aiProviderConfig);
-      setAiConfigDraft({
-        base_url: aiProviderConfig.base_url,
-        model: catalog.model,
-        models: catalog.models,
-        enabled_models: catalog.enabled_models,
-        use_api_key: aiProviderConfig.use_api_key,
-      });
-    }
-    setAiSettingsTab(nextTab);
-    setAiSettingsNavQuery('');
-    setAiModelListQuery('');
-    setMcpServerListQuery('');
-    setAiConfigError(aiProviderConfig?.error ?? '');
-    setMcpError('');
-    aiApiKeyBaselineRef.current = '';
-    setAiApiKeyDraft('');
-    setIsAiSettingsOpen(true);
-    isAiSettingsOpenRef.current = true;
-    // 打开时重新拉取，确保 vault 中的密钥可回填
-    void refreshAiProviderConfig({ fillApiKey: true });
-    void refreshMcpConfig();
+    // 独立 Tauri 窗口（轻量入口），禁止把 React 事件对象当 tab
+    void openAiSettingsWindow(tab === 'mcp' ? 'mcp' : 'models');
+  }
+
+  function completeAiSettingsClose() {
+    setIsAiSettingsOpen(false);
   }
 
   /** 关闭设置：Models/MCP 任一侧有未保存改动时确认 */
@@ -4135,11 +4359,11 @@ export function App() {
     );
     const mcpDirty = isMcpServersDraftDirty(mcpServersDraft, mcpSnapshot);
     if (!modelsDirty && !mcpDirty) {
-      setIsAiSettingsOpen(false);
+      completeAiSettingsClose();
       return;
     }
     const parts = [
-      modelsDirty ? 'Models' : null,
+      modelsDirty ? '模型' : null,
       mcpDirty ? 'MCP' : null,
     ].filter(Boolean).join(' / ');
     setConfirmDialog({
@@ -4147,11 +4371,12 @@ export function App() {
       message: `${parts} 有未保存的改动。关闭后将丢失这些草稿。`,
       confirmLabel: '放弃更改',
       danger: true,
-      onConfirm: () => {
-        setIsAiSettingsOpen(false);
-      },
+      onConfirm: completeAiSettingsClose,
     });
   }
+
+  openAiSettingsRef.current = openAiSettings;
+  requestCloseAiSettingsRef.current = requestCloseAiSettings;
 
   function snapshotToMcpDraft(snapshot: McpConfigSnapshot): McpServerConfig[] {
     return snapshot.servers.map((server) => ({
@@ -4261,12 +4486,12 @@ export function App() {
 
     const nextEnabled = !current.enabled;
     if (nextEnabled && current.transport === 'stdio' && !current.command.trim()) {
-      setMcpError('请先填写 Command，再启用该 MCP 服务器');
+      setMcpError('请先填写启动命令，再启用该 MCP 服务器');
       setExpandedMcpServerId(serverId);
       return;
     }
     if (nextEnabled && current.transport !== 'stdio' && !current.url.trim()) {
-      setMcpError('请先填写 URL，再启用远程 MCP 服务器');
+      setMcpError('请先填写服务地址，再启用远程 MCP 服务器');
       setExpandedMcpServerId(serverId);
       return;
     }
@@ -4312,7 +4537,7 @@ export function App() {
       ));
       if (invalidStdio) {
         setExpandedMcpServerId(invalidStdio.id);
-        throw new Error(`MCP “${invalidStdio.name.trim() || invalidStdio.id}” 已启用但缺少 Command`);
+        throw new Error(`MCP “${invalidStdio.name.trim() || invalidStdio.id}” 已启用但缺少启动命令`);
       }
       const invalidRemote = mcpServersDraft.find((server) => (
         server.enabled
@@ -4321,7 +4546,7 @@ export function App() {
       ));
       if (invalidRemote) {
         setExpandedMcpServerId(invalidRemote.id);
-        throw new Error(`MCP “${invalidRemote.name.trim() || invalidRemote.id}” 已启用但缺少 URL`);
+        throw new Error(`MCP “${invalidRemote.name.trim() || invalidRemote.id}” 已启用但缺少服务地址`);
       }
       const snapshot = await saveMcpConfig(mcpServersDraft);
       setMcpSnapshot(snapshot);
@@ -4370,6 +4595,7 @@ export function App() {
       setMcpImportOpen(false);
       return;
     }
+    setMcpMarketOpen(false);
     setMcpImportOpen(true);
     setMcpError('');
     setMcpNotice('');
@@ -4384,6 +4610,44 @@ export function App() {
     } catch (error) {
       setMcpError(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  function openMcpMarketPanel() {
+    if (isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting) return;
+    if (mcpMarketOpen) {
+      setMcpMarketOpen(false);
+      return;
+    }
+    setMcpImportOpen(false);
+    setMcpMarketOpen(true);
+    setMcpError('');
+    setMcpNotice('');
+  }
+
+  /** 从市场添加草稿：同 id 已存在则展开已有项；否则追加（默认不启用） */
+  function addMcpFromMarket(item: McpMarketItem) {
+    if (isMcpSaving || mcpBusyServerId) return;
+    const existing = mcpServersDraft.find((server) => server.id === item.id);
+    if (existing) {
+      setExpandedMcpServerId(existing.id);
+      setMcpMarketOpen(false);
+      setMcpNotice(`「${item.name}」已在列表中，已展开该服务器。`);
+      return;
+    }
+    const draft = marketItemToServerConfig(item);
+    setMcpServersDraft((current) => [...current, draft]);
+    setExpandedMcpServerId(draft.id);
+    setMcpMarketOpen(false);
+    setMcpError('');
+    const tips: string[] = [];
+    if (item.requiresEnv?.length) tips.push(`请填写环境变量：${item.requiresEnv.join('、')}`);
+    if (item.requiresArgs) tips.push('请按本机路径调整启动参数');
+    if (item.note) tips.push(item.note);
+    setMcpNotice(
+      tips.length > 0
+        ? `已添加「${item.name}」到草稿（未启用）。${tips.join('；')}。确认后点击「保存 MCP」。`
+        : `已添加「${item.name}」到草稿（未启用）。确认配置后点击「保存 MCP」，再开关启用连接。`,
+    );
   }
 
   async function importMcpFromPath(path: string) {
@@ -4414,7 +4678,7 @@ export function App() {
       if (mcpImportStrategy === 'overwrite') parts.push(`覆盖 ${updated}`);
       if (skipped > 0) parts.push(`跳过 ${skipped}`);
       setMcpNotice(
-        `已导入 ${preview.server_count} 个服务器（${parts.join(' · ')}）。请检查后点击 Save MCP。`,
+        `已导入 ${preview.server_count} 个服务器（${parts.join(' · ')}）。请检查后点击「保存 MCP」。`,
       );
     } catch (error) {
       setMcpError(error instanceof Error ? error.message : String(error));
@@ -6394,23 +6658,61 @@ export function App() {
                     修改时间 {sortKey === 'modifiedTime' ? (sortDirection === 'asc' ? '↑' : '↓') : '↕'}
                   </button>
                 </div>
-                <div className="file-list-body" onContextMenu={handleBlankContextMenu} onClick={(e) => { if (e.target === e.currentTarget) { setSelectedFiles(new Set()); setLastClickedIndex(-1); } }}>
+                <div
+                  className="file-list-body"
+                  onContextMenu={handleBlankContextMenu}
+                  onClick={(event) => {
+                    if (event.target !== event.currentTarget) return;
+                    clearPendingInlineRename();
+                    lastPlainFileClickRef.current = null;
+                    setSelectedFiles(new Set());
+                    setLastClickedIndex(-1);
+                  }}
+                >
                   {!isLoadingFiles && !fileListError && visibleFiles.map((file, index) => (
-                    <button
-                      key={file.name}
+                    <div
+                      key={file.path}
+                      role="button"
+                      tabIndex={-1}
                       className={`${selectedFiles.has(file.name) ? 'file-item selected' : 'file-item'}${clipboard?.operation === 'cut' && clipboard.paths.includes(file.path) ? ' is-cut' : ''}`}
                       onClick={(e) => handleFileClick(e, file, index)}
-                      onDoubleClick={() => openSelectedFile(file)}
+                      onDoubleClick={() => handleFileDoubleClick(file)}
                       onContextMenu={(e) => handleFileContextMenu(e, file)}
                     >
                       <span className="file-name">
                         <VscodeFileIcon filename={file.name} isDirectory={file.type === 'directory'} />
-                        <span className="file-name-text">{file.name}</span>
+                        {inlineRename?.path === file.path ? (
+                          <input
+                            ref={inlineRenameInputRef}
+                            className="file-inline-rename-input"
+                            value={inlineRename.value}
+                            disabled={inlineRename.submitting}
+                            aria-label={`重命名 ${file.name}`}
+                            onClick={(event) => event.stopPropagation()}
+                            onDoubleClick={(event) => event.stopPropagation()}
+                            onChange={(event) => setInlineRename((current) => current
+                              ? { ...current, value: event.target.value }
+                              : null)}
+                            onKeyDown={(event) => {
+                              event.stopPropagation();
+                              if (event.key === 'Enter') {
+                                event.preventDefault();
+                                void submitInlineRename();
+                              } else if (event.key === 'Escape') {
+                                event.preventDefault();
+                                cancelInlineRename();
+                              }
+                            }}
+                            onBlur={() => void submitInlineRename()}
+                          />
+                        ) : (
+                          <span className="file-name-text">{file.name}</span>
+                        )}
                       </span>
                       <span>{file.size}</span>
                       <span>{file.type === 'directory' ? '文件夹' : '文件'}</span>
                       <span>{file.modifiedTime}</span>
-                    </button>
+                    </div>
                   ))}
                   {isLoadingFiles ? (
                     <div className="file-list-empty-state">
@@ -6479,19 +6781,23 @@ export function App() {
                             <th className="transfer-th-index">序号</th>
                             <th className="transfer-th-direction">类型</th>
                             <th className="transfer-th-name">文件名称</th>
+                            <th className="transfer-th-status">状态</th>
                             <th className="transfer-th-size">文件大小</th>
                             <th className="transfer-th-speed">速度</th>
-                            <th className="transfer-th-time">{transferRecords.some(r => r.direction === 'download' || r.direction === 'open') ? '传输时间' : '上传时间'}</th>
+                            <th className="transfer-th-time">时间</th>
                             <th className="transfer-th-action">操作</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {transferRecords.map((record, idx) => (
+                          {transferRecords.map((record, idx) => {
+                            const statusLabel = transferStatusLabel(record);
+                            const statusDetail = transferStatusDetail(record);
+                            return (
                               <tr key={record.id} className={`transfer-row ${record.status}`}>
                                 <td className="transfer-td-index">{idx + 1}</td>
                                 <td className="transfer-td-direction">
                                   <span className={`transfer-direction ${record.direction}`}>
-                                    {record.direction === 'download' ? '下载' : record.direction === 'open' ? '打开' : '上传'}
+                                    {transferKindLabel(record.direction)}
                                   </span>
                                 </td>
                                 <td className="transfer-td-name">
@@ -6499,15 +6805,25 @@ export function App() {
                                     <span className="transfer-filename" title={record.fileName}>
                                       {record.fileName}
                                     </span>
-                                    {record.status === 'uploading' && (
-                                      <>
-                                        {record.progress >= 0 && (
-                                          <div className="transfer-progress-bar">
-                                            <div className="transfer-progress-fill" style={{ width: `${record.progress}%` }} />
-                                          </div>
-                                        )}
-                                        <span className="transfer-status-msg">{record.message}</span>
-                                      </>
+                                    {record.status === 'uploading' && record.progress >= 0 && (
+                                      <div className="transfer-progress-bar">
+                                        <div className="transfer-progress-fill" style={{ width: `${record.progress}%` }} />
+                                      </div>
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="transfer-td-status">
+                                  <div className="transfer-status-cell">
+                                    <span
+                                      className={`transfer-status-badge ${record.status}`}
+                                      title={statusDetail || statusLabel}
+                                    >
+                                      {statusLabel}
+                                    </span>
+                                    {statusDetail && (
+                                      <span className="transfer-status-detail" title={statusDetail}>
+                                        {statusDetail}
+                                      </span>
                                     )}
                                   </div>
                                 </td>
@@ -6533,19 +6849,27 @@ export function App() {
                                 </td>
                                 <td className="transfer-td-time">{record.time}</td>
                                 <td className="transfer-td-action">
-                                  {record.status === 'uploading' && (
-                                    <button className="transfer-btn transfer-btn-cancel" onClick={() => cancelUpload(record.id)} title="取消上传">
-                                      取消上传
+                                  {record.status === 'uploading' || record.status === 'pending' ? (
+                                    <button
+                                      className="transfer-btn transfer-btn-cancel"
+                                      onClick={() => cancelUpload(record.id)}
+                                      title={`取消${transferKindLabel(record.direction)}`}
+                                    >
+                                      取消
                                     </button>
-                                  )}
-                                  {(record.status === 'success' || record.status === 'failed' || record.status === 'cancelled') && (
-                                        <button className={`transfer-btn ${record.status === 'success' ? 'transfer-btn-success' : record.status === 'cancelled' ? 'transfer-btn-cancelled' : 'transfer-btn-delete'}`} onClick={() => deleteTransferRecord(record.id)} title="删除记录">
-                                          删除
-                                        </button>
+                                  ) : (
+                                    <button
+                                      className="transfer-btn transfer-btn-remove"
+                                      onClick={() => deleteTransferRecord(record.id)}
+                                      title="删除记录"
+                                    >
+                                      删除
+                                    </button>
                                   )}
                                 </td>
                               </tr>
-                            ))}
+                            );
+                          })}
                         </tbody>
                       </table>
                     )}
@@ -7850,9 +8174,9 @@ export function App() {
 
       {isAiSettingsOpen && (
         <div
-          className="ai-settings-backdrop"
+          className={`ai-settings-backdrop${isAiSettingsWindow ? ' native-window' : ''}`}
           onMouseDown={() => {
-            if (!isAiConfigSaving && !isAiModelsSyncing && !isMcpSaving) requestCloseAiSettings();
+            if (!isAiSettingsWindow && !isAiConfigSaving && !isAiModelsSyncing && !isMcpSaving) requestCloseAiSettings();
           }}
         >
           <div
@@ -8169,7 +8493,7 @@ export function App() {
                   <div className="ai-settings-body">
                     <section className="ai-settings-section ai-settings-section-flat">
                       <div className="ai-settings-section-title-row">
-                        <div className="ai-settings-section-title">Installed MCP Servers</div>
+                        <div className="ai-settings-section-title">已安装的 MCP 服务器</div>
                         <div className="ai-settings-mcp-actions">
                           <button
                             type="button"
@@ -8178,7 +8502,17 @@ export function App() {
                             onClick={() => void refreshMcpConfig()}
                           >
                             <RefreshCw size={14} className={isMcpLoading ? 'spin' : undefined} aria-hidden />
-                            <span>Refresh</span>
+                            <span>刷新</span>
+                          </button>
+                          <button
+                            type="button"
+                            className={`ai-settings-ghost-btn${mcpMarketOpen ? ' active' : ''}`}
+                            disabled={isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting}
+                            title="从精选市场添加 MCP"
+                            onClick={() => openMcpMarketPanel()}
+                          >
+                            <Store size={14} aria-hidden />
+                            <span>市场</span>
                           </button>
                           <button
                             type="button"
@@ -8187,17 +8521,17 @@ export function App() {
                             onClick={() => void openMcpImportPanel()}
                           >
                             <Download size={14} aria-hidden />
-                            <span>Import</span>
+                            <span>导入</span>
                           </button>
                           <button
                             type="button"
                             className="ai-settings-ghost-btn"
                             disabled={isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting || mcpServersDraft.length === 0}
-                            title="Export Cursor mcp.json"
+                            title="导出为 Cursor 风格 mcp.json"
                             onClick={() => void exportMcpCursorJson()}
                           >
                             <Upload size={14} aria-hidden />
-                            <span>{isMcpExporting ? 'Exporting…' : 'Export'}</span>
+                            <span>{isMcpExporting ? '导出中…' : '导出'}</span>
                           </button>
                           <button
                             type="button"
@@ -8210,35 +8544,149 @@ export function App() {
                             }}
                           >
                             <Plus size={14} aria-hidden />
-                            <span>New MCP Server</span>
+                            <span>新建服务器</span>
                           </button>
                         </div>
                       </div>
                       {mcpSnapshot?.config_path ? (
                         <div className="ai-settings-mcp-path" title={mcpSnapshot.config_path}>
-                          <span>Config</span>
+                          <span>配置文件</span>
                           <code>{mcpSnapshot.config_path}</code>
                           <button
                             type="button"
                             className="ai-settings-ghost-btn"
-                            title="Copy path"
+                            title="复制路径"
                             onClick={() => {
                               void writeClipboardText(mcpSnapshot.config_path || '').catch(() => {});
                             }}
                           >
                             <Clipboard size={13} aria-hidden />
-                            <span>Copy</span>
+                            <span>复制</span>
                           </button>
                         </div>
                       ) : null}
 
+                      {mcpMarketOpen && (
+                        <div className="ai-settings-mcp-market">
+                          <div className="ai-settings-mcp-import-title">
+                            MCP 市场
+                            <em>精选常用服务 · 一键加入草稿 · 需本机已装 Node/npx 或 uvx</em>
+                          </div>
+                          <div className="ai-settings-mcp-market-toolbar">
+                            <div className="ai-settings-model-filter">
+                              <Search size={14} aria-hidden />
+                              <input
+                                type="text"
+                                value={mcpMarketQuery}
+                                placeholder="搜索名称、标签、包名…"
+                                spellCheck={false}
+                                disabled={isMcpSaving}
+                                onChange={(event) => setMcpMarketQuery(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Escape') setMcpMarketQuery('');
+                                }}
+                              />
+                              {mcpMarketQuery ? (
+                                <button
+                                  type="button"
+                                  className="ai-settings-model-filter-clear"
+                                  title="清除搜索"
+                                  onClick={() => setMcpMarketQuery('')}
+                                >
+                                  <X size={13} aria-hidden />
+                                </button>
+                              ) : null}
+                            </div>
+                            <div className="ai-settings-mcp-market-cats" role="tablist" aria-label="市场分类">
+                              {MCP_MARKET_CATEGORIES.map((cat) => (
+                                <button
+                                  key={cat.id}
+                                  type="button"
+                                  role="tab"
+                                  aria-selected={mcpMarketCategory === cat.id}
+                                  className={`ai-settings-mcp-market-cat${mcpMarketCategory === cat.id ? ' active' : ''}`}
+                                  disabled={isMcpSaving}
+                                  onClick={() => setMcpMarketCategory(cat.id)}
+                                >
+                                  {cat.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                          <div className="ai-settings-mcp-market-list">
+                            {(() => {
+                              const visible = filterMcpMarketItems(
+                                MCP_MARKET_CATALOG,
+                                mcpMarketQuery,
+                                mcpMarketCategory,
+                              );
+                              if (visible.length === 0) {
+                                return (
+                                  <div className="ai-settings-model-empty">
+                                    没有匹配的 MCP（共收录 {MCP_MARKET_CATALOG.length} 个精选服务）
+                                  </div>
+                                );
+                              }
+                              return visible.map((item) => {
+                                const installed = mcpServersDraft.some((server) => server.id === item.id);
+                                return (
+                                  <div key={item.id} className={`ai-settings-mcp-market-card${installed ? ' installed' : ''}`}>
+                                    <div className="ai-settings-mcp-market-card-main">
+                                      <div className="ai-settings-mcp-market-card-title">
+                                        <strong>{item.name}</strong>
+                                        <em>{mcpMarketCategoryLabel(item.category)}</em>
+                                        {item.tags.slice(0, 3).map((tag) => (
+                                          <span key={tag} className="ai-settings-mcp-market-tag">{tag}</span>
+                                        ))}
+                                      </div>
+                                      <p>{item.description}</p>
+                                      <code>
+                                        {item.config.transport === 'stdio'
+                                          ? [item.config.command, ...(item.config.args ?? [])].join(' ')
+                                          : item.config.url}
+                                      </code>
+                                      {(item.requiresEnv?.length || item.requiresArgs || item.note) ? (
+                                        <small>
+                                          {[
+                                            item.requiresEnv?.length ? `需环境变量：${item.requiresEnv.join('、')}` : '',
+                                            item.requiresArgs ? '需按本机修改参数' : '',
+                                            item.note ?? '',
+                                          ].filter(Boolean).join(' · ')}
+                                        </small>
+                                      ) : null}
+                                    </div>
+                                    <button
+                                      type="button"
+                                      className={`ai-settings-ghost-btn${installed ? '' : ' primary-ghost'}`}
+                                      disabled={isMcpSaving || Boolean(mcpBusyServerId)}
+                                      onClick={() => addMcpFromMarket(item)}
+                                    >
+                                      <Plus size={14} aria-hidden />
+                                      <span>{installed ? '已添加' : '添加'}</span>
+                                    </button>
+                                  </div>
+                                );
+                              });
+                            })()}
+                          </div>
+                          <p className="ai-settings-mcp-market-foot">
+                            生态中有上千个社区 MCP，此处为官方 + 高星/常用精选（{MCP_MARKET_CATALOG.length} 个）。
+                            更多可浏览{' '}
+                            <span className="ai-settings-mcp-market-link">modelcontextprotocol/servers</span>
+                            {' '}与{' '}
+                            <span className="ai-settings-mcp-market-link">awesome-mcp-servers</span>
+                            ，或用「导入」从 Cursor/Claude 配置合并。
+                          </p>
+                        </div>
+                      )}
+
                       {mcpImportOpen && (
                         <div className="ai-settings-mcp-import">
                           <div className="ai-settings-mcp-import-title">
-                            Import Cursor / Claude MCP config
-                            <em>merge into draft · not saved until Save MCP</em>
+                            导入 Cursor / Claude MCP 配置
+                            <em>合并到草稿 · 点「保存 MCP」后才会写入磁盘</em>
                           </div>
-                          <div className="ai-settings-mcp-import-strategy" role="radiogroup" aria-label="Import strategy">
+                          <div className="ai-settings-mcp-import-strategy" role="radiogroup" aria-label="导入策略">
                             <button
                               type="button"
                               className={`ai-settings-mcp-strategy${mcpImportStrategy === 'overwrite' ? ' active' : ''}`}
@@ -8260,7 +8708,7 @@ export function App() {
                             <input
                               className="ai-settings-input"
                               value={mcpImportPath}
-                              placeholder="Path to mcp.json"
+                              placeholder="mcp.json 文件路径"
                               spellCheck={false}
                               disabled={isMcpImporting || isMcpSaving}
                               onChange={(event) => setMcpImportPath(event.target.value)}
@@ -8278,12 +8726,12 @@ export function App() {
                               onClick={() => void importMcpFromPath(mcpImportPath)}
                             >
                               <Download size={14} aria-hidden />
-                              <span>{isMcpImporting ? 'Importing…' : 'Import path'}</span>
+                              <span>{isMcpImporting ? '导入中…' : '导入路径'}</span>
                             </button>
                           </div>
                           <div className="ai-settings-mcp-import-candidates">
                             {mcpImportCandidates.length === 0 ? (
-                              <div className="ai-settings-model-empty">No candidate paths discovered.</div>
+                              <div className="ai-settings-model-empty">未发现候选配置路径</div>
                             ) : (
                               mcpImportCandidates.map((candidate) => (
                                 <button
@@ -8301,10 +8749,10 @@ export function App() {
                                   <code>{candidate.path}</code>
                                   <span>
                                     {!candidate.exists
-                                      ? 'missing'
+                                      ? '不存在'
                                       : candidate.error
-                                        ? 'invalid'
-                                        : `${candidate.server_count ?? 0} servers`}
+                                        ? '无效'
+                                        : `${candidate.server_count ?? 0} 个服务器`}
                                   </span>
                                 </button>
                               ))
@@ -8320,7 +8768,7 @@ export function App() {
                             <input
                               type="text"
                               value={mcpServerListQuery}
-                              placeholder="Filter MCP servers"
+                              placeholder="筛选 MCP 服务器"
                               spellCheck={false}
                               disabled={isMcpLoading || isMcpSaving}
                               onChange={(event) => setMcpServerListQuery(event.target.value)}
@@ -8332,7 +8780,7 @@ export function App() {
                               <button
                                 type="button"
                                 className="ai-settings-model-filter-clear"
-                                title="Clear filter"
+                                title="清除筛选"
                                 onClick={() => setMcpServerListQuery('')}
                               >
                                 <X size={13} aria-hidden />
@@ -8352,14 +8800,14 @@ export function App() {
                           if (mcpServersDraft.length === 0) {
                             return (
                               <div className="ai-settings-model-empty">
-                                No MCP servers configured. Add stdio or streamable-http servers for Agent tools.
+                                尚未配置 MCP 服务器。可点「市场」一键添加，或「新建服务器」手动配置。
                               </div>
                             );
                           }
                           if (visibleServers.length === 0) {
                             return (
                               <div className="ai-settings-model-empty">
-                                No servers match “{mcpServerListQuery.trim()}”
+                                没有匹配「{mcpServerListQuery.trim()}」的服务器
                               </div>
                             );
                           }
@@ -8367,7 +8815,7 @@ export function App() {
                           <div className="ai-settings-mcp-list">
                             {mcpDirty && (
                               <div className="ai-settings-mcp-dirty-hint">
-                                Unsaved changes — Save MCP to write config, or Reconnect to save and connect.
+                                有未保存更改 — 点「保存 MCP」写入配置，或点「重新连接」保存并连接。
                               </div>
                             )}
                             {visibleServers.map((server) => {
@@ -8390,19 +8838,19 @@ export function App() {
                                     >
                                       {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                                       <span className="ai-settings-mcp-title">{server.name.trim() || server.id}</span>
-                                      {dirty && <em className="ai-settings-mcp-dirty">Unsaved</em>}
+                                      {dirty && <em className="ai-settings-mcp-dirty">未保存</em>}
                                       <em className="ai-settings-mcp-transport" title={server.transport}>
                                         {server.transport === 'stdio'
-                                          ? 'stdio'
+                                          ? '本地进程'
                                           : server.transport === 'sse'
-                                            ? 'sse→http'
-                                            : 'http'}
+                                            ? 'SSE→HTTP'
+                                            : '远程 HTTP'}
                                       </em>
                                       <em className={`ai-settings-mcp-status ${server.enabled ? (live?.status || 'disconnected') : 'disabled'}`}>
                                         {mcpStatusLabel(server.enabled ? live?.status : 'disabled')}
                                       </em>
                                       {typeof live?.tool_count === 'number' && server.enabled && live.status === 'connected' && (
-                                        <em className="ai-settings-mcp-tools">{live.tool_count} tools</em>
+                                        <em className="ai-settings-mcp-tools">{live.tool_count} 个工具</em>
                                       )}
                                     </button>
                                     <button
@@ -8411,7 +8859,7 @@ export function App() {
                                       aria-checked={server.enabled}
                                       className={`ai-settings-switch${server.enabled ? ' on' : ''}`}
                                       disabled={isMcpSaving || busy}
-                                      title={server.enabled ? 'Disable server' : 'Enable server'}
+                                      title={server.enabled ? '禁用服务器' : '启用服务器'}
                                       onClick={() => void toggleMcpServerEnabled(server.id)}
                                     >
                                       <i />
@@ -8422,18 +8870,18 @@ export function App() {
                                     <div className="ai-settings-mcp-card-body">
                                       <div className="ai-settings-field-grid">
                                         <label className="ai-settings-field">
-                                          <span>Name</span>
+                                          <span>显示名称</span>
                                           <input
                                             className="ai-settings-input"
                                             value={server.name}
-                                            placeholder="Display name"
+                                            placeholder="显示名称"
                                             spellCheck={false}
                                             disabled={isMcpSaving || busy}
                                             onChange={(event) => updateMcpServerDraft(server.id, { name: event.target.value })}
                                           />
                                         </label>
                                         <label className="ai-settings-field">
-                                          <span>ID {isPersisted ? <em>locked after save</em> : <em>used by Agent</em>}</span>
+                                          <span>标识 ID {isPersisted ? <em>保存后锁定</em> : <em>Agent 调用用</em>}</span>
                                           <input
                                             className="ai-settings-input"
                                             value={server.id}
@@ -8444,7 +8892,7 @@ export function App() {
                                           />
                                         </label>
                                         <label className="ai-settings-field ai-settings-field-full">
-                                          <span>Transport <em>stdio / streamable-http 可连接</em></span>
+                                          <span>传输方式 <em>本地进程 / 远程 HTTP 可连接</em></span>
                                           <select
                                             className="ai-settings-input"
                                             value={server.transport}
@@ -8453,16 +8901,16 @@ export function App() {
                                               transport: event.target.value as McpTransport,
                                             })}
                                           >
-                                            <option value="stdio">stdio</option>
-                                            <option value="streamable-http">streamable-http</option>
-                                            <option value="sse">sse（按 streamable-http 连接）</option>
+                                            <option value="stdio">本地进程（stdio）</option>
+                                            <option value="streamable-http">远程 HTTP（streamable-http）</option>
+                                            <option value="sse">SSE（按 streamable-http 连接）</option>
                                           </select>
                                         </label>
 
                                         {server.transport === 'stdio' ? (
                                           <>
                                             <label className="ai-settings-field ai-settings-field-full">
-                                              <span>Command</span>
+                                              <span>启动命令</span>
                                               <input
                                                 className="ai-settings-input"
                                                 value={server.command}
@@ -8473,7 +8921,7 @@ export function App() {
                                               />
                                             </label>
                                             <label className="ai-settings-field ai-settings-field-full">
-                                              <span>Args <em>space-separated</em></span>
+                                              <span>参数 <em>空格分隔</em></span>
                                               <input
                                                 className="ai-settings-input"
                                                 value={server.args.join(' ')}
@@ -8486,7 +8934,7 @@ export function App() {
                                               />
                                             </label>
                                             <label className="ai-settings-field ai-settings-field-full">
-                                              <span>Env <em>KEY=VALUE per line</em></span>
+                                              <span>环境变量 <em>每行 KEY=VALUE</em></span>
                                               <textarea
                                                 className="ai-settings-textarea"
                                                 rows={3}
@@ -8508,11 +8956,11 @@ export function App() {
                                               />
                                             </label>
                                             <label className="ai-settings-field ai-settings-field-full">
-                                              <span>CWD</span>
+                                              <span>工作目录</span>
                                               <input
                                                 className="ai-settings-input"
                                                 value={server.cwd ?? ''}
-                                                placeholder="Optional working directory"
+                                                placeholder="可选，留空则用默认目录"
                                                 spellCheck={false}
                                                 disabled={isMcpSaving || busy}
                                                 onChange={(event) => updateMcpServerDraft(server.id, {
@@ -8524,7 +8972,7 @@ export function App() {
                                         ) : (
                                           <>
                                             <label className="ai-settings-field ai-settings-field-full">
-                                              <span>URL <em>http(s) · streamable-http</em></span>
+                                              <span>服务地址 <em>http(s) · streamable-http</em></span>
                                               <input
                                                 className="ai-settings-input"
                                                 value={server.url}
@@ -8535,7 +8983,7 @@ export function App() {
                                               />
                                             </label>
                                             <label className="ai-settings-field ai-settings-field-full">
-                                              <span>Headers <em>KEY=VALUE per line</em></span>
+                                              <span>请求头 <em>每行 KEY=VALUE</em></span>
                                               <textarea
                                                 className="ai-settings-textarea"
                                                 rows={3}
@@ -8557,7 +9005,7 @@ export function App() {
                                               />
                                             </label>
                                             <p className="ai-settings-mcp-remote-note">
-                                              远程 URL 使用 streamable-http 客户端（JSON / SSE 响应）。旧版纯 GET SSE 未实现。启用后可 Reconnect 探测工具。
+                                              远程地址使用 streamable-http 客户端（JSON / SSE 响应）。旧版纯 GET SSE 未实现。启用后可点「重新连接」探测工具。
                                             </p>
                                           </>
                                         )}
@@ -8574,7 +9022,7 @@ export function App() {
                                             </div>
                                           ))}
                                           {live.tools.length > 12 && (
-                                            <div className="ai-settings-mcp-tool-more">+{live.tools.length - 12} more tools</div>
+                                            <div className="ai-settings-mcp-tool-more">还有 {live.tools.length - 12} 个工具</div>
                                           )}
                                         </div>
                                       )}
@@ -8587,7 +9035,7 @@ export function App() {
                                           onClick={() => void reconnectMcpServerDraft(server.id)}
                                         >
                                           <RefreshCw size={14} className={busy ? 'spin' : undefined} aria-hidden />
-                                          <span>{busy ? 'Connecting…' : 'Reconnect'}</span>
+                                          <span>{busy ? '连接中…' : '重新连接'}</span>
                                         </button>
                                         <button
                                           type="button"
@@ -8596,7 +9044,7 @@ export function App() {
                                           onClick={() => requestRemoveMcpServer(server.id)}
                                         >
                                           <Trash2 size={14} aria-hidden />
-                                          <span>Delete</span>
+                                          <span>删除</span>
                                         </button>
                                       </div>
                                     </div>
@@ -8621,7 +9069,7 @@ export function App() {
                       disabled={isMcpSaving}
                       onClick={() => requestCloseAiSettings()}
                     >
-                      Cancel
+                      取消
                     </button>
                     <button
                       type="button"
@@ -8629,7 +9077,7 @@ export function App() {
                       disabled={isMcpLoading || isMcpSaving || !isMcpServersDraftDirty(mcpServersDraft, mcpSnapshot)}
                       onClick={() => void submitMcpConfig()}
                     >
-                      {isMcpSaving ? 'Saving…' : isMcpServersDraftDirty(mcpServersDraft, mcpSnapshot) ? 'Save MCP' : 'Saved'}
+                      {isMcpSaving ? '保存中…' : isMcpServersDraftDirty(mcpServersDraft, mcpSnapshot) ? '保存 MCP' : '已保存'}
                     </button>
                   </footer>
                 </div>
