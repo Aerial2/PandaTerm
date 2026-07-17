@@ -1,2 +1,3 @@
 # PandaTerm
-PandaTerm — SSH 终端与运维工作台
+
+PandaTerm 是一款 SSH 终端与运维工作台。
