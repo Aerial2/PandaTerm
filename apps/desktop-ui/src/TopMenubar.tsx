@@ -6,10 +6,20 @@ import {
   Eye,
   EyeOff,
   FolderOpen,
+  Info,
   Plus,
   Server,
   Settings,
 } from 'lucide-react';
+import {
+  fetchLatestGithubVersion,
+  getCurrentAppVersion,
+  githubReleasesUrl,
+  githubRepoUrl,
+  isNewerVersion,
+  PANDATERM_GITHUB_REPO,
+  type LatestVersionResult,
+} from './aboutModel';
 
 const SHOW_IP_STORAGE_KEY = 'pandaterm.topStatus.showIp';
 
@@ -49,6 +59,12 @@ type TopMenubarProps = {
   onSetLeftActivity: (panel: 'files' | 'monitor' | 'processes' | 'ai') => void;
 };
 
+type AboutState = {
+  currentVersion: string;
+  latest: LatestVersionResult | null;
+  loadingLatest: boolean;
+};
+
 /**
  * 顶部菜单独立 state，避免 activeMenu 切换拖垮整个 App 重渲染。
  */
@@ -63,6 +79,12 @@ export function TopMenubar({
 }: TopMenubarProps) {
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
   const [showIp, setShowIp] = useState(readShowIpPreference);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [about, setAbout] = useState<AboutState>({
+    currentVersion: '…',
+    latest: null,
+    loadingLatest: false,
+  });
 
   const hasSession = Boolean(sessionName || sessionUser || sessionHost);
   const displayHost = showIp ? sessionHost : maskHost(sessionHost);
@@ -79,6 +101,27 @@ export function TopMenubar({
     return () => window.removeEventListener('mousedown', close);
   }, [activeMenu]);
 
+  useEffect(() => {
+    if (!aboutOpen) return;
+    let cancelled = false;
+
+    setAbout((prev) => ({ ...prev, loadingLatest: true, latest: null }));
+
+    void (async () => {
+      const currentVersion = await getCurrentAppVersion();
+      if (cancelled) return;
+      setAbout((prev) => ({ ...prev, currentVersion }));
+
+      const latest = await fetchLatestGithubVersion();
+      if (cancelled) return;
+      setAbout({ currentVersion, latest, loadingLatest: false });
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [aboutOpen]);
+
   function runAndClose(action: () => void) {
     setActiveMenu(null);
     action();
@@ -92,140 +135,257 @@ export function TopMenubar({
     });
   }
 
-  return (
-    <header className="top-strip">
-      <nav className="menubar" role="menubar">
-        <div
-          className="menubar-item"
-          role="menuitem"
-          tabIndex={0}
-          onMouseEnter={() => {
-            if (activeMenu) setActiveMenu('连接');
-          }}
-          onClick={() => setActiveMenu(activeMenu === '连接' ? null : '连接')}
-        >
-          <span className="menubar-label">
-            连接<span className="menubar-accent">(F)</span>
-          </span>
-          {activeMenu === '连接' && (
-            <div className="menubar-dropdown" role="menu">
-              <button
-                className="menubar-menu-item"
-                role="menuitem"
-                onClick={() => runAndClose(onOpenConnectionCreate)}
-              >
-                <Plus size={14} />
-                <span>新建连接</span>
-              </button>
-              <button
-                className="menubar-menu-item"
-                role="menuitem"
-                onClick={() => runAndClose(onOpenConnectionManage)}
-              >
-                <Server size={14} />
-                <span>连接管理</span>
-              </button>
-            </div>
-          )}
-        </div>
-        <div
-          className="menubar-item"
-          role="menuitem"
-          tabIndex={0}
-          onMouseEnter={() => {
-            if (activeMenu) setActiveMenu('编辑');
-          }}
-          onClick={() => setActiveMenu(activeMenu === '编辑' ? null : '编辑')}
-        >
-          <span className="menubar-label">
-            编辑<span className="menubar-accent">(E)</span>
-          </span>
-          {activeMenu === '编辑' && (
-            <div className="menubar-dropdown" role="menu">
-              <button
-                className="menubar-menu-item"
-                role="menuitem"
-                onClick={() => runAndClose(onOpenAiSettings)}
-              >
-                <Settings size={14} />
-                <span>AI 设置</span>
-              </button>
-            </div>
-          )}
-        </div>
-        <div
-          className="menubar-item"
-          role="menuitem"
-          tabIndex={0}
-          onMouseEnter={() => {
-            if (activeMenu) setActiveMenu('查看');
-          }}
-          onClick={() => setActiveMenu(activeMenu === '查看' ? null : '查看')}
-        >
-          <span className="menubar-label">
-            查看<span className="menubar-accent">(V)</span>
-          </span>
-          {activeMenu === '查看' && (
-            <div className="menubar-dropdown" role="menu">
-              <button
-                className="menubar-menu-item"
-                role="menuitem"
-                onClick={() => runAndClose(() => onSetLeftActivity('files'))}
-              >
-                <FolderOpen size={14} />
-                <span>文件资源管理器</span>
-              </button>
-              <button
-                className="menubar-menu-item"
-                role="menuitem"
-                onClick={() => runAndClose(() => onSetLeftActivity('monitor'))}
-              >
-                <Cpu size={14} />
-                <span>系统监控</span>
-              </button>
-              <button
-                className="menubar-menu-item"
-                role="menuitem"
-                onClick={() => runAndClose(() => onSetLeftActivity('processes'))}
-              >
-                <Activity size={14} />
-                <span>进程列表</span>
-              </button>
-              <button
-                className="menubar-menu-item"
-                role="menuitem"
-                onClick={() => runAndClose(() => onSetLeftActivity('ai'))}
-              >
-                <Bot size={14} />
-                <span>AI 助手</span>
-              </button>
-            </div>
-          )}
-        </div>
-      </nav>
+  function openAbout() {
+    setAboutOpen(true);
+  }
 
-      <div className="top-status">
-        {hasSession && (
-          <>
-            <span
-              className="top-status-text"
-              title={showIp ? statusText : undefined}
-            >
-              {statusText}
+  const latestLabel = about.loadingLatest
+    ? '检查中…'
+    : about.latest?.ok
+      ? about.latest.version
+      : about.latest
+        ? '—'
+        : '—';
+
+  const latestHint = !about.loadingLatest && about.latest && !about.latest.ok
+    ? about.latest.error
+    : !about.loadingLatest && about.latest?.ok
+      ? isNewerVersion(about.latest.version, about.currentVersion)
+        ? '有新版本'
+        : '已是最新'
+      : null;
+
+  const releaseUrl = about.latest?.ok
+    ? about.latest.htmlUrl
+    : githubReleasesUrl(PANDATERM_GITHUB_REPO);
+
+  return (
+    <>
+      <header className="top-strip">
+        <nav className="menubar" role="menubar">
+          <div
+            className="menubar-item"
+            role="menuitem"
+            tabIndex={0}
+            onMouseEnter={() => {
+              if (activeMenu) setActiveMenu('连接');
+            }}
+            onClick={() => setActiveMenu(activeMenu === '连接' ? null : '连接')}
+          >
+            <span className="menubar-label">
+              连接<span className="menubar-accent">(F)</span>
             </span>
-            <button
-              type="button"
-              className="top-status-ip-toggle"
-              onClick={toggleShowIp}
-              title={showIp ? '隐藏 IP' : '显示 IP'}
-              aria-label={showIp ? '隐藏 IP' : '显示 IP'}
-              aria-pressed={showIp}
-            >
-              {showIp ? <Eye size={14} /> : <EyeOff size={14} />}
-            </button>
-          </>
-        )}
-      </div>
-    </header>
+            {activeMenu === '连接' && (
+              <div className="menubar-dropdown" role="menu">
+                <button
+                  className="menubar-menu-item"
+                  role="menuitem"
+                  onClick={() => runAndClose(onOpenConnectionCreate)}
+                >
+                  <Plus size={14} />
+                  <span>新建连接</span>
+                </button>
+                <button
+                  className="menubar-menu-item"
+                  role="menuitem"
+                  onClick={() => runAndClose(onOpenConnectionManage)}
+                >
+                  <Server size={14} />
+                  <span>连接管理</span>
+                </button>
+              </div>
+            )}
+          </div>
+          <div
+            className="menubar-item"
+            role="menuitem"
+            tabIndex={0}
+            onMouseEnter={() => {
+              if (activeMenu) setActiveMenu('编辑');
+            }}
+            onClick={() => setActiveMenu(activeMenu === '编辑' ? null : '编辑')}
+          >
+            <span className="menubar-label">
+              编辑<span className="menubar-accent">(E)</span>
+            </span>
+            {activeMenu === '编辑' && (
+              <div className="menubar-dropdown" role="menu">
+                <button
+                  className="menubar-menu-item"
+                  role="menuitem"
+                  onClick={() => runAndClose(onOpenAiSettings)}
+                >
+                  <Settings size={14} />
+                  <span>AI 设置</span>
+                </button>
+              </div>
+            )}
+          </div>
+          <div
+            className="menubar-item"
+            role="menuitem"
+            tabIndex={0}
+            onMouseEnter={() => {
+              if (activeMenu) setActiveMenu('查看');
+            }}
+            onClick={() => setActiveMenu(activeMenu === '查看' ? null : '查看')}
+          >
+            <span className="menubar-label">
+              查看<span className="menubar-accent">(V)</span>
+            </span>
+            {activeMenu === '查看' && (
+              <div className="menubar-dropdown" role="menu">
+                <button
+                  className="menubar-menu-item"
+                  role="menuitem"
+                  onClick={() => runAndClose(() => onSetLeftActivity('files'))}
+                >
+                  <FolderOpen size={14} />
+                  <span>文件资源管理器</span>
+                </button>
+                <button
+                  className="menubar-menu-item"
+                  role="menuitem"
+                  onClick={() => runAndClose(() => onSetLeftActivity('monitor'))}
+                >
+                  <Cpu size={14} />
+                  <span>系统监控</span>
+                </button>
+                <button
+                  className="menubar-menu-item"
+                  role="menuitem"
+                  onClick={() => runAndClose(() => onSetLeftActivity('processes'))}
+                >
+                  <Activity size={14} />
+                  <span>进程列表</span>
+                </button>
+                <button
+                  className="menubar-menu-item"
+                  role="menuitem"
+                  onClick={() => runAndClose(() => onSetLeftActivity('ai'))}
+                >
+                  <Bot size={14} />
+                  <span>AI 助手</span>
+                </button>
+              </div>
+            )}
+          </div>
+          <div
+            className="menubar-item"
+            role="menuitem"
+            tabIndex={0}
+            onMouseEnter={() => {
+              if (activeMenu) setActiveMenu('帮助');
+            }}
+            onClick={() => setActiveMenu(activeMenu === '帮助' ? null : '帮助')}
+          >
+            <span className="menubar-label">
+              帮助<span className="menubar-accent">(H)</span>
+            </span>
+            {activeMenu === '帮助' && (
+              <div className="menubar-dropdown" role="menu">
+                <button
+                  className="menubar-menu-item"
+                  role="menuitem"
+                  onClick={() => runAndClose(openAbout)}
+                >
+                  <Info size={14} />
+                  <span>关于</span>
+                </button>
+              </div>
+            )}
+          </div>
+        </nav>
+
+        <div className="top-status">
+          {hasSession && (
+            <>
+              <span
+                className="top-status-text"
+                title={showIp ? statusText : undefined}
+              >
+                {statusText}
+              </span>
+              <button
+                type="button"
+                className="top-status-ip-toggle"
+                onClick={toggleShowIp}
+                title={showIp ? '隐藏 IP' : '显示 IP'}
+                aria-label={showIp ? '隐藏 IP' : '显示 IP'}
+                aria-pressed={showIp}
+              >
+                {showIp ? <Eye size={14} /> : <EyeOff size={14} />}
+              </button>
+            </>
+          )}
+        </div>
+      </header>
+
+      {aboutOpen && (
+        <div className="dialog-backdrop" onMouseDown={() => setAboutOpen(false)}>
+          <div
+            className="dialog-card about-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="about-dialog-title"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <h3 id="about-dialog-title">关于 PandaTerm</h3>
+            <p className="about-dialog-desc">SSH 终端与运维工作台</p>
+            <div className="about-dialog-rows">
+              <div className="about-dialog-row">
+                <span>当前版本</span>
+                <strong>{about.currentVersion}</strong>
+              </div>
+              <div className="about-dialog-row">
+                <span>最新版本</span>
+                <strong className="about-dialog-latest">
+                  {latestLabel}
+                  {latestHint ? (
+                    <em className={latestHint === '有新版本' ? 'update' : undefined}>
+                      {latestHint}
+                    </em>
+                  ) : null}
+                </strong>
+              </div>
+              <div className="about-dialog-row about-dialog-source">
+                <span>检查来源</span>
+                <a
+                  className="about-dialog-link"
+                  href={githubRepoUrl(PANDATERM_GITHUB_REPO)}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={PANDATERM_GITHUB_REPO}
+                >
+                  GitHub · {PANDATERM_GITHUB_REPO}
+                </a>
+              </div>
+            </div>
+            {!about.loadingLatest && about.latest && !about.latest.ok ? (
+              <p className="about-dialog-error">{about.latest.error}</p>
+            ) : null}
+            <div className="dialog-actions">
+              <button
+                type="button"
+                className="dialog-btn"
+                onClick={() => {
+                  window.open(releaseUrl, '_blank', 'noopener,noreferrer');
+                }}
+              >
+                打开发布页
+              </button>
+              <button
+                type="button"
+                className="dialog-btn primary"
+                autoFocus
+                onClick={() => setAboutOpen(false)}
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }

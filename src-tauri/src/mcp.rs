@@ -814,11 +814,9 @@ pub fn transport_label(transport: &McpTransport) -> &'static str {
 }
 
 /// 拼出更完整的 PATH，缓解 GUI 进程缺少终端/fnm/nodejs 路径的问题。
+/// 稳定安装目录优先于进程 PATH（避免过期的 fnm_multishell 抢先命中）。
 fn build_mcp_process_path() -> Option<OsString> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(path) = env::var_os("PATH") {
-        dirs.extend(env::split_paths(&path));
-    }
     #[cfg(windows)]
     {
         if let Ok(pf) = env::var("ProgramFiles") {
@@ -831,7 +829,7 @@ fn build_mcp_process_path() -> Option<OsString> {
             let local = PathBuf::from(local);
             dirs.push(local.join("Programs").join("nodejs"));
             dirs.push(local.join("fnm"));
-            // 最近 fnm multishell（若存在）
+            // 最近 fnm multishell（若存在且目录有效）
             let multi = local.join("fnm_multishells");
             if multi.is_dir() {
                 if let Ok(entries) = std::fs::read_dir(&multi) {
@@ -840,7 +838,6 @@ fn build_mcp_process_path() -> Option<OsString> {
                         .filter(|p| p.is_dir())
                         .collect();
                     shells.sort();
-                    // 取末尾若干新目录
                     for p in shells.into_iter().rev().take(3) {
                         dirs.push(p);
                     }
@@ -857,7 +854,6 @@ fn build_mcp_process_path() -> Option<OsString> {
             dirs.push(home.join("AppData").join("Roaming").join("Python").join("Scripts"));
             dirs.push(home.join(".cargo").join("bin"));
         }
-        // 常见 Python 安装
         for ver in ["Python313", "Python312", "Python311", "Python310"] {
             if let Ok(local) = env::var("LOCALAPPDATA") {
                 let base = PathBuf::from(&local).join("Programs").join("Python").join(ver);
@@ -877,6 +873,17 @@ fn build_mcp_process_path() -> Option<OsString> {
         }
         dirs.push(PathBuf::from("/usr/local/bin"));
         dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    }
+    // 再拼当前进程 PATH（跳过已失效目录）
+    if let Some(path) = env::var_os("PATH") {
+        for dir in env::split_paths(&path) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            if dir.is_dir() {
+                dirs.push(dir);
+            }
+        }
     }
 
     // 去重保序
@@ -1018,6 +1025,10 @@ fn windows_quote_arg(arg: &str) -> String {
 }
 
 /// 构造 stdio MCP 启动命令：解析真实可执行文件；Windows 批处理走 cmd.exe。
+///
+/// 注意：路径含空格时（如 `C:\Program Files\nodejs\npx.cmd`）不能用
+/// `cmd /S /C "\"path\" args"`，/S 会剥掉首尾引号导致 `C:\Program` 被截断。
+/// 使用 `cmd /D /C call <program> <args...>`，由 CreateProcess 正确引用各参数。
 fn build_mcp_stdio_command(config: &McpServerConfig) -> Result<Command, String> {
     let program = resolve_mcp_program(&config.command).ok_or_else(|| {
         format!(
@@ -1034,14 +1045,10 @@ fn build_mcp_stdio_command(config: &McpServerConfig) -> Result<Command, String> 
             .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
             .unwrap_or(false);
         if is_batch {
-            // CreateProcess 不能直接跑 .cmd，需经 cmd.exe
-            let mut line = format!("\"{}\"", program.display());
-            for arg in &config.args {
-                line.push(' ');
-                line.push_str(&windows_quote_arg(arg));
-            }
             let mut command = Command::new("cmd.exe");
-            command.arg("/D").arg("/S").arg("/C").arg(line);
+            command.arg("/D").arg("/C").arg("call");
+            command.arg(&program);
+            command.args(&config.args);
             return Ok(command);
         }
     }
@@ -1049,6 +1056,20 @@ fn build_mcp_stdio_command(config: &McpServerConfig) -> Result<Command, String> 
     let mut command = Command::new(&program);
     command.args(&config.args);
     Ok(command)
+}
+
+fn append_mcp_stderr_hint(base: String, stderr_tail: &str) -> String {
+    let trimmed = stderr_tail.trim();
+    if trimmed.is_empty() {
+        return base;
+    }
+    let hint: String = trimmed.chars().rev().take(1200).collect::<String>().chars().rev().collect();
+    let hint = hint.trim();
+    if hint.is_empty() {
+        base
+    } else {
+        format!("{base}\n—— 进程输出 ——\n{hint}")
+    }
 }
 
 fn snapshot_server(
@@ -1396,9 +1417,11 @@ impl McpRuntime {
             routes.insert(config.id.clone(), Arc::clone(&pending_map));
         }
 
-        // Drain stderr so the process never blocks on a full pipe.
+        // Drain stderr so the process never blocks on a full pipe；同时保留尾部供报错展示
+        let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         if let Some(stderr) = stderr.take() {
             let server_id = config.id.clone();
+            let stderr_tail = Arc::clone(&stderr_tail);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut line = String::new();
@@ -1407,9 +1430,22 @@ impl McpRuntime {
                     match reader.read_line(&mut line).await {
                         Ok(0) => break,
                         Ok(_) => {
-                            let text = line.trim();
-                            if !text.is_empty() {
-                                eprintln!("[MCP {}] {text}", server_id);
+                            let text = line.trim_end_matches(['\r', '\n']);
+                            if text.is_empty() {
+                                continue;
+                            }
+                            eprintln!("[MCP {}] {text}", server_id);
+                            let mut buf = stderr_tail.lock().await;
+                            if !buf.is_empty() {
+                                buf.push('\n');
+                            }
+                            buf.push_str(text);
+                            // 限制长度，避免异常输出撑爆内存
+                            const MAX_TAIL: usize = 8_000;
+                            if buf.len() > MAX_TAIL {
+                                let keep_from = buf.len() - MAX_TAIL;
+                                let keep = buf.split_off(keep_from);
+                                *buf = keep;
                             }
                         }
                         Err(_) => break,
@@ -1480,7 +1516,15 @@ impl McpRuntime {
             }),
             MCP_INIT_TIMEOUT,
         )
-        .await?;
+        .await;
+        let init_result = match init_result {
+            Ok(value) => value,
+            Err(error) => {
+                let tail = stderr_tail.lock().await.clone();
+                let _ = live.child.kill().await;
+                return Err(append_mcp_stderr_hint(error, &tail));
+            }
+        };
         let _ = init_result;
 
         // notifications/initialized (no id)
@@ -1491,17 +1535,25 @@ impl McpRuntime {
         let frame = encode_mcp_message(&notification)?;
         {
             let mut stdin_guard = live.stdin.lock().await;
-            stdin_guard
-                .write_all(&frame)
-                .await
-                .map_err(|error| format!("MCP initialized 通知失败：{error}"))?;
-            stdin_guard
-                .flush()
-                .await
-                .map_err(|error| format!("MCP initialized 通知失败：{error}"))?;
+            if let Err(error) = stdin_guard.write_all(&frame).await {
+                let tail = stderr_tail.lock().await.clone();
+                let _ = live.child.kill().await;
+                return Err(append_mcp_stderr_hint(
+                    format!("MCP initialized 通知失败：{error}"),
+                    &tail,
+                ));
+            }
+            if let Err(error) = stdin_guard.flush().await {
+                let tail = stderr_tail.lock().await.clone();
+                let _ = live.child.kill().await;
+                return Err(append_mcp_stderr_hint(
+                    format!("MCP initialized 通知失败：{error}"),
+                    &tail,
+                ));
+            }
         }
 
-        let tools_result = request_on_session(
+        let tools_result = match request_on_session(
             &live.stdin,
             &live.next_id,
             &pending_map,
@@ -1509,7 +1561,15 @@ impl McpRuntime {
             json!({}),
             MCP_REQUEST_TIMEOUT,
         )
-        .await?;
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let tail = stderr_tail.lock().await.clone();
+                let _ = live.child.kill().await;
+                return Err(append_mcp_stderr_hint(error, &tail));
+            }
+        };
         let tools = parse_tools_list(&tools_result)?;
         live.tools = tools.clone();
 
@@ -2083,6 +2143,55 @@ mod tests {
     fn windows_quote_arg_handles_spaces() {
         assert_eq!(windows_quote_arg("plain"), "plain");
         assert_eq!(windows_quote_arg("a b"), "\"a b\"");
+    }
+
+    #[test]
+    fn append_mcp_stderr_hint_includes_tail() {
+        let msg = append_mcp_stderr_hint("MCP 进程已退出".into(), "  'C:\\Program' is not recognized  ");
+        assert!(msg.contains("MCP 进程已退出"));
+        assert!(msg.contains("C:\\Program"));
+        assert_eq!(
+            append_mcp_stderr_hint("ok".into(), "   "),
+            "ok"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_batch_stdio_command_uses_call_not_s_flag() {
+        let config = McpServerConfig {
+            id: "ctx".into(),
+            name: "ctx".into(),
+            transport: McpTransport::Stdio,
+            command: "npx".into(),
+            args: vec!["-y".into(), "@upstash/context7-mcp@latest".into()],
+            env: HashMap::new(),
+            cwd: None,
+            url: String::new(),
+            headers: HashMap::new(),
+            enabled: true,
+            disabled_tools: vec![],
+        };
+        // 无 npx 时跳过（CI 可能无 Node）
+        let Ok(command) = build_mcp_stdio_command(&config) else {
+            return;
+        };
+        let program = command.as_std().get_program().to_string_lossy().to_string();
+        // 解析到 .cmd 时应走 cmd.exe + call；直接 .exe 则原样
+        if program.eq_ignore_ascii_case("cmd.exe") || program.eq_ignore_ascii_case("cmd") {
+            let args: Vec<String> = command
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(args.iter().any(|a| a == "/C"), "args={args:?}");
+            assert!(args.iter().any(|a| a == "call"), "args={args:?}");
+            assert!(!args.iter().any(|a| a == "/S"), "must not use /S: {args:?}");
+            assert!(
+                args.iter().any(|a| a.ends_with("npx.cmd") || a.ends_with("npx.CMD")),
+                "args={args:?}"
+            );
+        }
     }
 
     #[test]

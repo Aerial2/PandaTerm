@@ -146,7 +146,6 @@ import {
   type McpServerConfig,
   type McpConfigSnapshot,
   type McpImportCandidate,
-  type McpTransport,
   listLocalDirectory,
   listRemoteDirectory,
   listSessions,
@@ -261,6 +260,7 @@ import {
   createEmptyMcpServer,
   countEnabledMcpTools,
   formatMcpServerCommandLine,
+  formatMcpServerJson,
   isAiConfigDraftDirty,
   isMcpServerDraftDirty,
   isMcpServersDraftDirty,
@@ -269,6 +269,7 @@ import {
   mcpServerAvatarLetter,
   mcpServerStatusDot,
   mcpStatusLabel,
+  parseMcpServerJsonText,
   resolveAiModelCatalog,
   snapshotToMcpDraft,
   toggleMcpToolDisabled,
@@ -405,6 +406,9 @@ export function App() {
   const [mcpError, setMcpError] = useState('');
   const [mcpNotice, setMcpNotice] = useState('');
   const [expandedMcpServerId, setExpandedMcpServerId] = useState<string | null>(null);
+  /** 编辑框中的 JSON 文本（按 server id） */
+  const [mcpEditJsonById, setMcpEditJsonById] = useState<Record<string, string>>({});
+  const [mcpEditJsonErrorById, setMcpEditJsonErrorById] = useState<Record<string, string>>({});
   /** 工具标签 Show more */
   const [mcpToolsExpandedIds, setMcpToolsExpandedIds] = useState<Record<string, boolean>>({});
   /** Cursor mcp.json 导入面板 */
@@ -415,8 +419,8 @@ export function App() {
   const [mcpImportStrategy, setMcpImportStrategy] = useState<'overwrite' | 'skip'>('overwrite');
   const [isMcpImporting, setIsMcpImporting] = useState(false);
   const [isMcpExporting, setIsMcpExporting] = useState(false);
-  /** MCP 市场：精选目录搜索 / 一键添加 */
-  const [mcpMarketOpen, setMcpMarketOpen] = useState(false);
+  /** MCP 页内：已安装 | 市场 */
+  const [mcpPane, setMcpPane] = useState<'installed' | 'market'>('installed');
   const [mcpMarketQuery, setMcpMarketQuery] = useState('');
   const [mcpMarketCategory, setMcpMarketCategory] = useState<McpMarketCategoryId>('all');
   const mcpRefreshGenerationRef = useRef(0);
@@ -565,7 +569,7 @@ export function App() {
     setMcpImportPath('');
     setMcpImportStrategy('overwrite');
     setIsMcpImporting(false);
-    setMcpMarketOpen(false);
+    setMcpPane('installed');
     setMcpMarketQuery('');
     setMcpMarketCategory('all');
     setIsMcpExporting(false);
@@ -3674,6 +3678,69 @@ export function App() {
     )));
   }
 
+  function openMcpServerJsonEditor(server: McpServerConfig) {
+    setExpandedMcpServerId(server.id);
+    setMcpEditJsonById((current) => ({
+      ...current,
+      [server.id]: formatMcpServerJson(server),
+    }));
+    setMcpEditJsonErrorById((current) => ({ ...current, [server.id]: '' }));
+  }
+
+  function syncMcpServerJsonEditor(server: McpServerConfig) {
+    if (expandedMcpServerId !== server.id) return;
+    setMcpEditJsonById((current) => ({
+      ...current,
+      [server.id]: formatMcpServerJson(server),
+    }));
+    setMcpEditJsonErrorById((current) => ({ ...current, [server.id]: '' }));
+  }
+
+  function applyMcpServerJsonText(serverId: string, text: string) {
+    setMcpEditJsonById((current) => ({ ...current, [serverId]: text }));
+    const isPersisted = Boolean(mcpSnapshot?.servers.some((item) => item.id === serverId));
+    const otherIds = new Set(
+      mcpServersDraft.filter((item) => item.id !== serverId).map((item) => item.id),
+    );
+    const parsed = parseMcpServerJsonText(text, {
+      fallbackId: serverId,
+      lockId: isPersisted,
+    });
+    if (!parsed.ok) {
+      setMcpEditJsonErrorById((current) => ({ ...current, [serverId]: parsed.error }));
+      return;
+    }
+    const nextId = isPersisted ? serverId : (parsed.server.id.trim() || serverId);
+    if (!isPersisted && nextId !== serverId && otherIds.has(nextId)) {
+      setMcpEditJsonErrorById((current) => ({
+        ...current,
+        [serverId]: `标识 ID「${nextId}」已存在`,
+      }));
+      return;
+    }
+    const nextServer: McpServerConfig = { ...parsed.server, id: nextId };
+    setMcpEditJsonErrorById((current) => ({ ...current, [serverId]: '' }));
+    setMcpServersDraft((current) => current.map((server) => (
+      server.id === serverId ? nextServer : server
+    )));
+    if (nextId !== serverId) {
+      setExpandedMcpServerId(nextId);
+      setMcpEditJsonById((current) => {
+        const { [serverId]: moved, ...rest } = current;
+        return { ...rest, [nextId]: moved ?? text };
+      });
+      setMcpEditJsonErrorById((current) => {
+        const { [serverId]: _removed, ...rest } = current;
+        return rest;
+      });
+      setMcpToolsExpandedIds((current) => {
+        if (!(serverId in current)) return current;
+        const { [serverId]: moved, ...rest } = current;
+        return { ...rest, [nextId]: moved };
+      });
+    }
+  }
+
   /** 删除 MCP：确认后立即落盘（新草稿未入库则只移除草稿） */
   function requestRemoveMcpServer(serverId: string) {
     if (isMcpSaving || mcpBusyServerId) return;
@@ -3727,12 +3794,12 @@ export function App() {
     const nextEnabled = !current.enabled;
     if (nextEnabled && current.transport === 'stdio' && !current.command.trim()) {
       setMcpError('请先填写启动命令，再启用该 MCP 服务器');
-      setExpandedMcpServerId(serverId);
+      openMcpServerJsonEditor(current);
       return;
     }
     if (nextEnabled && current.transport !== 'stdio' && !current.url.trim()) {
       setMcpError('请先填写服务地址，再启用远程 MCP 服务器');
-      setExpandedMcpServerId(serverId);
+      openMcpServerJsonEditor(current);
       return;
     }
 
@@ -3820,11 +3887,11 @@ export function App() {
 
   async function openMcpImportPanel() {
     if (isMcpLoading || isMcpSaving || isMcpImporting) return;
+    setMcpPane('installed');
     if (mcpImportOpen) {
       setMcpImportOpen(false);
       return;
     }
-    setMcpMarketOpen(false);
     setMcpImportOpen(true);
     setMcpError('');
     setMcpNotice('');
@@ -3841,14 +3908,12 @@ export function App() {
     }
   }
 
-  function openMcpMarketPanel() {
+  function switchMcpPane(pane: 'installed' | 'market') {
     if (isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting) return;
-    if (mcpMarketOpen) {
-      setMcpMarketOpen(false);
-      return;
+    setMcpPane(pane);
+    if (pane === 'market') {
+      setMcpImportOpen(false);
     }
-    setMcpImportOpen(false);
-    setMcpMarketOpen(true);
     setMcpError('');
     setMcpNotice('');
   }
@@ -3858,15 +3923,15 @@ export function App() {
     if (isMcpSaving || mcpBusyServerId) return;
     const existing = mcpServersDraft.find((server) => server.id === item.id);
     if (existing) {
-      setExpandedMcpServerId(existing.id);
-      setMcpMarketOpen(false);
-      setMcpNotice(`「${item.name}」已在列表中，已展开该服务器。`);
+      setMcpPane('installed');
+      openMcpServerJsonEditor(existing);
+      setMcpNotice(`「${item.name}」已在列表中，已切换到已安装并展开。`);
       return;
     }
     const draft = marketItemToServerConfig(item);
     setMcpServersDraft((current) => [...current, draft]);
-    setExpandedMcpServerId(draft.id);
-    setMcpMarketOpen(false);
+    setMcpPane('installed');
+    openMcpServerJsonEditor(draft);
     setMcpError('');
     const tips: string[] = [];
     if (item.requiresEnv?.length) tips.push(`请填写环境变量：${item.requiresEnv.join('、')}`);
@@ -7538,67 +7603,84 @@ export function App() {
                   <div className="ai-settings-body">
                     <section className="ai-settings-section ai-settings-section-flat">
                       <div className="ai-settings-section-title-row">
-                        <div className="ai-settings-section-title">已安装的 MCP 服务器</div>
-                        <div className="ai-settings-mcp-actions">
+                        <div className="ai-settings-mcp-pane-tabs" role="tablist" aria-label="MCP 视图">
                           <button
                             type="button"
-                            className="ai-settings-ghost-btn"
+                            role="tab"
+                            aria-selected={mcpPane === 'installed'}
+                            className={`ai-settings-mcp-pane-tab${mcpPane === 'installed' ? ' active' : ''}`}
                             disabled={isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting}
-                            onClick={() => void refreshMcpConfig()}
+                            onClick={() => switchMcpPane('installed')}
                           >
-                            <RefreshCw size={14} className={isMcpLoading ? 'spin' : undefined} aria-hidden />
-                            <span>刷新</span>
+                            已安装
+                            {mcpServersDraft.length > 0 ? (
+                              <em>{mcpServersDraft.length}</em>
+                            ) : null}
                           </button>
                           <button
                             type="button"
-                            className={`ai-settings-ghost-btn${mcpMarketOpen ? ' active' : ''}`}
+                            role="tab"
+                            aria-selected={mcpPane === 'market'}
+                            className={`ai-settings-mcp-pane-tab${mcpPane === 'market' ? ' active' : ''}`}
                             disabled={isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting}
-                            title="从精选市场添加 MCP"
-                            onClick={() => openMcpMarketPanel()}
+                            onClick={() => switchMcpPane('market')}
                           >
-                            <Store size={14} aria-hidden />
-                            <span>市场</span>
-                          </button>
-                          <button
-                            type="button"
-                            className={`ai-settings-ghost-btn${mcpImportOpen ? ' active' : ''}`}
-                            disabled={isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting}
-                            onClick={() => void openMcpImportPanel()}
-                          >
-                            <Download size={14} aria-hidden />
-                            <span>导入</span>
-                          </button>
-                          <button
-                            type="button"
-                            className="ai-settings-ghost-btn"
-                            disabled={isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting || mcpServersDraft.length === 0}
-                            title="导出为 Cursor 风格 mcp.json"
-                            onClick={() => void exportMcpCursorJson()}
-                          >
-                            <Upload size={14} aria-hidden />
-                            <span>{isMcpExporting ? '导出中…' : '导出'}</span>
-                          </button>
-                          <button
-                            type="button"
-                            className="ai-settings-ghost-btn primary-ghost"
-                            disabled={isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting}
-                            onClick={() => {
-                              const server = createEmptyMcpServer();
-                              setMcpServersDraft((current) => [...current, server]);
-                              setExpandedMcpServerId(server.id);
-                            }}
-                          >
-                            <Plus size={14} aria-hidden />
-                            <span>新建服务器</span>
+                            <Store size={13} aria-hidden />
+                            市场
                           </button>
                         </div>
+                        {mcpPane === 'installed' && (
+                          <div className="ai-settings-mcp-actions">
+                            <button
+                              type="button"
+                              className="ai-settings-ghost-btn"
+                              disabled={isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting}
+                              onClick={() => void refreshMcpConfig()}
+                            >
+                              <RefreshCw size={14} className={isMcpLoading ? 'spin' : undefined} aria-hidden />
+                              <span>刷新</span>
+                            </button>
+                            <button
+                              type="button"
+                              className={`ai-settings-ghost-btn${mcpImportOpen ? ' active' : ''}`}
+                              disabled={isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting}
+                              onClick={() => void openMcpImportPanel()}
+                            >
+                              <Download size={14} aria-hidden />
+                              <span>导入</span>
+                            </button>
+                            <button
+                              type="button"
+                              className="ai-settings-ghost-btn"
+                              disabled={isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting || mcpServersDraft.length === 0}
+                              title="导出为 Cursor 风格 mcp.json"
+                              onClick={() => void exportMcpCursorJson()}
+                            >
+                              <Upload size={14} aria-hidden />
+                              <span>{isMcpExporting ? '导出中…' : '导出'}</span>
+                            </button>
+                            <button
+                              type="button"
+                              className="ai-settings-ghost-btn primary-ghost"
+                              disabled={isMcpLoading || isMcpSaving || isMcpImporting || isMcpExporting}
+                              onClick={() => {
+                                const server = createEmptyMcpServer();
+                                setMcpServersDraft((current) => [...current, server]);
+                                openMcpServerJsonEditor(server);
+                              }}
+                            >
+                              <Plus size={14} aria-hidden />
+                              <span>新建MCP</span>
+                            </button>
+                          </div>
+                        )}
                       </div>
 
-                      {mcpMarketOpen && (
+                      {mcpPane === 'market' && (
                         <div className="ai-settings-mcp-market">
-                          <div className="ai-settings-mcp-import-title">
-                            MCP 市场
-                            <em>精选常用服务 · 一键加入草稿 · 需本机已装 Node/npx 或 uvx</em>
+                          <div className="ai-settings-mcp-market-head">
+                            精选 MCP
+                            <em>一键加入草稿 · 需本机已装 Node/npx 或 uvx</em>
                           </div>
                           <div className="ai-settings-mcp-market-toolbar">
                             <div className="ai-settings-model-filter">
@@ -7657,36 +7739,42 @@ export function App() {
                               }
                               return visible.map((item) => {
                                 const installed = mcpServersDraft.some((server) => server.id === item.id);
+                                const initial = item.name.trim().charAt(0).toUpperCase() || 'M';
                                 return (
                                   <div key={item.id} className={`ai-settings-mcp-market-card${installed ? ' installed' : ''}`}>
-                                    <div className="ai-settings-mcp-market-card-main">
-                                      <div className="ai-settings-mcp-market-card-title">
-                                        <strong>{item.name}</strong>
-                                        <em>{mcpMarketCategoryLabel(item.category)}</em>
-                                        {item.tags.slice(0, 3).map((tag) => (
-                                          <span key={tag} className="ai-settings-mcp-market-tag">{tag}</span>
-                                        ))}
+                                    <div className="ai-settings-mcp-market-card-info">
+                                      <div className="ai-settings-mcp-avatar" aria-hidden>
+                                        {initial}
                                       </div>
-                                      <p>{item.description}</p>
-                                      <code>
-                                        {item.config.transport === 'stdio'
-                                          ? [item.config.command, ...(item.config.args ?? [])].join(' ')
-                                          : item.config.url}
-                                      </code>
-                                      {(item.requiresEnv?.length || item.requiresArgs || item.note) ? (
-                                        <small>
-                                          {[
-                                            item.requiresEnv?.length ? `需环境变量：${item.requiresEnv.join('、')}` : '',
-                                            item.requiresArgs ? '需按本机修改参数' : '',
-                                            item.note ?? '',
-                                          ].filter(Boolean).join(' · ')}
-                                        </small>
-                                      ) : null}
+                                      <div className="ai-settings-mcp-market-card-main">
+                                        <div className="ai-settings-mcp-market-card-title">
+                                          <strong>{item.name}</strong>
+                                          <em>{mcpMarketCategoryLabel(item.category)}</em>
+                                          {item.tags.slice(0, 3).map((tag) => (
+                                            <span key={tag} className="ai-settings-mcp-market-tag">{tag}</span>
+                                          ))}
+                                        </div>
+                                        <p>{item.description}</p>
+                                        <code>
+                                          {item.config.transport === 'stdio'
+                                            ? [item.config.command, ...(item.config.args ?? [])].join(' ')
+                                            : item.config.url}
+                                        </code>
+                                        {(item.requiresEnv?.length || item.requiresArgs || item.note) ? (
+                                          <small>
+                                            {[
+                                              item.requiresEnv?.length ? `需环境变量：${item.requiresEnv.join('、')}` : '',
+                                              item.requiresArgs ? '需按本机修改参数' : '',
+                                              item.note ?? '',
+                                            ].filter(Boolean).join(' · ')}
+                                          </small>
+                                        ) : null}
+                                      </div>
                                     </div>
                                     <button
                                       type="button"
                                       className={`ai-settings-ghost-btn${installed ? '' : ' primary-ghost'}`}
-                                      disabled={isMcpSaving || Boolean(mcpBusyServerId)}
+                                      disabled={isMcpSaving || Boolean(mcpBusyServerId) || installed}
                                       onClick={() => addMcpFromMarket(item)}
                                     >
                                       <Plus size={14} aria-hidden />
@@ -7703,12 +7791,12 @@ export function App() {
                             <span className="ai-settings-mcp-market-link">modelcontextprotocol/servers</span>
                             {' '}与{' '}
                             <span className="ai-settings-mcp-market-link">awesome-mcp-servers</span>
-                            ，或用「导入」从 Cursor/Claude 配置合并。
+                            ，或切到「已安装」用「导入」从 Cursor/Claude 配置合并。
                           </p>
                         </div>
                       )}
 
-                      {mcpImportOpen && (
+                      {mcpPane === 'installed' && mcpImportOpen && (
                         <div className="ai-settings-mcp-import">
                           <div className="ai-settings-mcp-import-title">
                             导入 Cursor / Claude MCP 配置
@@ -7789,13 +7877,15 @@ export function App() {
                         </div>
                       )}
 
+                      {mcpPane === 'installed' && (
                       <div className="ai-settings-mcp-list-block">
+
                         {(() => {
                           const mcpDirty = isMcpServersDraftDirty(mcpServersDraft, mcpSnapshot);
                           if (mcpServersDraft.length === 0) {
                             return (
                               <div className="ai-settings-model-empty">
-                                尚未配置 MCP 服务器。可点「市场」一键添加，或「新建服务器」手动配置。
+                                尚未配置 MCP。可切换到「市场」一键添加，或点「新建MCP」手动配置。
                               </div>
                             );
                           }
@@ -7869,9 +7959,13 @@ export function App() {
                                                     : (tool.description || tool.name)}
                                                   disabled={isMcpSaving || busy}
                                                   aria-pressed={!toolOff}
-                                                  onClick={() => updateMcpServerDraft(server.id, {
-                                                    disabled_tools: toggleMcpToolDisabled(server.disabled_tools, tool.name),
-                                                  })}
+                                                  onClick={() => {
+                                                    const disabled_tools = toggleMcpToolDisabled(server.disabled_tools, tool.name);
+                                                    updateMcpServerDraft(server.id, { disabled_tools });
+                                                    if (editing) {
+                                                      syncMcpServerJsonEditor({ ...server, disabled_tools });
+                                                    }
+                                                  }}
                                                 >
                                                   {tool.name}
                                                 </button>
@@ -7887,7 +7981,13 @@ export function App() {
                                         className={`ai-settings-mcp-icon-btn${editing ? ' active' : ''}`}
                                         title={editing ? '收起编辑' : '编辑'}
                                         disabled={isMcpSaving || busy}
-                                        onClick={() => setExpandedMcpServerId(editing ? null : server.id)}
+                                        onClick={() => {
+                                          if (editing) {
+                                            setExpandedMcpServerId(null);
+                                            return;
+                                          }
+                                          openMcpServerJsonEditor(server);
+                                        }}
                                       >
                                         <Pencil size={16} aria-hidden />
                                       </button>
@@ -7916,146 +8016,24 @@ export function App() {
 
                                   {editing && (
                                     <div className="ai-settings-mcp-card-body">
-                                      <div className="ai-settings-field-grid">
-                                        <label className="ai-settings-field">
-                                          <span>显示名称</span>
-                                          <input
-                                            className="ai-settings-input"
-                                            value={server.name}
-                                            placeholder="显示名称"
-                                            spellCheck={false}
-                                            disabled={isMcpSaving || busy}
-                                            onChange={(event) => updateMcpServerDraft(server.id, { name: event.target.value })}
-                                          />
-                                        </label>
-                                        <label className="ai-settings-field">
-                                          <span>标识 ID {isPersisted ? <em>保存后锁定</em> : <em>Agent 调用用</em>}</span>
-                                          <input
-                                            className="ai-settings-input"
-                                            value={server.id}
-                                            placeholder="id"
-                                            spellCheck={false}
-                                            disabled={isMcpSaving || busy || isPersisted}
-                                            onChange={(event) => updateMcpServerDraft(server.id, { id: event.target.value })}
-                                          />
-                                        </label>
-                                        <label className="ai-settings-field ai-settings-field-full">
-                                          <span>传输方式 <em>本地进程 / 远程 HTTP 可连接</em></span>
-                                          <select
-                                            className="ai-settings-input"
-                                            value={server.transport}
-                                            disabled={isMcpSaving || busy}
-                                            onChange={(event) => updateMcpServerDraft(server.id, {
-                                              transport: event.target.value as McpTransport,
-                                            })}
-                                          >
-                                            <option value="stdio">本地进程（stdio）</option>
-                                            <option value="streamable-http">远程 HTTP（streamable-http）</option>
-                                            <option value="sse">SSE（按 streamable-http 连接）</option>
-                                          </select>
-                                        </label>
-
-                                        {server.transport === 'stdio' ? (
-                                          <>
-                                            <label className="ai-settings-field ai-settings-field-full">
-                                              <span>启动命令</span>
-                                              <input
-                                                className="ai-settings-input"
-                                                value={server.command}
-                                                placeholder="npx / node / uvx …"
-                                                spellCheck={false}
-                                                disabled={isMcpSaving || busy}
-                                                onChange={(event) => updateMcpServerDraft(server.id, { command: event.target.value })}
-                                              />
-                                            </label>
-                                            <label className="ai-settings-field ai-settings-field-full">
-                                              <span>参数 <em>空格分隔</em></span>
-                                              <input
-                                                className="ai-settings-input"
-                                                value={server.args.join(' ')}
-                                                placeholder="-y @modelcontextprotocol/server-filesystem ."
-                                                spellCheck={false}
-                                                disabled={isMcpSaving || busy}
-                                                onChange={(event) => updateMcpServerDraft(server.id, {
-                                                  args: event.target.value.trim() ? event.target.value.trim().split(/\s+/) : [],
-                                                })}
-                                              />
-                                            </label>
-                                            <label className="ai-settings-field ai-settings-field-full">
-                                              <span>环境变量 <em>每行 KEY=VALUE</em></span>
-                                              <textarea
-                                                className="ai-settings-textarea"
-                                                rows={3}
-                                                value={Object.entries(server.env).map(([key, value]) => `${key}=${value}`).join('\n')}
-                                                placeholder="FOO=bar"
-                                                spellCheck={false}
-                                                disabled={isMcpSaving || busy}
-                                                onChange={(event) => {
-                                                  const env: Record<string, string> = {};
-                                                  for (const line of event.target.value.split(/\r?\n/)) {
-                                                    const trimmed = line.trim();
-                                                    if (!trimmed) continue;
-                                                    const eq = trimmed.indexOf('=');
-                                                    if (eq <= 0) continue;
-                                                    env[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1);
-                                                  }
-                                                  updateMcpServerDraft(server.id, { env });
-                                                }}
-                                              />
-                                            </label>
-                                            <label className="ai-settings-field ai-settings-field-full">
-                                              <span>工作目录</span>
-                                              <input
-                                                className="ai-settings-input"
-                                                value={server.cwd ?? ''}
-                                                placeholder="可选，留空则用默认目录"
-                                                spellCheck={false}
-                                                disabled={isMcpSaving || busy}
-                                                onChange={(event) => updateMcpServerDraft(server.id, {
-                                                  cwd: event.target.value.trim() || null,
-                                                })}
-                                              />
-                                            </label>
-                                          </>
-                                        ) : (
-                                          <>
-                                            <label className="ai-settings-field ai-settings-field-full">
-                                              <span>服务地址 <em>http(s) · streamable-http</em></span>
-                                              <input
-                                                className="ai-settings-input"
-                                                value={server.url}
-                                                placeholder="https://example.com/mcp"
-                                                spellCheck={false}
-                                                disabled={isMcpSaving || busy}
-                                                onChange={(event) => updateMcpServerDraft(server.id, { url: event.target.value })}
-                                              />
-                                            </label>
-                                            <label className="ai-settings-field ai-settings-field-full">
-                                              <span>请求头 <em>每行 KEY=VALUE</em></span>
-                                              <textarea
-                                                className="ai-settings-textarea"
-                                                rows={3}
-                                                value={Object.entries(server.headers ?? {}).map(([key, value]) => `${key}=${value}`).join('\n')}
-                                                placeholder="Authorization=Bearer …"
-                                                spellCheck={false}
-                                                disabled={isMcpSaving || busy}
-                                                onChange={(event) => {
-                                                  const headers: Record<string, string> = {};
-                                                  for (const line of event.target.value.split(/\r?\n/)) {
-                                                    const trimmed = line.trim();
-                                                    if (!trimmed) continue;
-                                                    const eq = trimmed.indexOf('=');
-                                                    if (eq <= 0) continue;
-                                                    headers[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1);
-                                                  }
-                                                  updateMcpServerDraft(server.id, { headers });
-                                                }}
-                                              />
-                                            </label>
-                                            <p className="ai-settings-mcp-remote-note">
-                                              远程地址使用 streamable-http 客户端（JSON / SSE 响应）。旧版纯 GET SSE 未实现。启用后可点「重新连接」探测工具。
-                                            </p>
-                                          </>
+                                      <div className="ai-settings-mcp-json-editor">
+                                        <div className="ai-settings-mcp-json-toolbar">
+                                          <span className="ai-settings-mcp-json-label">mcp.json</span>
+                                          <span className="ai-settings-mcp-json-hint">
+                                            {isPersisted ? '已保存条目的 id 锁定' : '可改 id · 也支持粘贴 Cursor mcpServers'}
+                                          </span>
+                                        </div>
+                                        <textarea
+                                          className="ai-settings-mcp-json-input"
+                                          value={mcpEditJsonById[server.id] ?? formatMcpServerJson(server)}
+                                          spellCheck={false}
+                                          disabled={isMcpSaving || busy}
+                                          rows={16}
+                                          aria-label={`${title} MCP JSON 配置`}
+                                          onChange={(event) => applyMcpServerJsonText(server.id, event.target.value)}
+                                        />
+                                        {mcpEditJsonErrorById[server.id] && (
+                                          <p className="ai-settings-error">{mcpEditJsonErrorById[server.id]}</p>
                                         )}
                                       </div>
 
@@ -8081,6 +8059,7 @@ export function App() {
                           );
                         })()}
                       </div>
+                      )}
                     </section>
 
                     {mcpNotice && <p className="ai-settings-mcp-notice">{mcpNotice}</p>}

@@ -233,6 +233,154 @@ export function formatMcpServerCommandLine(server: Pick<McpServerConfig, 'transp
   return (server.url ?? '').trim() || '—';
 }
 
+/** 编辑框展示：与 ~/.pandaterm/mcp.json 中单条 server 字段一致（pretty JSON） */
+export function formatMcpServerJson(server: McpServerConfig): string {
+  const disabled = [...(server.disabled_tools ?? [])]
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right));
+  const payload: Record<string, unknown> = {
+    id: server.id.trim(),
+    name: server.name.trim() || server.id.trim(),
+    transport: server.transport || 'stdio',
+    command: server.command ?? '',
+    args: [...(server.args ?? [])],
+    env: { ...(server.env ?? {}) },
+    cwd: (server.cwd ?? '').trim() || null,
+    url: server.url ?? '',
+    headers: { ...(server.headers ?? {}) },
+    enabled: Boolean(server.enabled),
+  };
+  if (disabled.length > 0) {
+    payload.disabled_tools = disabled;
+  }
+  return `${JSON.stringify(payload, null, 2)}\n`;
+}
+
+function asStringRecord(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof item === 'string') out[key] = item;
+    else if (item == null) continue;
+    else out[key] = String(item);
+  }
+  return out;
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item)).map((item) => item.trim()).filter(Boolean);
+}
+
+function normalizeTransport(value: unknown, hasUrl: boolean): McpTransport {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (raw === 'sse') return 'sse';
+  if (raw === 'streamable-http' || raw === 'http' || raw === 'streamable_http') return 'streamable-http';
+  if (raw === 'stdio') return 'stdio';
+  return hasUrl ? 'streamable-http' : 'stdio';
+}
+
+function cursorEntryToServer(
+  id: string,
+  entry: Record<string, unknown>,
+): McpServerConfig {
+  const url = typeof entry.url === 'string' ? entry.url.trim() : '';
+  const command = typeof entry.command === 'string' ? entry.command : '';
+  const transport = normalizeTransport(entry.transport, Boolean(url) && !command.trim());
+  const nameRaw = typeof entry.name === 'string' ? entry.name.trim() : '';
+  const disabled = entry.disabled === true;
+  const enabled = entry.enabled === undefined ? !disabled : Boolean(entry.enabled);
+  return {
+    id: id.trim(),
+    name: nameRaw || id.trim(),
+    transport,
+    command,
+    args: asStringArray(entry.args),
+    env: asStringRecord(entry.env),
+    cwd: typeof entry.cwd === 'string' && entry.cwd.trim() ? entry.cwd.trim() : null,
+    url,
+    headers: asStringRecord(entry.headers),
+    enabled,
+    disabled_tools: asStringArray(entry.disabled_tools),
+  };
+}
+
+function storeLikeToServer(
+  raw: Record<string, unknown>,
+  fallbackId: string,
+  lockId: boolean,
+): McpServerConfig {
+  const rawId = typeof raw.id === 'string' ? raw.id.trim() : '';
+  const id = lockId ? fallbackId : (rawId || fallbackId);
+  return cursorEntryToServer(id, raw);
+}
+
+export type ParseMcpServerJsonResult =
+  | { ok: true; server: McpServerConfig }
+  | { ok: false; error: string };
+
+/**
+ * 解析编辑框 JSON：
+ * - PandaTerm 单条 `{ id, command, ... }`（与 mcp.json 条目一致）
+ * - PandaTerm store `{ version, servers: [...] }`（取第一条 / 匹配 fallbackId）
+ * - Cursor `{ mcpServers: { id: {...} } }`
+ */
+export function parseMcpServerJsonText(
+  text: string,
+  options: { fallbackId: string; lockId?: boolean },
+): ParseMcpServerJsonResult {
+  const fallbackId = options.fallbackId.trim() || 'mcp-server';
+  const lockId = Boolean(options.lockId);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { ok: false, error: 'JSON 格式无效' };
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, error: '需要 JSON 对象' };
+  }
+  const obj = raw as Record<string, unknown>;
+
+  // Cursor / Claude Desktop
+  if (obj.mcpServers && typeof obj.mcpServers === 'object' && !Array.isArray(obj.mcpServers)) {
+    const map = obj.mcpServers as Record<string, unknown>;
+    const keys = Object.keys(map);
+    if (keys.length === 0) return { ok: false, error: 'mcpServers 为空' };
+    let key = keys.includes(fallbackId) ? fallbackId : keys[0];
+    if (lockId) key = keys.includes(fallbackId) ? fallbackId : keys[0];
+    const entry = map[key];
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return { ok: false, error: 'mcpServers 条目无效' };
+    }
+    const id = lockId ? fallbackId : key.trim() || fallbackId;
+    return { ok: true, server: cursorEntryToServer(id, entry as Record<string, unknown>) };
+  }
+
+  // PandaTerm store
+  if (Array.isArray(obj.servers)) {
+    const list = obj.servers.filter((item): item is Record<string, unknown> => (
+      Boolean(item) && typeof item === 'object' && !Array.isArray(item)
+    ));
+    if (list.length === 0) return { ok: false, error: 'servers 为空' };
+    const matched = list.find((item) => typeof item.id === 'string' && item.id.trim() === fallbackId) ?? list[0];
+    return { ok: true, server: storeLikeToServer(matched, fallbackId, lockId) };
+  }
+
+  // 单条 store 形态
+  if (
+    typeof obj.id === 'string'
+    || typeof obj.command === 'string'
+    || typeof obj.url === 'string'
+    || typeof obj.transport === 'string'
+  ) {
+    return { ok: true, server: storeLikeToServer(obj, fallbackId, lockId) };
+  }
+
+  return { ok: false, error: '无法识别的 MCP 配置（需要单条 server、servers 或 mcpServers）' };
+}
+
 /** 头像字母：取显示名首字符 */
 export function mcpServerAvatarLetter(server: Pick<McpServerConfig, 'name' | 'id'>): string {
   const source = (server.name.trim() || server.id.trim() || '?').trim();
