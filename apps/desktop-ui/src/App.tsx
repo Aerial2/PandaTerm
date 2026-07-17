@@ -78,6 +78,8 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
+  Pencil,
   Download,
   Eye,
   EyeOff,
@@ -257,13 +259,19 @@ import {
 } from './aiChatModel';
 import {
   createEmptyMcpServer,
+  countEnabledMcpTools,
+  formatMcpServerCommandLine,
   isAiConfigDraftDirty,
   isMcpServerDraftDirty,
   isMcpServersDraftDirty,
+  isMcpToolDisabled,
   mergeMcpServerImports,
+  mcpServerAvatarLetter,
+  mcpServerStatusDot,
   mcpStatusLabel,
   resolveAiModelCatalog,
   snapshotToMcpDraft,
+  toggleMcpToolDisabled,
 } from './aiSettingsModel';
 import {
   clampFloatingMenuLeft,
@@ -397,8 +405,8 @@ export function App() {
   const [mcpError, setMcpError] = useState('');
   const [mcpNotice, setMcpNotice] = useState('');
   const [expandedMcpServerId, setExpandedMcpServerId] = useState<string | null>(null);
-  /** MCP 服务器列表过滤 */
-  const [mcpServerListQuery, setMcpServerListQuery] = useState('');
+  /** 工具标签 Show more */
+  const [mcpToolsExpandedIds, setMcpToolsExpandedIds] = useState<Record<string, boolean>>({});
   /** Cursor mcp.json 导入面板 */
   const [mcpImportOpen, setMcpImportOpen] = useState(false);
   const [mcpImportCandidates, setMcpImportCandidates] = useState<McpImportCandidate[]>([]);
@@ -552,7 +560,6 @@ export function App() {
     setAiApiKeyDraft('');
     aiApiKeyBaselineRef.current = '';
     setAiModelListQuery('');
-    setMcpServerListQuery('');
     setMcpImportOpen(false);
     setMcpImportCandidates([]);
     setMcpImportPath('');
@@ -7586,23 +7593,6 @@ export function App() {
                           </button>
                         </div>
                       </div>
-                      {mcpSnapshot?.config_path ? (
-                        <div className="ai-settings-mcp-path" title={mcpSnapshot.config_path}>
-                          <span>配置文件</span>
-                          <code>{mcpSnapshot.config_path}</code>
-                          <button
-                            type="button"
-                            className="ai-settings-ghost-btn"
-                            title="复制路径"
-                            onClick={() => {
-                              void writeClipboardText(mcpSnapshot.config_path || '').catch(() => {});
-                            }}
-                          >
-                            <Clipboard size={13} aria-hidden />
-                            <span>复制</span>
-                          </button>
-                        </div>
-                      ) : null}
 
                       {mcpMarketOpen && (
                         <div className="ai-settings-mcp-market">
@@ -7800,52 +7790,12 @@ export function App() {
                       )}
 
                       <div className="ai-settings-mcp-list-block">
-                        {mcpServersDraft.length > 0 && (
-                          <div className="ai-settings-model-filter">
-                            <Search size={14} aria-hidden />
-                            <input
-                              type="text"
-                              value={mcpServerListQuery}
-                              placeholder="筛选 MCP 服务器"
-                              spellCheck={false}
-                              disabled={isMcpLoading || isMcpSaving}
-                              onChange={(event) => setMcpServerListQuery(event.target.value)}
-                              onKeyDown={(event) => {
-                                if (event.key === 'Escape') setMcpServerListQuery('');
-                              }}
-                            />
-                            {mcpServerListQuery ? (
-                              <button
-                                type="button"
-                                className="ai-settings-model-filter-clear"
-                                title="清除筛选"
-                                onClick={() => setMcpServerListQuery('')}
-                              >
-                                <X size={13} aria-hidden />
-                              </button>
-                            ) : null}
-                          </div>
-                        )}
                         {(() => {
-                          const query = mcpServerListQuery.trim().toLowerCase();
-                          const visibleServers = query
-                            ? mcpServersDraft.filter((server) => {
-                              const haystack = `${server.name} ${server.id} ${server.command} ${server.url}`.toLowerCase();
-                              return haystack.includes(query);
-                            })
-                            : mcpServersDraft;
                           const mcpDirty = isMcpServersDraftDirty(mcpServersDraft, mcpSnapshot);
                           if (mcpServersDraft.length === 0) {
                             return (
                               <div className="ai-settings-model-empty">
                                 尚未配置 MCP 服务器。可点「市场」一键添加，或「新建服务器」手动配置。
-                              </div>
-                            );
-                          }
-                          if (visibleServers.length === 0) {
-                            return (
-                              <div className="ai-settings-model-empty">
-                                没有匹配「{mcpServerListQuery.trim()}」的服务器
                               </div>
                             );
                           }
@@ -7856,55 +7806,115 @@ export function App() {
                                 有未保存更改 — 点「保存 MCP」写入配置，或点「重新连接」保存并连接。
                               </div>
                             )}
-                            {visibleServers.map((server) => {
+                            {mcpServersDraft.map((server) => {
                               const live = mcpSnapshot?.servers.find((item) => item.id === server.id);
-                              const expanded = expandedMcpServerId === server.id;
+                              const editing = expandedMcpServerId === server.id;
                               const busy = mcpBusyServerId === server.id;
                               const dirty = isMcpServerDraftDirty(server, mcpSnapshot);
                               const isPersisted = Boolean(mcpSnapshot?.servers.some((item) => item.id === server.id));
+                              const tools = live?.tools ?? [];
+                              const toolsExpanded = Boolean(mcpToolsExpandedIds[server.id]);
+                              const statusDot = mcpServerStatusDot(live?.status, server.enabled);
+                              const title = server.name.trim() || server.id;
+                              const commandLine = formatMcpServerCommandLine(server);
+                              const enabledToolCount = countEnabledMcpTools(tools, server.disabled_tools);
+                              const toolsSummary = tools.length > 0
+                                ? `${enabledToolCount} tools enabled`
+                                : '0 tools enabled';
                               return (
                                 <div
                                   key={server.id}
-                                  className={`ai-settings-mcp-card${server.enabled ? ' enabled' : ''}${live?.status === 'error' ? ' error' : ''}${live?.status === 'connected' ? ' connected' : ''}${dirty ? ' dirty' : ''}`}
+                                  className={`ai-settings-mcp-card${server.enabled ? ' enabled' : ''}${live?.status === 'error' ? ' error' : ''}${live?.status === 'connected' ? ' connected' : ''}${dirty ? ' dirty' : ''}${editing ? ' editing' : ''}`}
                                 >
-                                  <div className="ai-settings-mcp-card-head">
-                                    <button
-                                      type="button"
-                                      className="ai-settings-mcp-expand"
-                                      onClick={() => setExpandedMcpServerId(expanded ? null : server.id)}
-                                      aria-expanded={expanded}
-                                    >
-                                      {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                                      <span className="ai-settings-mcp-title">{server.name.trim() || server.id}</span>
-                                      {dirty && <em className="ai-settings-mcp-dirty">未保存</em>}
-                                      <em className="ai-settings-mcp-transport" title={server.transport}>
-                                        {server.transport === 'stdio'
-                                          ? '本地进程'
-                                          : server.transport === 'sse'
-                                            ? 'SSE→HTTP'
-                                            : '远程 HTTP'}
-                                      </em>
-                                      <em className={`ai-settings-mcp-status ${server.enabled ? (live?.status || 'disconnected') : 'disabled'}`}>
-                                        {mcpStatusLabel(server.enabled ? live?.status : 'disabled')}
-                                      </em>
-                                      {typeof live?.tool_count === 'number' && server.enabled && live.status === 'connected' && (
-                                        <em className="ai-settings-mcp-tools">{live.tool_count} 个工具</em>
-                                      )}
-                                    </button>
-                                    <button
-                                      type="button"
-                                      role="switch"
-                                      aria-checked={server.enabled}
-                                      className={`ai-settings-switch${server.enabled ? ' on' : ''}`}
-                                      disabled={isMcpSaving || busy}
-                                      title={server.enabled ? '禁用服务器' : '启用服务器'}
-                                      onClick={() => void toggleMcpServerEnabled(server.id)}
-                                    >
-                                      <i />
-                                    </button>
+                                  <div className="ai-settings-mcp-card-main">
+                                    <div className="ai-settings-mcp-card-info">
+                                      <div className="ai-settings-mcp-avatar" aria-hidden>
+                                        <span>{mcpServerAvatarLetter(server)}</span>
+                                        <i className={`ai-settings-mcp-status-dot ${statusDot}`} title={mcpStatusLabel(server.enabled ? live?.status : 'disabled')} />
+                                      </div>
+                                      <div className="ai-settings-mcp-card-meta">
+                                        <div className="ai-settings-mcp-title-row">
+                                          <span className="ai-settings-mcp-title">{title}</span>
+                                          {dirty && <em className="ai-settings-mcp-dirty">未保存</em>}
+                                        </div>
+                                        <button
+                                          type="button"
+                                          className={`ai-settings-mcp-cmd${toolsExpanded ? ' open' : ''}`}
+                                          title={commandLine}
+                                          disabled={tools.length === 0}
+                                          aria-expanded={toolsExpanded}
+                                          onClick={() => setMcpToolsExpandedIds((current) => ({
+                                            ...current,
+                                            [server.id]: !current[server.id],
+                                          }))}
+                                        >
+                                          <span>{toolsSummary}</span>
+                                          {tools.length > 0 && (
+                                            toolsExpanded
+                                              ? <ChevronUp size={12} aria-hidden />
+                                              : <ChevronDown size={12} aria-hidden />
+                                          )}
+                                        </button>
+                                        {toolsExpanded && tools.length > 0 && (
+                                          <div className="ai-settings-mcp-tags expanded">
+                                            {tools.map((tool) => {
+                                              const toolOff = isMcpToolDisabled(tool.name, server.disabled_tools);
+                                              return (
+                                                <button
+                                                  key={`${server.id}-${tool.name}`}
+                                                  type="button"
+                                                  className={`ai-settings-mcp-tag${toolOff ? ' off' : ' on'}`}
+                                                  title={toolOff
+                                                    ? `${tool.description || tool.name}（已禁用，不可调用）`
+                                                    : (tool.description || tool.name)}
+                                                  disabled={isMcpSaving || busy}
+                                                  aria-pressed={!toolOff}
+                                                  onClick={() => updateMcpServerDraft(server.id, {
+                                                    disabled_tools: toggleMcpToolDisabled(server.disabled_tools, tool.name),
+                                                  })}
+                                                >
+                                                  {tool.name}
+                                                </button>
+                                              );
+                                            })}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                    <div className="ai-settings-mcp-card-actions">
+                                      <button
+                                        type="button"
+                                        className={`ai-settings-mcp-icon-btn${editing ? ' active' : ''}`}
+                                        title={editing ? '收起编辑' : '编辑'}
+                                        disabled={isMcpSaving || busy}
+                                        onClick={() => setExpandedMcpServerId(editing ? null : server.id)}
+                                      >
+                                        <Pencil size={16} aria-hidden />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="ai-settings-mcp-icon-btn danger"
+                                        title="删除"
+                                        disabled={isMcpSaving || busy}
+                                        onClick={() => requestRemoveMcpServer(server.id)}
+                                      >
+                                        <Trash2 size={16} aria-hidden />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        role="switch"
+                                        aria-checked={server.enabled}
+                                        className={`ai-settings-switch ai-settings-switch-compact${server.enabled ? ' on' : ''}`}
+                                        disabled={isMcpSaving || busy}
+                                        title={server.enabled ? '禁用服务器' : '启用服务器'}
+                                        onClick={() => void toggleMcpServerEnabled(server.id)}
+                                      >
+                                        <i />
+                                      </button>
+                                    </div>
                                   </div>
 
-                                  {expanded && (
+                                  {editing && (
                                     <div className="ai-settings-mcp-card-body">
                                       <div className="ai-settings-field-grid">
                                         <label className="ai-settings-field">
@@ -8051,20 +8061,6 @@ export function App() {
 
                                       {live?.error && <p className="ai-settings-error">{live.error}</p>}
 
-                                      {live?.tools && live.tools.length > 0 && (
-                                        <div className="ai-settings-mcp-tool-list">
-                                          {live.tools.slice(0, 12).map((tool) => (
-                                            <div key={`${server.id}-${tool.name}`} className="ai-settings-mcp-tool-row">
-                                              <strong>{tool.name}</strong>
-                                              <span>{tool.description || '—'}</span>
-                                            </div>
-                                          ))}
-                                          {live.tools.length > 12 && (
-                                            <div className="ai-settings-mcp-tool-more">还有 {live.tools.length - 12} 个工具</div>
-                                          )}
-                                        </div>
-                                      )}
-
                                       <div className="ai-settings-mcp-card-footer">
                                         <button
                                           type="button"
@@ -8074,15 +8070,6 @@ export function App() {
                                         >
                                           <RefreshCw size={14} className={busy ? 'spin' : undefined} aria-hidden />
                                           <span>{busy ? '连接中…' : '重新连接'}</span>
-                                        </button>
-                                        <button
-                                          type="button"
-                                          className="ai-settings-ghost-btn danger"
-                                          disabled={isMcpSaving || busy}
-                                          onClick={() => requestRemoveMcpServer(server.id)}
-                                        >
-                                          <Trash2 size={14} aria-hidden />
-                                          <span>删除</span>
                                         </button>
                                       </div>
                                     </div>

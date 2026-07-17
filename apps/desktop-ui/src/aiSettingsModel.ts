@@ -1,4 +1,4 @@
-﻿import type { AiProviderConfig, McpConfigSnapshot, McpServerConfig, McpTransport } from './api';
+import type { AiProviderConfig, McpConfigSnapshot, McpServerConfig, McpTransport } from './api';
 
 export type AiSettingsTab = 'models' | 'mcp';
 
@@ -33,11 +33,15 @@ export function resolveAiModelCatalog(config: Pick<AiProviderConfig, 'model' | '
 
 function serializeMcpServerConfig(server: Pick<
   McpServerConfig,
-  'id' | 'name' | 'transport' | 'command' | 'args' | 'env' | 'cwd' | 'url' | 'headers' | 'enabled'
+  'id' | 'name' | 'transport' | 'command' | 'args' | 'env' | 'cwd' | 'url' | 'headers' | 'enabled' | 'disabled_tools'
 >): string {
   const sortRecord = (record: Record<string, string>) => Object.fromEntries(
     Object.entries(record).sort(([left], [right]) => left.localeCompare(right)),
   );
+  const disabled = [...(server.disabled_tools ?? [])]
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right));
   return JSON.stringify({
     id: server.id.trim(),
     name: server.name.trim(),
@@ -49,6 +53,7 @@ function serializeMcpServerConfig(server: Pick<
     url: (server.url ?? '').trim(),
     headers: sortRecord(server.headers ?? {}),
     enabled: Boolean(server.enabled),
+    disabled_tools: disabled,
   });
 }
 
@@ -69,6 +74,7 @@ export function isMcpServerDraftDirty(
     url: saved.url ?? '',
     headers: saved.headers ?? {},
     enabled: saved.enabled,
+    disabled_tools: saved.disabled_tools ?? [],
   });
 }
 
@@ -124,6 +130,7 @@ export function mergeMcpServerImports(
       url: raw.url ?? '',
       headers: raw.headers ?? {},
       enabled: Boolean(raw.enabled),
+      disabled_tools: Array.isArray(raw.disabled_tools) ? [...raw.disabled_tools] : [],
     };
     if (byId.has(id)) {
       if (strategy === 'overwrite') {
@@ -158,6 +165,7 @@ export function snapshotToMcpDraft(snapshot: McpConfigSnapshot): McpServerConfig
     url: server.url ?? '',
     headers: server.headers ?? {},
     enabled: server.enabled,
+    disabled_tools: Array.isArray(server.disabled_tools) ? [...server.disabled_tools] : [],
   }));
 }
 
@@ -174,7 +182,35 @@ export function createEmptyMcpServer(): McpServerConfig {
     url: '',
     headers: {},
     enabled: false,
+    disabled_tools: [],
   };
+}
+
+/** 启用中的工具数（总数减去 disabled_tools） */
+export function countEnabledMcpTools(
+  tools: Array<{ name: string }>,
+  disabledTools?: string[] | null,
+): number {
+  const disabled = new Set((disabledTools ?? []).map((item) => item.trim()).filter(Boolean));
+  return tools.filter((tool) => !disabled.has(tool.name)).length;
+}
+
+export function isMcpToolDisabled(toolName: string, disabledTools?: string[] | null): boolean {
+  const name = toolName.trim();
+  return (disabledTools ?? []).some((item) => item.trim() === name);
+}
+
+export function toggleMcpToolDisabled(
+  disabledTools: string[] | undefined,
+  toolName: string,
+): string[] {
+  const name = toolName.trim();
+  if (!name) return [...(disabledTools ?? [])];
+  const current = [...(disabledTools ?? [])].map((item) => item.trim()).filter(Boolean);
+  if (current.includes(name)) {
+    return current.filter((item) => item !== name);
+  }
+  return [...current, name];
 }
 
 export function mcpStatusLabel(status?: string | null) {
@@ -186,6 +222,31 @@ export function mcpStatusLabel(status?: string | null) {
     case 'disconnected': return '未连接';
     default: return status || '未知';
   }
+}
+
+/** 卡片副标题：stdio 命令行 / 远程 URL */
+export function formatMcpServerCommandLine(server: Pick<McpServerConfig, 'transport' | 'command' | 'args' | 'url'>): string {
+  if (server.transport === 'stdio') {
+    const parts = [server.command?.trim(), ...(server.args ?? []).map((item) => item.trim()).filter(Boolean)].filter(Boolean);
+    return parts.join(' ') || '—';
+  }
+  return (server.url ?? '').trim() || '—';
+}
+
+/** 头像字母：取显示名首字符 */
+export function mcpServerAvatarLetter(server: Pick<McpServerConfig, 'name' | 'id'>): string {
+  const source = (server.name.trim() || server.id.trim() || '?').trim();
+  const ch = source.charAt(0);
+  return /[a-z]/i.test(ch) ? ch.toUpperCase() : ch || '?';
+}
+
+/** 状态点：connected | connecting | error | offline */
+export function mcpServerStatusDot(status?: string | null, enabled?: boolean): 'online' | 'busy' | 'error' | 'offline' {
+  if (!enabled) return 'offline';
+  if (status === 'connected') return 'online';
+  if (status === 'connecting') return 'busy';
+  if (status === 'error') return 'error';
+  return 'offline';
 }
 
 export function normalizeAiReasoningEffort(value?: string | null): string {

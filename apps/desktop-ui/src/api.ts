@@ -66,7 +66,9 @@ export function preloadConnectionWindows() {
   const run = () => {
     void getWebviewWindowApi();
     void import('./ConnectionWindow');
+    void import('./AiSettingsWindow');
     void warmConnectionWindow('manage').catch(() => undefined);
+    void warmAiSettingsWindow().catch(() => undefined);
   };
   if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
     window.requestIdleCallback(() => run(), { timeout: 2500 });
@@ -182,84 +184,117 @@ export async function openConnectionWindow(mode: ConnectionWindowMode) {
 }
 
 export async function openAiSettingsWindow(tab: 'models' | 'mcp' = 'models') {
-  const { WebviewWindow, getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+  const { WebviewWindow } = await getWebviewWindowApi();
   const label = 'ai-settings';
-  const existing = await WebviewWindow.getByLabel(label);
-  if (existing) {
-    await existing.emit('ai-settings-set-tab', { tab });
-    await existing.show();
-    await existing.unminimize().catch(() => undefined);
-    await existing.setFocus();
-    return;
+  const warmKey = '__pandatermAiSettingsWarm';
+  const creatingKey = '__pandatermAiSettingsCreating';
+  const globalAny = globalThis as typeof globalThis & { [key: string]: Promise<void> | undefined };
+
+  if (globalAny[warmKey]) await globalAny[warmKey].catch(() => undefined);
+  if (globalAny[creatingKey]) {
+    await globalAny[creatingKey].catch(() => undefined);
+    const retryAfterCreate = await WebviewWindow.getByLabel(label);
+    if (retryAfterCreate) {
+      await focusAiSettingsWindow(retryAfterCreate, tab);
+      return;
+    }
   }
 
-  // 防止连点时并发创建多个 webview（首开窗口尚未就绪时 getByLabel 仍为空）
-  const creatingKey = '__pandatermAiSettingsCreating';
-  const globalAny = globalThis as typeof globalThis & { [creatingKey]?: Promise<void> };
-  if (globalAny[creatingKey]) {
-    await globalAny[creatingKey];
-    const retry = await WebviewWindow.getByLabel(label);
-    if (retry) {
-      await retry.emit('ai-settings-set-tab', { tab });
-      await retry.show();
-      await retry.unminimize().catch(() => undefined);
-      await retry.setFocus();
-    }
+  const existing = await WebviewWindow.getByLabel(label);
+  if (existing) {
+    await focusAiSettingsWindow(existing, tab);
     return;
   }
 
   const windowOpts = { width: 980, height: 700, minWidth: 760, minHeight: 520 };
-  let position: { x: number; y: number } | { center: true };
-  try {
-    const parent = getCurrentWebviewWindow();
-    const [scale, parentPos, parentSize] = await Promise.all([
-      parent.scaleFactor(),
-      parent.outerPosition(),
-      parent.outerSize(),
-    ]);
-    position = {
-      x: Math.round(parentPos.x / scale + (parentSize.width / scale - windowOpts.width) / 2),
-      y: Math.round(parentPos.y / scale + (parentSize.height / scale - windowOpts.height) / 2),
-    };
-  } catch {
-    position = { center: true };
-  }
-
-  const query = `mode=ai-settings&tab=${tab}`;
-  const url = import.meta.env.DEV
-    ? `http://localhost:1420?${query}`
-    : `index.html?${query}`;
 
   globalAny[creatingKey] = (async () => {
-    // 使用系统原生标题栏；页面内不再绘制第二套 titlebar
+    const position = await resolveParentCenteredPosition(windowOpts.width, windowOpts.height);
     const settingsWindow = new WebviewWindow(label, {
-      url,
+      url: aiSettingsWindowUrl(tab, false),
       title: 'AI 设置 — PandaTerm',
       ...windowOpts,
       ...('x' in position ? position : { center: true }),
       resizable: true,
-      decorations: true,
+      decorations: false,
       transparent: false,
       visible: false,
-      backgroundColor: '#1e2227',
+      backgroundColor: '#1D2025',
     });
 
     settingsWindow.once('tauri://error', (event) => {
       console.error('AI settings window error:', event);
     });
 
-    // 轻量窗口就绪后立刻显示，避免“点了没反应”
+    // 窗口进程创建后立刻显示，不等 React 首屏（与连接窗口一致）
     await new Promise<void>((resolve) => {
       const done = () => resolve();
       settingsWindow.once('tauri://created', done);
-      window.setTimeout(done, 1500);
+      window.setTimeout(done, 1200);
     });
+
+    await settingsWindow.show().catch(() => undefined);
+    await settingsWindow.setFocus().catch(() => undefined);
+    await settingsWindow.emit('ai-settings-set-tab', { tab }).catch(() => undefined);
   })();
 
   try {
     await globalAny[creatingKey];
   } finally {
     globalAny[creatingKey] = undefined;
+  }
+}
+
+async function focusAiSettingsWindow(
+  win: { emit: (event: string, payload: unknown) => Promise<void>; show: () => Promise<void>; unminimize: () => Promise<void>; setFocus: () => Promise<void> },
+  tab: 'models' | 'mcp',
+) {
+  await win.emit('ai-settings-set-tab', { tab });
+  await win.show();
+  await win.unminimize().catch(() => undefined);
+  await win.setFocus();
+}
+
+function aiSettingsWindowUrl(tab: 'models' | 'mcp', warm = false) {
+  const warmQuery = warm ? '&warm=1' : '';
+  const query = `mode=ai-settings&tab=${tab}${warmQuery}`;
+  return import.meta.env.DEV
+    ? `http://localhost:1420?${query}`
+    : `index.html?${query}`;
+}
+
+async function warmAiSettingsWindow() {
+  const { WebviewWindow } = await getWebviewWindowApi();
+  const label = 'ai-settings';
+  if (await WebviewWindow.getByLabel(label)) return;
+
+  const warmKey = '__pandatermAiSettingsWarm';
+  const globalAny = globalThis as typeof globalThis & { [key: string]: Promise<void> | undefined };
+  if (globalAny[warmKey]) {
+    await globalAny[warmKey];
+    return;
+  }
+
+  const windowOpts = { width: 980, height: 700, minWidth: 760, minHeight: 520 };
+  globalAny[warmKey] = (async () => {
+    const position = await resolveParentCenteredPosition(windowOpts.width, windowOpts.height);
+    new WebviewWindow(label, {
+      url: aiSettingsWindowUrl('models', true),
+      title: 'AI 设置 — PandaTerm',
+      ...windowOpts,
+      ...('x' in position ? position : { center: true }),
+      resizable: true,
+      decorations: false,
+      transparent: false,
+      visible: false,
+      backgroundColor: '#1D2025',
+    });
+  })();
+
+  try {
+    await globalAny[warmKey];
+  } finally {
+    globalAny[warmKey] = undefined;
   }
 }
 
@@ -623,6 +658,8 @@ export type McpServerConfig = {
   url: string;
   headers: Record<string, string>;
   enabled: boolean;
+  /** 取消勾选的工具名，不进入 Agent 且禁止调用 */
+  disabled_tools?: string[];
 };
 
 export type McpServerSnapshot = McpServerConfig & {

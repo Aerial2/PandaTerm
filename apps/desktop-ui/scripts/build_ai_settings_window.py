@@ -119,7 +119,6 @@ export function AiSettingsWindow() {
   const [mcpError, setMcpError] = useState('');
   const [mcpNotice, setMcpNotice] = useState('');
   const [expandedMcpServerId, setExpandedMcpServerId] = useState<string | null>(null);
-  const [mcpServerListQuery, setMcpServerListQuery] = useState('');
   const [mcpImportOpen, setMcpImportOpen] = useState(false);
   const [mcpImportCandidates, setMcpImportCandidates] = useState<McpImportCandidate[]>([]);
   const [mcpImportPath, setMcpImportPath] = useState('');

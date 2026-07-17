@@ -33,6 +33,7 @@ const MAX_MCP_TOOLS: usize = 200;
 const MAX_ENV_ENTRIES: usize = 64;
 const MAX_ARGS: usize = 64;
 const MAX_HEADERS: usize = 32;
+const MAX_DISABLED_TOOLS: usize = 200;
 const MAX_CALL_RESULT_CHARS: usize = 64_000;
 
 // ── Config ──────────────────────────────────────────────────────────────
@@ -77,6 +78,9 @@ pub struct McpServerConfig {
     /// Cursor uses `disabled`; we store inverted `enabled` for UI clarity.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 用户在设置页取消勾选的工具名；不进入 Agent 目录且禁止 call。
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -159,6 +163,8 @@ pub struct McpServerSnapshot {
     pub url: String,
     pub headers: HashMap<String, String>,
     pub enabled: bool,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
     /// disabled | connecting | connected | error
     pub status: String,
     pub error: Option<String>,
@@ -415,6 +421,7 @@ fn cursor_server_to_config(id: String, entry: CursorMcpServer) -> McpServerConfi
         url,
         headers: entry.headers.unwrap_or_default(),
         enabled: !entry.disabled.unwrap_or(false),
+        disabled_tools: Vec::new(),
     }
 }
 
@@ -432,6 +439,7 @@ pub fn normalize_mcp_servers(servers: Vec<McpServerConfig>) -> Result<Vec<McpSer
         let name = server.name.trim().to_string();
         let transport = server.transport;
         let enabled = server.enabled;
+        let disabled_tools = normalize_disabled_tools(server.disabled_tools);
         match transport {
             McpTransport::Stdio => {
                 let command = server.command.trim().to_string();
@@ -477,6 +485,7 @@ pub fn normalize_mcp_servers(servers: Vec<McpServerConfig>) -> Result<Vec<McpSer
                     url: String::new(),
                     headers: HashMap::new(),
                     enabled,
+                    disabled_tools,
                 });
             }
             McpTransport::Sse | McpTransport::StreamableHttp => {
@@ -512,6 +521,7 @@ pub fn normalize_mcp_servers(servers: Vec<McpServerConfig>) -> Result<Vec<McpSer
                     url,
                     headers: server.headers,
                     enabled,
+                    disabled_tools,
                 });
             }
         }
@@ -531,6 +541,29 @@ fn validate_mcp_server_id(value: &str) -> Result<String, String> {
         return Err("MCP 服务器 id 仅允许字母、数字、.-_".to_string());
     }
     Ok(id.to_string())
+}
+
+fn normalize_disabled_tools(tools: Vec<String>) -> Vec<String> {
+    let mut seen = HashMap::new();
+    let mut normalized = Vec::new();
+    for tool in tools {
+        let name = tool.trim();
+        if name.is_empty() || name.chars().count() > 128 {
+            continue;
+        }
+        if seen.insert(name.to_string(), ()).is_some() {
+            continue;
+        }
+        normalized.push(name.to_string());
+        if normalized.len() >= MAX_DISABLED_TOOLS {
+            break;
+        }
+    }
+    normalized
+}
+
+fn is_tool_disabled(server: &McpServerConfig, tool_name: &str) -> bool {
+    server.disabled_tools.iter().any(|item| item == tool_name)
 }
 
 /// 常见 Cursor / Claude Desktop 全局 MCP 配置路径（仅探测，不写文件）。
@@ -1041,6 +1074,7 @@ fn snapshot_server(
         url: config.url.clone(),
         headers: config.headers.clone(),
         enabled: config.enabled,
+        disabled_tools: config.disabled_tools.clone(),
         status,
         error,
         tools,
@@ -1571,6 +1605,9 @@ impl McpRuntime {
                 continue;
             }
             for tool in &slot.tools {
+                if is_tool_disabled(server, &tool.name) {
+                    continue;
+                }
                 catalog.push(json!({
                     "server": server.id,
                     "server_name": server.display_name(),
@@ -1597,6 +1634,14 @@ impl McpRuntime {
             return Err(format!("MCP 服务器已禁用：{}", request.server_id));
         }
 
+        let tool_name = request.tool_name.trim();
+        if tool_name.is_empty() || tool_name.chars().count() > 128 {
+            return Err("MCP 工具名无效".to_string());
+        }
+        if is_tool_disabled(server, tool_name) {
+            return Err(format!("MCP 工具已禁用：{tool_name}"));
+        }
+
         // Ensure connected
         let needs_connect = {
             let sessions = self.sessions.lock().await;
@@ -1608,10 +1653,6 @@ impl McpRuntime {
             self.connect_server(server).await?;
         }
 
-        let tool_name = request.tool_name.trim();
-        if tool_name.is_empty() || tool_name.chars().count() > 128 {
-            return Err("MCP 工具名无效".to_string());
-        }
         let arguments = request.arguments.unwrap_or_else(|| json!({}));
 
         // 取出 live，避免在 await 期间长期占用 sessions 锁
@@ -2057,6 +2098,7 @@ mod tests {
             url: String::new(),
             headers: HashMap::new(),
             enabled: true,
+            disabled_tools: Vec::new(),
         }])
         .expect("normalize");
         assert_eq!(servers.len(), 1);
@@ -2074,6 +2116,7 @@ mod tests {
                 url: String::new(),
                 headers: HashMap::new(),
                 enabled: true,
+                disabled_tools: Vec::new(),
             },
             McpServerConfig {
                 id: "fs".into(),
@@ -2086,6 +2129,7 @@ mod tests {
                 url: String::new(),
                 headers: HashMap::new(),
                 enabled: true,
+                disabled_tools: Vec::new(),
             },
         ])
         .expect_err("duplicate");
@@ -2139,6 +2183,7 @@ mod tests {
             url: String::new(),
             headers: HashMap::new(),
             enabled: false,
+            disabled_tools: Vec::new(),
         }];
         let imported = vec![McpServerConfig {
             id: "memory".into(),
@@ -2151,6 +2196,7 @@ mod tests {
             url: String::new(),
             headers: HashMap::new(),
             enabled: true,
+            disabled_tools: Vec::new(),
         }, McpServerConfig {
             id: "fs".into(),
             name: "fs".into(),
@@ -2162,6 +2208,7 @@ mod tests {
             url: String::new(),
             headers: HashMap::new(),
             enabled: false,
+            disabled_tools: Vec::new(),
         }];
         let (merged, added, updated) =
             merge_mcp_server_imports(existing.clone(), imported.clone()).expect("merge");
@@ -2193,6 +2240,7 @@ mod tests {
                 url: String::new(),
                 headers: HashMap::new(),
                 enabled: true,
+                disabled_tools: Vec::new(),
             },
             McpServerConfig {
                 id: "remote".into(),
@@ -2205,6 +2253,7 @@ mod tests {
                 url: "https://example.com/mcp".into(),
                 headers: HashMap::from([("Authorization".into(), "Bearer x".into())]),
                 enabled: false,
+                disabled_tools: Vec::new(),
             },
         ];
         let exported = export_mcp_servers_cursor_json(&servers).expect("export");

@@ -804,6 +804,7 @@ export function marketItemToServerConfig(item: McpMarketItem): McpServerConfig {
     url: item.config.url ?? '',
     headers: { ...(item.config.headers ?? {}) },
     enabled: false,
+    disabled_tools: [],
   };
 }
 
