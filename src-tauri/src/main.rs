@@ -5746,7 +5746,7 @@ fn agent_openai_tools() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "run_terminal_command",
-                "description": "Propose a one-shot non-interactive terminal command. Creates a pending approval card; the command is NOT executed until the user authorizes it.",
+                "description": "Propose ONE non-interactive terminal command for authorization. Creates a pending card only; does NOT execute until approved (or low-risk auto-run). Prefer tools over describing commands in prose.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -5775,7 +5775,7 @@ fn agent_openai_tools() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "call_mcp_tool",
-                "description": "Propose an MCP tool invocation. Creates a pending approval card; the tool is NOT called until the user authorizes it.",
+                "description": "Propose ONE MCP tool call for authorization. Creates a pending card only; does NOT call until approved (or low-risk auto-run). Use exact server/tool names from the catalog.",
                 "parameters": {
                     "type": "object",
                     "properties": {

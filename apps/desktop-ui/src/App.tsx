@@ -118,7 +118,9 @@ import {
   RotateCcw,
   MessageSquarePlus,
   Store,
+  Zap,
 } from 'lucide-react';
+import { AiMarkdown } from './AiMarkdown';
 import {
   connectSession,
   disconnectSession,
@@ -240,6 +242,7 @@ import {
 import {
   AI_AGENT_MAX_CONTINUATIONS,
   AI_AGENT_RESULT_LABEL_PREFIX,
+  AI_EMPTY_SUGGESTIONS,
   AI_HISTORY_CHAR_BUDGET,
   AI_HISTORY_MESSAGE_LIMIT,
   AI_MODE_OPTIONS,
@@ -248,12 +251,14 @@ import {
   AI_REQUEST_TRUNCATION_MARKER,
   aiAgentContinuationCount,
   aiSystemMessage,
+  buildAgentContinuationPrompt,
   buildAiRequestMessages,
   canContinueAiAgent,
   estimateAiContextUsage,
   formatAiContextAmount,
   formatAiRequestContent,
   formatMcpToolsCatalog,
+  isAiAgentContinuationMessage,
   limitAiRequestMessage,
   normalizeAiReasoningEffort,
   resolveAiChatModelOptions,
@@ -446,6 +451,22 @@ export function App() {
   /** 输入区模式/模型/推理强度/上下文菜单：Cursor 风格自定义下拉 */
   const [aiComposerMenu, setAiComposerMenu] = useState<null | 'mode' | 'provider' | 'model' | 'effort' | 'context'>(null);
   const [aiComposerMenuAnchor, setAiComposerMenuAnchor] = useState<FloatingMenuAnchor | null>(null);
+  /** Agent：低风险终端/MCP 提案后自动执行（高风险与文件修改仍须确认） */
+  const [aiAutoRunEnabled, setAiAutoRunEnabled] = useState(() => {
+    try {
+      return window.localStorage.getItem('pandaterm.ai.autoRun') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const aiAutoRunEnabledRef = useRef(aiAutoRunEnabled);
+  aiAutoRunEnabledRef.current = aiAutoRunEnabled;
+  /** 生成中排队的用户消息（发送时若正在生成则入队） */
+  const [aiMessageQueue, setAiMessageQueue] = useState<Array<{
+    id: string;
+    content: string;
+    contexts: AiContextItem[];
+  }>>([]);
   const [aiConversationError, setAiConversationError] = useState('');
   const aiConversationsLoadedRef = useRef(false);
   const aiMessagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -464,6 +485,17 @@ export function App() {
     status: 'complete' | 'cancelled' | 'error',
     errorMessage?: string,
   ) => void>(() => undefined);
+  const runAiTerminalActionRef = useRef<(
+    conversationId: string,
+    messageId: string,
+    action: AiTerminalAction,
+  ) => void>(() => undefined);
+  const runAiMcpActionRef = useRef<(
+    conversationId: string,
+    messageId: string,
+    action: AiMcpAction,
+  ) => Promise<void>>(async () => undefined);
+  const flushAiMessageQueueRef = useRef<() => void>(() => undefined);
   const [currentPath, setCurrentPath] = useState('');
   const [parentPath, setParentPath] = useState<string | null>(null);
   const [resourceFiles, setResourceFiles] = useState<ResourceFile[]>([]);
@@ -3497,6 +3529,15 @@ export function App() {
     errorMessage?: string,
   ) {
     let shouldRepairAgentProtocol = false;
+    /** 用对象承载，避免 TS 认为 setState updater 不会同步执行导致 never */
+    const autoRunCapture: {
+      job: null | {
+        messageId: string;
+        terminal?: AiTerminalAction;
+        mcp?: AiMcpAction;
+      };
+    } = { job: null };
+
     updateAiConversation(activeRequest.conversationId, (conversation) => {
       const userMessage = conversation.messages.find((message) => message.id === activeRequest.userMessageId);
       return {
@@ -3623,7 +3664,7 @@ export function App() {
               }];
             });
             const isToolContinuation = userMessage?.contexts.some(({ label }) =>
-              label.startsWith('Agent 工具结果：') || label.startsWith('Agent MCP 结果：'),
+              label.startsWith(AI_AGENT_RESULT_LABEL_PREFIX),
             ) ?? false;
             const declaresPendingToolWork = /(如果你(?:要我|愿意)|我会(?:直接)?提交|下一条会|需要.*(?:重新执行|再查|继续查)|可以直接再)/u.test(
               parsedMcp.visibleContent,
@@ -3637,6 +3678,22 @@ export function App() {
             const errorSuffix = actionErrors.length > 0
               ? `\n\n动作未全部接受：${actionErrors.join('；')}`
               : '';
+
+            // 自动执行：在同一同步解析结果上排队，不依赖尚未 re-render 的 workspace ref
+            if (aiAutoRunEnabledRef.current && !shouldRepairAgentProtocol) {
+              const autoTerminal = terminalActions.find((action) =>
+                action.status === 'proposed' && !isHighRiskTerminalCommand(action.command),
+              );
+              if (autoTerminal) {
+                autoRunCapture.job = { messageId: message.id, terminal: autoTerminal };
+              } else {
+                const autoMcp = mcpActions.find((action) => action.status === 'proposed');
+                if (autoMcp) {
+                  autoRunCapture.job = { messageId: message.id, mcp: autoMcp };
+                }
+              }
+            }
+
             return {
               ...message,
               content: `${parsedMcp.visibleContent}${errorSuffix}`.trim(),
@@ -3669,11 +3726,35 @@ export function App() {
         const baseMessages = conversation.messages.filter(({ id }) => id !== activeRequest.assistantMessageId);
         const repairMessage: AiMessage = {
           ...userMessage,
-          content: `${userMessage.content}\n\n协议纠偏：上一回复明确表示仍需工具操作，却没有提交动作。请立即调用 run_terminal_command 或 call_mcp_tool（若供应商不支持 tools，再回退 pandaterm-terminal / pandaterm-mcp 代码块）；不要再次询问，不要重复解释。`,
+          content: `${userMessage.content}\n\n协议纠偏：上一回复表示仍需工具，却未提交 tool call。请立即调用 run_terminal_command 或 call_mcp_tool（无 tools 时用 pandaterm-terminal / pandaterm-mcp 代码块）；不要再次询问。`,
         };
         beginAiGeneration(conversation, baseMessages, repairMessage, true);
       }, 0);
+      return;
     }
+    // 低风险自动执行：用解析阶段捕获的动作对象，绕过 ref 时序问题
+    if (autoRunCapture.job) {
+      const job = autoRunCapture.job;
+      window.setTimeout(() => {
+        if (job.terminal) {
+          runAiTerminalActionRef.current(
+            activeRequest.conversationId,
+            job.messageId,
+            job.terminal,
+          );
+          return;
+        }
+        if (job.mcp) {
+          void runAiMcpActionRef.current(
+            activeRequest.conversationId,
+            job.messageId,
+            job.mcp,
+          );
+        }
+      }, 0);
+    }
+    // 生成结束：冲刷排队消息（续跑/自动执行中若又起请求，队列会等下一轮）
+    window.setTimeout(() => flushAiMessageQueueRef.current(), 40);
   }
 
   finishAiStreamRef.current = finishAiStream;
@@ -4609,7 +4690,7 @@ export function App() {
 
   async function submitAiMessage() {
     const content = aiInput.trim();
-    if (!content || isAiGenerating || !activeAiConversation) return;
+    if (!content || !activeAiConversation) return;
     if (!aiProviderConfig
       || aiProviderConfig.error
       || !aiProviderConfig.api_key_configured) {
@@ -4634,6 +4715,17 @@ export function App() {
       }
     }
 
+    // 生成中：入队，避免打断当前流式
+    if (isAiGenerating || aiActiveRequestRef.current) {
+      setAiMessageQueue((queue) => [
+        ...queue,
+        { id: crypto.randomUUID(), content, contexts: messageContexts },
+      ]);
+      setAiInput('');
+      setPendingAiContexts([]);
+      return;
+    }
+
     const userMessage: AiMessage = {
       id: crypto.randomUUID(),
       role: 'user',
@@ -4649,6 +4741,34 @@ export function App() {
     setPendingAiContexts([]);
     beginAiGeneration(activeAiConversation, [...activeAiConversation.messages, userMessage], userMessage);
   }
+
+  function flushAiMessageQueue() {
+    if (aiActiveRequestRef.current || isAiGenerating) return;
+    const conversation = activeAiConversation;
+    if (!conversation) return;
+    setAiMessageQueue((queue) => {
+      if (queue.length === 0) return queue;
+      const [next, ...rest] = queue;
+      const userMessage: AiMessage = {
+        id: crypto.randomUUID(),
+        role: 'user',
+        content: next.content,
+        contexts: next.contexts,
+        proposals: [],
+        terminalActions: [],
+        mcpActions: [],
+        createdAt: new Date().toISOString(),
+        status: 'complete',
+      };
+      window.setTimeout(() => {
+        const current = aiWorkspaceRef.current.conversations.find(({ id }) => id === conversation.id);
+        if (!current || aiActiveRequestRef.current) return;
+        beginAiGeneration(current, [...current.messages, userMessage], userMessage);
+      }, 0);
+      return rest;
+    });
+  }
+  flushAiMessageQueueRef.current = flushAiMessageQueue;
 
   async function stopCurrentAiGeneration() {
     const activeRequest = aiActiveRequestRef.current;
@@ -4679,9 +4799,12 @@ export function App() {
     }));
   }
 
-  async function runAiTerminalAction(messageId: string, action: AiTerminalAction) {
-    if (!activeAiConversation || !['proposed', 'timeout', 'error'].includes(action.status)) return;
-    const conversationId = activeAiConversation.id;
+  async function runAiTerminalAction(
+    conversationId: string,
+    messageId: string,
+    action: AiTerminalAction,
+  ) {
+    if (!['proposed', 'timeout', 'error'].includes(action.status)) return;
     updateAiTerminalAction(conversationId, messageId, action.id, (current) => ({
       ...current,
       status: 'running',
@@ -4715,6 +4838,9 @@ export function App() {
       }));
     }
   }
+  runAiTerminalActionRef.current = (conversationId, messageId, action) => {
+    void runAiTerminalAction(conversationId, messageId, action);
+  };
 
   function rejectAiTerminalAction(messageId: string, action: AiTerminalAction) {
     if (!activeAiConversation || action.status === 'running' || action.status === 'completed') return;
@@ -4744,9 +4870,12 @@ export function App() {
     }));
   }
 
-  async function runAiMcpAction(messageId: string, action: AiMcpAction) {
-    if (!activeAiConversation || !['proposed', 'error'].includes(action.status)) return;
-    const conversationId = activeAiConversation.id;
+  async function runAiMcpAction(
+    conversationId: string,
+    messageId: string,
+    action: AiMcpAction,
+  ) {
+    if (!['proposed', 'error'].includes(action.status)) return;
     updateAiMcpAction(conversationId, messageId, action.id, (current) => ({
       ...current,
       status: 'running',
@@ -4779,6 +4908,7 @@ export function App() {
       }));
     }
   }
+  runAiMcpActionRef.current = runAiMcpAction;
 
   function rejectAiMcpAction(messageId: string, action: AiMcpAction) {
     if (!activeAiConversation || action.status === 'running' || action.status === 'completed') return;
@@ -4808,10 +4938,10 @@ export function App() {
     const userMessage: AiMessage = {
       id: crypto.randomUUID(),
       role: 'user',
-      content: '继续处理当前任务。你已经被明确要求继续，无需再次询问用户是否继续。请根据上一步 MCP 工具结果判断下一步；如果任务已经完成，请直接说明结果。如果还需要工具，本次回复必须立即调用 call_mcp_tool 或 run_terminal_command。',
+      content: buildAgentContinuationPrompt('mcp'),
       contexts: [{
         kind: 'terminal',
-        label: `Agent MCP 结果：${action.summary}`,
+        label: `${AI_AGENT_RESULT_LABEL_PREFIX}MCP 结果：${action.summary}`,
         source: `mcp:${action.serverId}/${action.toolName}`,
         preview: `tool_action_id: ${action.id}\nserver: ${action.serverId}\ntool: ${action.toolName}\narguments: ${JSON.stringify(action.arguments)}\nis_error: false\noutput:\n${output.slice(-8000)}`,
       }],
@@ -4853,10 +4983,10 @@ export function App() {
     const userMessage: AiMessage = {
       id: crypto.randomUUID(),
       role: 'user',
-      content: '继续处理当前任务。你已经被明确要求继续，无需再次询问用户是否继续。请根据上一步工具结果判断下一步；如果任务已经完成，请直接说明结果。如果还需要执行命令，本次回复必须立即调用 run_terminal_command，不得用“如果你要我继续”“我会提交”等话术把决定退回用户，也不要只展示 bash 代码。',
+      content: buildAgentContinuationPrompt('terminal'),
       contexts: [{
         kind: 'terminal',
-        label: `Agent 工具结果：${action.summary}`,
+        label: `${AI_AGENT_RESULT_LABEL_PREFIX}工具结果：${action.summary}`,
         source: action.contextSource,
         preview: `tool_action_id: ${action.id}\ncommand: ${action.command}\nexit_code: ${action.exitCode ?? 'unknown'}\ntimed_out: ${action.status === 'timeout'}\ntruncated: ${Boolean(action.truncated)}\noutput:\n${output.slice(-8000)}`,
         isRemote: action.isRemote,
@@ -4891,10 +5021,10 @@ export function App() {
         const userMessage: AiMessage = {
           id: crypto.randomUUID(),
           role: 'user',
-          content: '继续处理当前任务。上一步文件修改已经成功应用，请判断任务是否完成；如需下一步，只提出必要动作。',
+          content: buildAgentContinuationPrompt('edit'),
           contexts: [{
             kind: 'file',
-            label: `Agent 修改结果：${proposal.targetLabel}`,
+            label: `${AI_AGENT_RESULT_LABEL_PREFIX}修改结果：${proposal.targetLabel}`,
             source: proposal.targetSource,
             preview: `applied: true\nsummary: ${proposal.summary}\ntarget: ${proposal.targetSource}`,
             isRemote: proposal.isRemote,
@@ -4902,7 +5032,7 @@ export function App() {
           }],
           proposals: [],
           terminalActions: [],
-      mcpActions: [],
+          mcpActions: [],
           createdAt: new Date().toISOString(),
           status: 'complete',
         };
@@ -6496,10 +6626,36 @@ export function App() {
                   <div className="ai-empty-icon"><Bot size={24} /></div>
                   <strong>可以开始工作了</strong>
                   <span>输入问题，或使用 @ 引用终端、选中文本和项目文件。</span>
+                  <div className="ai-empty-suggestions">
+                    {AI_EMPTY_SUGGESTIONS.map((item) => (
+                      <button
+                        key={item.label}
+                        type="button"
+                        className="ai-empty-chip"
+                        disabled={isAiGenerating}
+                        onClick={() => setAiInput(item.prompt)}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               ) : aiMessages.map((message) => {
                 const isUser = message.role === 'user';
                 const isEditingUser = isUser && editingUserMessageId === message.id;
+                const isContinuation = isUser && isAiAgentContinuationMessage(message);
+                if (isContinuation && !isEditingUser) {
+                  const label = message.contexts.find((c) => c.label.startsWith(AI_AGENT_RESULT_LABEL_PREFIX))?.label
+                    || '工具结果已回传';
+                  return (
+                    <article key={message.id} className="ai-message user continuation">
+                      <div className="ai-agent-continuation" title={message.content}>
+                        <span className="ai-agent-continuation-badge">续跑</span>
+                        <span className="ai-agent-continuation-text">{label}</span>
+                      </div>
+                    </article>
+                  );
+                }
                 return (
                 <article key={message.id} className={`ai-message ${message.role} ${message.status}${isEditingUser ? ' editing' : ''}`}>
                   <div className="ai-message-body">
@@ -6582,7 +6738,9 @@ export function App() {
                         </div>
                       )
                     ) : message.content ? (
-                      <div className="ai-message-content">{message.content}</div>
+                      <div className="ai-message-content">
+                        <AiMarkdown content={message.content} />
+                      </div>
                     ) : message.status === 'streaming' ? (
                       <div className="ai-typing" aria-label="正在生成"><i /><i /><i /></div>
                     ) : null}
@@ -6651,6 +6809,9 @@ export function App() {
                             <span>{action.contextLabel} · {action.isRemote ? '远程' : '本地'} · {Math.round(action.timeoutMs / 1000)}s</span>
                           </div>
                           {isHighRiskTerminalCommand(action.command) && <em>高风险</em>}
+                          {aiAutoRunEnabled && action.status === 'proposed' && !isHighRiskTerminalCommand(action.command) && (
+                            <em className="ai-action-auto">自动执行</em>
+                          )}
                         </div>
                         <pre className="ai-terminal-command">{action.command}</pre>
                         {action.output !== undefined && action.status === 'completed' && (
@@ -6662,7 +6823,10 @@ export function App() {
                             <button
                               type="button"
                               className={isHighRiskTerminalCommand(action.command) ? 'danger' : 'primary'}
-                              onClick={() => runAiTerminalAction(message.id, action)}
+                              onClick={() => {
+                                if (!activeAiConversation) return;
+                                void runAiTerminalAction(activeAiConversation.id, message.id, action);
+                              }}
                             >
                               {action.status === 'proposed' ? '授权并执行' : '重新执行'}
                             </button>
@@ -6699,6 +6863,9 @@ export function App() {
                             <strong>{action.summary}</strong>
                             <span>MCP · {action.serverId}/{action.toolName}</span>
                           </div>
+                          {aiAutoRunEnabled && action.status === 'proposed' && (
+                            <em className="ai-action-auto">自动执行</em>
+                          )}
                         </div>
                         <pre className="ai-terminal-command">{JSON.stringify(action.arguments ?? {}, null, 2)}</pre>
                         {action.content !== undefined && action.status === 'completed' && (
@@ -6710,7 +6877,10 @@ export function App() {
                             <button
                               type="button"
                               className="primary"
-                              onClick={() => void runAiMcpAction(message.id, action)}
+                              onClick={() => {
+                                if (!activeAiConversation) return;
+                                void runAiMcpAction(activeAiConversation.id, message.id, action);
+                              }}
                             >
                               {action.status === 'proposed' ? '授权并调用' : '重新调用'}
                             </button>
@@ -6801,6 +6971,23 @@ export function App() {
                     <button type="button" key={file.path} onClick={() => requestAiContext('file', file)}>
                       <File size={13} /><span>{file.name}</span>
                     </button>
+                  ))}
+                </div>
+              )}
+              {aiMessageQueue.length > 0 && (
+                <div className="ai-message-queue" aria-label="待发送队列">
+                  {aiMessageQueue.map((item) => (
+                    <div key={item.id} className="ai-queue-item">
+                      <em>排队</em>
+                      <span title={item.content}>{item.content}</span>
+                      <button
+                        type="button"
+                        aria-label="移除排队消息"
+                        onClick={() => setAiMessageQueue((queue) => queue.filter((row) => row.id !== item.id))}
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
                   ))}
                 </div>
               )}
@@ -6969,6 +7156,32 @@ export function App() {
                               document.body,
                             )}
                           </div>
+                          {currentMode === 'agent' ? (
+                            <button
+                              type="button"
+                              className={`ai-composer-trigger muted ai-auto-run-toggle${aiAutoRunEnabled ? ' on' : ''}`}
+                              aria-label="低风险自动执行"
+                              aria-pressed={aiAutoRunEnabled}
+                              title={aiAutoRunEnabled
+                                ? '已开启：低风险终端/MCP 提案后自动执行（高风险与改文件仍需确认）'
+                                : '关闭：每个动作都需你点授权'}
+                              disabled={isAiGenerating}
+                              onClick={() => {
+                                setAiAutoRunEnabled((on) => {
+                                  const next = !on;
+                                  try {
+                                    window.localStorage.setItem('pandaterm.ai.autoRun', next ? '1' : '0');
+                                  } catch {
+                                    /* ignore */
+                                  }
+                                  return next;
+                                });
+                              }}
+                            >
+                              <Zap size={12} className="ai-composer-trigger-icon" aria-hidden />
+                              <span>自动</span>
+                            </button>
+                          ) : null}
                           {aiProviderConfig ? (
                             <>
                               <div className="ai-composer-menu ai-composer-menu-provider">
