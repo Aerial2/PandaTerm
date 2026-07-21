@@ -65,7 +65,7 @@ export async function getCurrentAppVersion(): Promise<string> {
     const { getVersion } = await import('@tauri-apps/api/app');
     return await getVersion();
   } catch {
-    return '0.1.0';
+    return '0.1.1';
   }
 }
 
