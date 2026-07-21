@@ -449,7 +449,7 @@ export function App() {
   const [pendingAiContexts, setPendingAiContexts] = useState<AiContextItem[]>([]);
   const [isAiMentionOpen, setIsAiMentionOpen] = useState(false);
   /** 输入区模式/模型/推理强度/上下文菜单：Cursor 风格自定义下拉 */
-  const [aiComposerMenu, setAiComposerMenu] = useState<null | 'mode' | 'provider' | 'model' | 'effort' | 'context'>(null);
+  const [aiComposerMenu, setAiComposerMenu] = useState<null | 'mode' | 'model' | 'effort' | 'context'>(null);
   const [aiComposerMenuAnchor, setAiComposerMenuAnchor] = useState<FloatingMenuAnchor | null>(null);
   /** Agent：低风险终端/MCP 提案后自动执行（高风险与文件修改仍须确认） */
   const [aiAutoRunEnabled, setAiAutoRunEnabled] = useState(() => {
@@ -7052,7 +7052,7 @@ export function App() {
                         : contextUsage.percent >= 70
                           ? 'warn'
                           : 'ok';
-                      const toggleComposerMenu = (menu: 'mode' | 'provider' | 'model' | 'effort' | 'context', trigger: HTMLButtonElement) => {
+                      const toggleComposerMenu = (menu: 'mode' | 'model' | 'effort' | 'context', trigger: HTMLButtonElement) => {
                         if (aiComposerMenu === menu) {
                           setAiComposerMenu(null);
                           setAiComposerMenuAnchor(null);
@@ -7077,19 +7077,20 @@ export function App() {
                             api_key_configured: aiProviderConfig.api_key_configured,
                           }]
                           : []);
-                      const activeProviderId = (aiProviderConfig?.account_id || aiProviderConfig?.active_account_id || '').trim();
+                      const activeProviderId = (aiProviderConfig?.account_id || aiProviderConfig?.active_account_id || '').trim()
+                        || providerAccounts[0]?.id
+                        || '';
                       const activeProviderName = (aiProviderConfig?.account_name || '').trim()
                         || providerAccounts.find((item) => item.id === activeProviderId)?.name
+                        || providerAccounts[0]?.name
                         || '供应商';
                       const composerMenuMinWidth = aiComposerMenu === 'model'
-                        ? 220
-                        : aiComposerMenu === 'provider'
+                        ? 420
+                        : aiComposerMenu === 'effort'
                           ? 200
-                          : aiComposerMenu === 'effort'
-                            ? 200
-                            : aiComposerMenu === 'context'
-                              ? 240
-                              : 188;
+                          : aiComposerMenu === 'context'
+                            ? 240
+                            : 188;
                       const composerPopoverStyle = aiComposerMenuAnchor
                         ? {
                             left: clampFloatingMenuLeft(aiComposerMenuAnchor.left, composerMenuMinWidth),
@@ -7183,140 +7184,110 @@ export function App() {
                             </button>
                           ) : null}
                           {aiProviderConfig ? (
-                            <>
-                              <div className="ai-composer-menu ai-composer-menu-provider">
-                                <button
-                                  type="button"
-                                  className={`ai-composer-trigger muted${aiComposerMenu === 'provider' ? ' open' : ''}`}
-                                  aria-label="AI 供应商"
-                                  aria-haspopup="listbox"
-                                  aria-expanded={aiComposerMenu === 'provider'}
-                                  title="选择供应商"
-                                  disabled={isAiGenerating || isAiConfigSaving || Boolean(aiProviderConfig.error)}
-                                  onClick={(event) => toggleComposerMenu('provider', event.currentTarget)}
+                            <div className="ai-composer-menu ai-composer-menu-model">
+                              <button
+                                type="button"
+                                className={`ai-composer-trigger muted${aiComposerMenu === 'model' ? ' open' : ''}`}
+                                aria-label="AI 模型"
+                                aria-haspopup="listbox"
+                                aria-expanded={aiComposerMenu === 'model'}
+                                title={`${activeProviderName} · ${aiProviderConfig.model || '选择模型'}`}
+                                disabled={isAiGenerating || isAiConfigSaving || Boolean(aiProviderConfig.error)}
+                                onClick={(event) => toggleComposerMenu('model', event.currentTarget)}
+                              >
+                                <span>{aiProviderConfig.model || '选择模型'}</span>
+                                <ChevronDown size={12} aria-hidden />
+                              </button>
+                              {aiComposerMenu === 'model' && aiComposerMenuAnchor && createPortal(
+                                <div
+                                  className="ai-composer-popover provider-model"
+                                  role="dialog"
+                                  aria-label="选择供应商与模型"
+                                  style={composerPopoverStyle}
                                 >
-                                  <span>{activeProviderName}</span>
-                                  <ChevronDown size={12} aria-hidden />
-                                </button>
-                                {aiComposerMenu === 'provider' && aiComposerMenuAnchor && createPortal(
-                                  <div
-                                    className="ai-composer-popover provider"
-                                    role="listbox"
-                                    aria-label="选择供应商"
-                                    style={composerPopoverStyle}
-                                  >
-                                    <div className="ai-composer-popover-label">供应商</div>
-                                    {providerAccounts.map((account) => {
-                                      const selected = account.id === activeProviderId;
-                                      return (
-                                        <button
-                                          type="button"
-                                          key={account.id}
-                                          role="option"
-                                          aria-selected={selected}
-                                          className={selected ? 'active' : undefined}
-                                          onClick={() => {
-                                            void selectAiProviderAccountInChat(account.id);
-                                            closeComposerMenu();
-                                          }}
-                                        >
-                                          <span className="ai-composer-option-text">
-                                            <strong>{account.name || '未命名'}</strong>
-                                            <em>
-                                              {account.model || '未选模型'}
-                                              {account.api_key_configured ? '' : ' · 未配置密钥'}
-                                            </em>
-                                          </span>
-                                          <span className="ai-composer-option-check">
-                                            {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
-                                          </span>
-                                        </button>
-                                      );
-                                    })}
-                                    <div className="ai-composer-popover-footer">
-                                      <button
-                                        type="button"
-                                        className="ai-composer-popover-action"
-                                        onClick={() => {
-                                          closeComposerMenu();
-                                          openAiSettings();
-                                        }}
-                                      >
-                                        <Settings size={12} aria-hidden />
-                                        管理供应商…
-                                      </button>
+                                  <div className="ai-composer-picker-body">
+                                    <div className="ai-composer-picker-col providers">
+                                      <div className="ai-composer-popover-label">供应商</div>
+                                      <div className="ai-composer-picker-list" role="listbox" aria-label="供应商列表">
+                                        {providerAccounts.map((account) => {
+                                          const selected = account.id === activeProviderId;
+                                          return (
+                                            <button
+                                              type="button"
+                                              key={account.id}
+                                              role="option"
+                                              aria-selected={selected}
+                                              className={selected ? 'active' : undefined}
+                                              onClick={() => {
+                                                // 切换供应商后保持菜单打开，右侧模型列表随配置刷新
+                                                void selectAiProviderAccountInChat(account.id);
+                                              }}
+                                            >
+                                              <span className="ai-composer-option-text">
+                                                <strong>{account.name || '未命名'}</strong>
+                                                <em>
+                                                  {account.model || '未选模型'}
+                                                  {account.api_key_configured ? '' : ' · 未配置密钥'}
+                                                </em>
+                                              </span>
+                                              <span className="ai-composer-option-check">
+                                                {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
+                                              </span>
+                                            </button>
+                                          );
+                                        })}
+                                      </div>
                                     </div>
-                                  </div>,
-                                  document.body,
-                                )}
-                              </div>
-                              <div className="ai-composer-menu ai-composer-menu-model">
-                                <button
-                                  type="button"
-                                  className={`ai-composer-trigger muted${aiComposerMenu === 'model' ? ' open' : ''}`}
-                                  aria-label="AI 模型"
-                                  aria-haspopup="listbox"
-                                  aria-expanded={aiComposerMenu === 'model'}
-                                  title={`${activeProviderName} · 选择模型`}
-                                  disabled={isAiGenerating || isAiConfigSaving || Boolean(aiProviderConfig.error)}
-                                  onClick={(event) => toggleComposerMenu('model', event.currentTarget)}
-                                >
-                                  <span>{aiProviderConfig.model}</span>
-                                  <ChevronDown size={12} aria-hidden />
-                                </button>
-                                {aiComposerMenu === 'model' && aiComposerMenuAnchor && createPortal(
-                                  <div
-                                    className="ai-composer-popover model"
-                                    role="listbox"
-                                    aria-label="选择模型"
-                                    style={composerPopoverStyle}
-                                  >
-                                    <div className="ai-composer-popover-label">
-                                      模型 · {activeProviderName}
+                                    <div className="ai-composer-picker-col models">
+                                      <div className="ai-composer-popover-label">
+                                        模型 · {activeProviderName}
+                                      </div>
+                                      <div className="ai-composer-picker-list" role="listbox" aria-label="模型列表">
+                                        {modelOptions.length === 0 ? (
+                                          <div className="ai-composer-popover-empty">当前供应商暂无可用模型</div>
+                                        ) : modelOptions.map((model) => {
+                                          const selected = model === aiProviderConfig.model;
+                                          return (
+                                            <button
+                                              type="button"
+                                              key={model}
+                                              role="option"
+                                              aria-selected={selected}
+                                              className={selected ? 'active' : undefined}
+                                              onClick={() => {
+                                                void selectAiModel(model);
+                                                closeComposerMenu();
+                                              }}
+                                            >
+                                              <span className="ai-composer-option-text single">
+                                                <strong>{model}</strong>
+                                              </span>
+                                              <span className="ai-composer-option-check">
+                                                {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
+                                              </span>
+                                            </button>
+                                          );
+                                        })}
+                                      </div>
                                     </div>
-                                    {modelOptions.length === 0 ? (
-                                      <div className="ai-composer-popover-empty">当前供应商暂无可用模型</div>
-                                    ) : modelOptions.map((model) => {
-                                      const selected = model === aiProviderConfig.model;
-                                      return (
-                                        <button
-                                          type="button"
-                                          key={model}
-                                          role="option"
-                                          aria-selected={selected}
-                                          className={selected ? 'active' : undefined}
-                                          onClick={() => {
-                                            void selectAiModel(model);
-                                            closeComposerMenu();
-                                          }}
-                                        >
-                                          <span className="ai-composer-option-text single">
-                                            <strong>{model}</strong>
-                                          </span>
-                                          <span className="ai-composer-option-check">
-                                            {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
-                                          </span>
-                                        </button>
-                                      );
-                                    })}
-                                    <div className="ai-composer-popover-footer">
-                                      <button
-                                        type="button"
-                                        className="ai-composer-popover-action"
-                                        onClick={() => {
-                                          closeComposerMenu();
-                                          openAiSettings();
-                                        }}
-                                      >
-                                        <Settings size={12} aria-hidden />
-                                        管理模型…
-                                      </button>
-                                    </div>
-                                  </div>,
-                                  document.body,
-                                )}
-                              </div>
-                            </>
+                                  </div>
+                                  <div className="ai-composer-popover-footer">
+                                    <button
+                                      type="button"
+                                      className="ai-composer-popover-action"
+                                      onClick={() => {
+                                        closeComposerMenu();
+                                        openAiSettings();
+                                      }}
+                                    >
+                                      <Settings size={12} aria-hidden />
+                                      管理供应商与模型…
+                                    </button>
+                                  </div>
+                                </div>,
+                                document.body,
+                              )}
+                            </div>
                           ) : (
                             <button type="button" className="ai-model-label is-action" onClick={() => openAiSettings()}>
                               尚未配置模型
