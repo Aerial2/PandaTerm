@@ -1616,8 +1616,19 @@ button:disabled {
   max-width: min(360px, calc(100vw - 16px));
 }
 
+.ai-composer-popover.provider {
+  max-width: min(300px, calc(100vw - 16px));
+}
+
 .ai-composer-popover.effort {
   max-width: min(240px, calc(100vw - 16px));
+}
+
+.ai-composer-popover-empty {
+  padding: 10px 12px 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 /* Cursor 风格：上下文用量环 + 明细浮层 */

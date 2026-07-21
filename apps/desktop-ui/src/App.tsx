@@ -444,7 +444,7 @@ export function App() {
   const [pendingAiContexts, setPendingAiContexts] = useState<AiContextItem[]>([]);
   const [isAiMentionOpen, setIsAiMentionOpen] = useState(false);
   /** 输入区模式/模型/推理强度/上下文菜单：Cursor 风格自定义下拉 */
-  const [aiComposerMenu, setAiComposerMenu] = useState<null | 'mode' | 'model' | 'effort' | 'context'>(null);
+  const [aiComposerMenu, setAiComposerMenu] = useState<null | 'mode' | 'provider' | 'model' | 'effort' | 'context'>(null);
   const [aiComposerMenuAnchor, setAiComposerMenuAnchor] = useState<FloatingMenuAnchor | null>(null);
   const [aiConversationError, setAiConversationError] = useState('');
   const aiConversationsLoadedRef = useRef(false);
@@ -656,6 +656,8 @@ export function App() {
   const terminalPasteInFlightRef = useRef(new Set<string>());
   const [isUploading, setIsUploading] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
+  /** 嵌套 dragenter/leave 深度，避免子节点抖动误关遮罩 */
+  const resourceDragDepthRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
   const pathEditInputRef = useRef<HTMLInputElement | null>(null);
@@ -1169,7 +1171,6 @@ export function App() {
   }, []);
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? null;
-  const activeSession = activeTab?.session ?? localSession;
   const visibleTerminalPaneIds = activeTab?.kind === 'terminal'
     ? collectTerminalLayoutTabIds(activeTab.layout ?? createDefaultTerminalLayout(activeTab.id))
     : [];
@@ -1200,6 +1201,24 @@ export function App() {
     () => (activePaneId ? tabs.find((tab) => tab.id === activePaneId && tab.kind === 'terminal') ?? null : null),
     [activePaneId, tabs],
   );
+  // 顶栏状态跟「当前焦点」：优先激活 pane；编辑器打开时显示文件名
+  const statusFocusSession = useMemo(() => {
+    if (showEditor) return null;
+    return activePaneTab?.session ?? activeTab?.session ?? null;
+  }, [showEditor, activePaneTab?.session, activeTab?.session]);
+  const statusFocusEditor = useMemo(() => {
+    if (!showEditor) return null;
+    return editorTabs.find((tab) => tab.id === activeEditorTabId) ?? null;
+  }, [showEditor, editorTabs, activeEditorTabId]);
+  const topStatusName = statusFocusEditor
+    ? (statusFocusEditor.isUntitled
+      ? statusFocusEditor.name
+      : (statusFocusEditor.path || statusFocusEditor.name))
+    : (statusFocusSession?.name ?? '');
+  const topStatusUser = statusFocusEditor ? '' : (statusFocusSession?.username ?? '');
+  const topStatusHost = statusFocusEditor ? '' : (statusFocusSession?.host ?? '');
+  // 其余逻辑仍用当前工作区会话（资源树 / 菜单兜底）
+  const activeSession = activePaneTab?.session ?? activeTab?.session ?? localSession;
   const activePaneTabRef = useRef<WorkspaceTab | null>(null);
   useEffect(() => {
     activePaneTabRef.current = activePaneTab;
@@ -1291,6 +1310,44 @@ export function App() {
     scheduleVisibleTerminalFits({ force: true });
   }, [activeTab?.id, activePaneId]);
 
+  // 拖拽遮罩：拖出窗口 / 取消 / 失焦 / 切走资源面板时必须清掉
+  useEffect(() => {
+    if (leftActivity !== 'files') {
+      clearResourceDragOverlay();
+      return;
+    }
+    if (!isDragOver) return;
+
+    const clear = () => clearResourceDragOverlay();
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') clear();
+    };
+    const onDocDragLeave = (event: DragEvent) => {
+      // 指针离开浏览器视口
+      if (event.clientX <= 0 || event.clientY <= 0
+        || event.clientX >= window.innerWidth
+        || event.clientY >= window.innerHeight) {
+        clear();
+      }
+    };
+
+    window.addEventListener('dragend', clear, true);
+    window.addEventListener('drop', clear, true);
+    window.addEventListener('blur', clear);
+    window.addEventListener('pointercancel', clear, true);
+    document.addEventListener('visibilitychange', onVisibility);
+    document.addEventListener('dragleave', onDocDragLeave);
+
+    return () => {
+      window.removeEventListener('dragend', clear, true);
+      window.removeEventListener('drop', clear, true);
+      window.removeEventListener('blur', clear);
+      window.removeEventListener('pointercancel', clear, true);
+      document.removeEventListener('visibilitychange', onVisibility);
+      document.removeEventListener('dragleave', onDocDragLeave);
+    };
+  }, [isDragOver, leftActivity]);
+
   useEffect(() => {
     if (activeTab?.kind !== 'terminal') return;
     scheduleVisibleTerminalFits({ force: true });
@@ -1337,6 +1394,7 @@ export function App() {
   function focusTerminalPane(tabId: string) {
     const ownerTab = findTerminalWorkspaceOwner(tabsRef.current, tabId);
     if (!ownerTab) return;
+    setShowEditor(false);
     setActiveTabId(ownerTab.id);
     setTabs((current) => current.map((item) => {
       if (item.id !== ownerTab.id) return item;
@@ -1892,6 +1950,24 @@ export function App() {
     setStatusMessage(`已新建空白文件：${name}`);
   }
 
+  function selectEditorWorkspaceTab(id: string) {
+    setActiveEditorTabId(id);
+    setShowEditor(true);
+  }
+
+  function selectSessionWorkspaceTab(tabId: string) {
+    setActiveTabId(tabId);
+    setShowEditor(false);
+  }
+
+  function editorTabLabel(tab: EditorTab, all: EditorTab[]): string {
+    const sameName = all.filter((item) => item.name === tab.name).length;
+    if (sameName <= 1) return tab.name;
+    const parts = tab.path.split(/[/\\]/);
+    const parent = parts.length >= 2 ? parts[parts.length - 2] : '';
+    return parent ? `${tab.name} (${parent})` : tab.name;
+  }
+
   async function openFileInEditor(file: ResourceFile) {
     // If already open, just focus it.  Must match both path AND the
     // originating session (terminalId) so that the same filename on
@@ -2023,7 +2099,9 @@ export function App() {
     setEditorTabs((current) => {
       const next = current.filter((t) => t.id !== id);
       if (activeEditorTabId === id) {
-        setActiveEditorTabId(next.length > 0 ? next[next.length - 1].id : null);
+        const fallback = next.length > 0 ? next[next.length - 1].id : null;
+        setActiveEditorTabId(fallback);
+        if (!fallback) setShowEditor(false);
       }
       return next;
     });
@@ -2393,6 +2471,11 @@ export function App() {
     if (folderInputRef.current) folderInputRef.current.value = '';
   }
 
+  function clearResourceDragOverlay() {
+    resourceDragDepthRef.current = 0;
+    setIsDragOver(false);
+  }
+
   function handleDragOver(event: React.DragEvent) {
     if (leftActivity !== 'files' || isUploading) return;
     // Must preventDefault on dragover to allow drop and clear the forbidden cursor.
@@ -2401,16 +2484,25 @@ export function App() {
     if (!isDragOver) setIsDragOver(true);
   }
 
+  function handleDragEnter(event: React.DragEvent) {
+    if (leftActivity !== 'files' || isUploading) return;
+    event.preventDefault();
+    resourceDragDepthRef.current += 1;
+    setIsDragOver(true);
+  }
+
   function handleDragLeave(event: React.DragEvent) {
-    // Only clear when leaving the panel entirely (not when moving between children).
-    if (event.currentTarget === event.target) {
-      setIsDragOver(false);
-    }
+    if (leftActivity !== 'files') return;
+    // 进入子节点时 relatedTarget 仍在面板内，不清理
+    const related = event.relatedTarget as Node | null;
+    if (related && event.currentTarget.contains(related)) return;
+    resourceDragDepthRef.current = Math.max(0, resourceDragDepthRef.current - 1);
+    if (resourceDragDepthRef.current === 0) setIsDragOver(false);
   }
 
   async function handleDrop(event: React.DragEvent) {
     event.preventDefault();
-    setIsDragOver(false);
+    clearResourceDragOverlay();
 
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
@@ -4312,6 +4404,20 @@ export function App() {
     }
   }
 
+  async function selectAiProviderAccountInChat(accountId: string) {
+    const nextId = accountId.trim();
+    if (!nextId || !aiProviderConfig || isAiGenerating || isAiConfigSaving) return;
+    const currentId = (aiProviderConfig.account_id || aiProviderConfig.active_account_id || '').trim();
+    if (nextId === currentId) return;
+    setAiConfigError('');
+    try {
+      const config = await setActiveAiProviderAccount(nextId);
+      applyAiProviderConfigState(config);
+    } catch (error) {
+      setAiConfigError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   async function selectAiModel(model: string) {
     const nextModel = model.trim();
     if (!nextModel || !aiProviderConfig || isAiGenerating || isAiConfigSaving) return;
@@ -5536,6 +5642,7 @@ export function App() {
         }
       } else if (candidate && !candidate.active) {
         setActiveTabId(tabId);
+        setShowEditor(false);
       }
       terminalPointerDragRef.current = null;
       document.body.classList.remove('terminal-tab-dragging');
@@ -5768,16 +5875,18 @@ export function App() {
             for (const tabId of paneTabIds) terminalPaneRefs.current.delete(tabId);
           }
         }}
-        className={`${isActivePane ? 'terminal-split-pane active' : 'terminal-split-pane'}${getPaneDropClass(node.tabId)}`}
+        className={`${isActivePane ? 'terminal-split-pane active' : 'terminal-split-pane'}${showEditor && isActivePane ? ' is-editor' : ''}${getPaneDropClass(node.tabId)}`}
         onMouseDown={(event) => {
           if ((event.target as HTMLElement | null)?.closest('.terminal-pane-tabbar')) return;
+          if (showEditor) return;
           focusTerminalPane(node.tabId);
         }}
       >
         {getPaneDropPreview(node.tabId)}
         <div className="terminal-pane-tabbar" onDoubleClick={(event) => {
           if ((event.target as HTMLElement).closest('.terminal-pane-tab, .terminal-pane-tab-add')) return;
-          openConnectionManagerForPane(node.tabId);
+          // 双击空白：新建编辑器；仅 + 打开连接管理
+          createUntitledEditorTab();
         }}>
           <div className="terminal-pane-tabs">
             {paneTabs.map((tab) => (
@@ -5790,7 +5899,7 @@ export function App() {
                 role="tab"
                 tabIndex={0}
                 draggable={false}
-                className={tab.id === node.tabId ? 'terminal-pane-tab active' : 'terminal-pane-tab'}
+                className={(!showEditor && tab.id === node.tabId) ? 'terminal-pane-tab active' : 'terminal-pane-tab'}
                 onDragStart={(event) => event.preventDefault()}
                 onPointerDown={(event) => {
                   event.stopPropagation();
@@ -5798,6 +5907,7 @@ export function App() {
                 }}
                 onClick={(event) => {
                   event.stopPropagation();
+                  setShowEditor(false);
                   focusTerminalPane(tab.id);
                 }}
                 onDoubleClick={(event) => {
@@ -5818,16 +5928,49 @@ export function App() {
                 </button>
               </div>
             ))}
+            {isActivePane && editorTabs.map((tab) => {
+              const dirty = tab.content !== tab.originalContent;
+              const active = showEditor && activeEditorTabId === tab.id;
+              return (
+                <div
+                  key={tab.id}
+                  role="tab"
+                  tabIndex={0}
+                  draggable={false}
+                  className={`terminal-pane-tab is-editor${active ? ' active' : ''}`}
+                  title={tab.isUntitled ? '未保存的空白文件' : tab.path}
+                  onDragStart={(event) => event.preventDefault()}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    selectEditorWorkspaceTab(tab.id);
+                  }}
+                >
+                  <FileText size={13} />
+                  <span className="terminal-pane-tab-title">{editorTabLabel(tab, editorTabs)}</span>
+                  {dirty && <span className="terminal-pane-tab-dirty" aria-hidden>•</span>}
+                  <button
+                    className="terminal-pane-tab-close"
+                    title="关闭"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      closeEditorTab(tab.id);
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
             <button
               className="terminal-pane-tab-add"
-              title="在当前 pane 新建 tab"
+              title="新建连接"
               onClick={(event) => { event.stopPropagation(); openConnectionManagerForPane(node.tabId); }}
             >
               <Plus size={13} />
             </button>
           </div>
         </div>
-        {paneTab.status === 'failed' ? (
+        {paneTab.status === 'failed' && !showEditor ? (
           <div className="terminal-connection-state is-error">
             <Server size={24} />
             <h2>连接失败</h2>
@@ -5851,10 +5994,25 @@ export function App() {
                 onPasteCapture={(event) => handleTerminalPasteEvent(event, tab.id)}
               />
             ))}
-            {(paneTab.status === 'connecting' || paneTab.status === 'reconnecting') && (
+            {(paneTab.status === 'connecting' || paneTab.status === 'reconnecting') && !showEditor && (
               <div className="terminal-connection-overlay">
                 <RefreshCw size={18} className="spin" />
                 <span>{paneTab.statusMessage || '等待终端就绪...'}</span>
+              </div>
+            )}
+            {isActivePane && (
+              <div className={`terminal-pane-editor-host${showEditor ? '' : ' is-hidden'}`}>
+                <EditorPanel
+                  tabs={editorTabs}
+                  activeTabId={activeEditorTabId}
+                  onSelectTab={selectEditorWorkspaceTab}
+                  onCloseTab={closeEditorTab}
+                  onSave={saveEditorFile}
+                  onContentChange={updateEditorContent}
+                  onCreateUntitled={createUntitledEditorTab}
+                  showTabBar={false}
+                  visible={showEditor}
+                />
               </div>
             )}
           </>
@@ -5866,9 +6024,9 @@ export function App() {
   return (
     <main className="ssh-workbench" onDragOver={handleGlobalDragOver} onDrop={handleGlobalDrop}>
       <TopMenubar
-        sessionName={activeSession?.name ?? ''}
-        sessionUser={activeSession?.username ?? ''}
-        sessionHost={activeSession?.host ?? ''}
+        sessionName={topStatusName}
+        sessionUser={topStatusUser}
+        sessionHost={topStatusHost}
         onOpenConnectionCreate={() => {
           void openConnectionWindow('create');
         }}
@@ -5930,6 +6088,7 @@ export function App() {
           style={{ gridTemplateRows: '42px auto minmax(0, 1fr)' }}
           tabIndex={0}
           onKeyDown={handleResourceKeyDown}
+          onDragEnter={handleDragEnter}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={(e) => void handleDrop(e)}
@@ -6706,7 +6865,7 @@ export function App() {
                         : contextUsage.percent >= 70
                           ? 'warn'
                           : 'ok';
-                      const toggleComposerMenu = (menu: 'mode' | 'model' | 'effort' | 'context', trigger: HTMLButtonElement) => {
+                      const toggleComposerMenu = (menu: 'mode' | 'provider' | 'model' | 'effort' | 'context', trigger: HTMLButtonElement) => {
                         if (aiComposerMenu === menu) {
                           setAiComposerMenu(null);
                           setAiComposerMenuAnchor(null);
@@ -6719,13 +6878,31 @@ export function App() {
                         setAiComposerMenu(null);
                         setAiComposerMenuAnchor(null);
                       };
+                      const providerAccounts = aiProviderConfig?.accounts?.length
+                        ? aiProviderConfig.accounts
+                        : (aiProviderConfig
+                          ? [{
+                            id: aiProviderConfig.account_id || aiProviderConfig.active_account_id || 'default',
+                            name: aiProviderConfig.account_name || '默认',
+                            base_url: aiProviderConfig.base_url,
+                            model: aiProviderConfig.model,
+                            api_format: String(aiProviderConfig.api_format || 'openai'),
+                            api_key_configured: aiProviderConfig.api_key_configured,
+                          }]
+                          : []);
+                      const activeProviderId = (aiProviderConfig?.account_id || aiProviderConfig?.active_account_id || '').trim();
+                      const activeProviderName = (aiProviderConfig?.account_name || '').trim()
+                        || providerAccounts.find((item) => item.id === activeProviderId)?.name
+                        || '供应商';
                       const composerMenuMinWidth = aiComposerMenu === 'model'
                         ? 220
-                        : aiComposerMenu === 'effort'
+                        : aiComposerMenu === 'provider'
                           ? 200
-                          : aiComposerMenu === 'context'
-                            ? 240
-                            : 188;
+                          : aiComposerMenu === 'effort'
+                            ? 200
+                            : aiComposerMenu === 'context'
+                              ? 240
+                              : 188;
                       const composerPopoverStyle = aiComposerMenuAnchor
                         ? {
                             left: clampFloatingMenuLeft(aiComposerMenuAnchor.left, composerMenuMinWidth),
@@ -6793,68 +6970,140 @@ export function App() {
                             )}
                           </div>
                           {aiProviderConfig ? (
-                            <div className="ai-composer-menu ai-composer-menu-model">
-                              <button
-                                type="button"
-                                className={`ai-composer-trigger muted${aiComposerMenu === 'model' ? ' open' : ''}`}
-                                aria-label="AI 模型"
-                                aria-haspopup="listbox"
-                                aria-expanded={aiComposerMenu === 'model'}
-                                title="选择模型"
-                                disabled={isAiGenerating || isAiConfigSaving || Boolean(aiProviderConfig.error)}
-                                onClick={(event) => toggleComposerMenu('model', event.currentTarget)}
-                              >
-                                <span>{aiProviderConfig.model}</span>
-                                <ChevronDown size={12} aria-hidden />
-                              </button>
-                              {aiComposerMenu === 'model' && aiComposerMenuAnchor && createPortal(
-                                <div
-                                  className="ai-composer-popover model"
-                                  role="listbox"
-                                  aria-label="选择模型"
-                                  style={composerPopoverStyle}
+                            <>
+                              <div className="ai-composer-menu ai-composer-menu-provider">
+                                <button
+                                  type="button"
+                                  className={`ai-composer-trigger muted${aiComposerMenu === 'provider' ? ' open' : ''}`}
+                                  aria-label="AI 供应商"
+                                  aria-haspopup="listbox"
+                                  aria-expanded={aiComposerMenu === 'provider'}
+                                  title="选择供应商"
+                                  disabled={isAiGenerating || isAiConfigSaving || Boolean(aiProviderConfig.error)}
+                                  onClick={(event) => toggleComposerMenu('provider', event.currentTarget)}
                                 >
-                                  <div className="ai-composer-popover-label">模型</div>
-                                  {modelOptions.map((model) => {
-                                    const selected = model === aiProviderConfig.model;
-                                    return (
+                                  <span>{activeProviderName}</span>
+                                  <ChevronDown size={12} aria-hidden />
+                                </button>
+                                {aiComposerMenu === 'provider' && aiComposerMenuAnchor && createPortal(
+                                  <div
+                                    className="ai-composer-popover provider"
+                                    role="listbox"
+                                    aria-label="选择供应商"
+                                    style={composerPopoverStyle}
+                                  >
+                                    <div className="ai-composer-popover-label">供应商</div>
+                                    {providerAccounts.map((account) => {
+                                      const selected = account.id === activeProviderId;
+                                      return (
+                                        <button
+                                          type="button"
+                                          key={account.id}
+                                          role="option"
+                                          aria-selected={selected}
+                                          className={selected ? 'active' : undefined}
+                                          onClick={() => {
+                                            void selectAiProviderAccountInChat(account.id);
+                                            closeComposerMenu();
+                                          }}
+                                        >
+                                          <span className="ai-composer-option-text">
+                                            <strong>{account.name || '未命名'}</strong>
+                                            <em>
+                                              {account.model || '未选模型'}
+                                              {account.api_key_configured ? '' : ' · 未配置密钥'}
+                                            </em>
+                                          </span>
+                                          <span className="ai-composer-option-check">
+                                            {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
+                                          </span>
+                                        </button>
+                                      );
+                                    })}
+                                    <div className="ai-composer-popover-footer">
                                       <button
                                         type="button"
-                                        key={model}
-                                        role="option"
-                                        aria-selected={selected}
-                                        className={selected ? 'active' : undefined}
+                                        className="ai-composer-popover-action"
                                         onClick={() => {
-                                          void selectAiModel(model);
                                           closeComposerMenu();
+                                          openAiSettings();
                                         }}
                                       >
-                                        <span className="ai-composer-option-text single">
-                                          <strong>{model}</strong>
-                                        </span>
-                                        <span className="ai-composer-option-check">
-                                          {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
-                                        </span>
+                                        <Settings size={12} aria-hidden />
+                                        管理供应商…
                                       </button>
-                                    );
-                                  })}
-                                  <div className="ai-composer-popover-footer">
-                                    <button
-                                      type="button"
-                                      className="ai-composer-popover-action"
-                                      onClick={() => {
-                                        closeComposerMenu();
-                                        openAiSettings();
-                                      }}
-                                    >
-                                      <Settings size={12} aria-hidden />
-                                      管理模型…
-                                    </button>
-                                  </div>
-                                </div>,
-                                document.body,
-                              )}
-                            </div>
+                                    </div>
+                                  </div>,
+                                  document.body,
+                                )}
+                              </div>
+                              <div className="ai-composer-menu ai-composer-menu-model">
+                                <button
+                                  type="button"
+                                  className={`ai-composer-trigger muted${aiComposerMenu === 'model' ? ' open' : ''}`}
+                                  aria-label="AI 模型"
+                                  aria-haspopup="listbox"
+                                  aria-expanded={aiComposerMenu === 'model'}
+                                  title={`${activeProviderName} · 选择模型`}
+                                  disabled={isAiGenerating || isAiConfigSaving || Boolean(aiProviderConfig.error)}
+                                  onClick={(event) => toggleComposerMenu('model', event.currentTarget)}
+                                >
+                                  <span>{aiProviderConfig.model}</span>
+                                  <ChevronDown size={12} aria-hidden />
+                                </button>
+                                {aiComposerMenu === 'model' && aiComposerMenuAnchor && createPortal(
+                                  <div
+                                    className="ai-composer-popover model"
+                                    role="listbox"
+                                    aria-label="选择模型"
+                                    style={composerPopoverStyle}
+                                  >
+                                    <div className="ai-composer-popover-label">
+                                      模型 · {activeProviderName}
+                                    </div>
+                                    {modelOptions.length === 0 ? (
+                                      <div className="ai-composer-popover-empty">当前供应商暂无可用模型</div>
+                                    ) : modelOptions.map((model) => {
+                                      const selected = model === aiProviderConfig.model;
+                                      return (
+                                        <button
+                                          type="button"
+                                          key={model}
+                                          role="option"
+                                          aria-selected={selected}
+                                          className={selected ? 'active' : undefined}
+                                          onClick={() => {
+                                            void selectAiModel(model);
+                                            closeComposerMenu();
+                                          }}
+                                        >
+                                          <span className="ai-composer-option-text single">
+                                            <strong>{model}</strong>
+                                          </span>
+                                          <span className="ai-composer-option-check">
+                                            {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
+                                          </span>
+                                        </button>
+                                      );
+                                    })}
+                                    <div className="ai-composer-popover-footer">
+                                      <button
+                                        type="button"
+                                        className="ai-composer-popover-action"
+                                        onClick={() => {
+                                          closeComposerMenu();
+                                          openAiSettings();
+                                        }}
+                                      >
+                                        <Settings size={12} aria-hidden />
+                                        管理模型…
+                                      </button>
+                                    </div>
+                                  </div>,
+                                  document.body,
+                                )}
+                              </div>
+                            </>
                           ) : (
                             <button type="button" className="ai-model-label is-action" onClick={() => openAiSettings()}>
                               尚未配置模型
@@ -7102,13 +7351,30 @@ export function App() {
         />
 
         <section
-          className={`terminal-panel${activeTab?.kind === 'terminal' ? ' terminal-panel-terminal-only' : ''}${activeTab?.kind !== 'terminal' && tabs.filter((tab) => !tab.parentTabId && tab.session.id !== localSession.id).length === 0 ? ' terminal-panel-no-tabs' : ''}`}
+          className={`terminal-panel${activeTab?.kind === 'terminal' ? ' terminal-panel-terminal-only' : ''}`}
         >
-          {activeTab?.kind !== 'terminal' && tabs.filter((tab) => !tab.parentTabId && tab.session.id !== localSession.id).length > 0 && (
-            <div className="workspace-tabs" ref={workspaceTabsRef} onDoubleClick={(event) => {
-              if ((event.target as HTMLElement).closest('.workspace-tab, .workspace-tab-add')) return;
-              openNewConnectionTab();
-            }}>
+          {/* 非终端工作区顶栏：会话 + 编辑器共用；双击空白建编辑，+ 开连接 */}
+          {activeTab?.kind !== 'terminal' && (
+            <div
+              className="workspace-tabs"
+              ref={workspaceTabsRef}
+              title="双击空白处新建空白编辑器"
+              onWheel={(event) => {
+                const el = event.currentTarget;
+                if (el.scrollWidth <= el.clientWidth) return;
+                const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+                if (delta === 0) return;
+                const max = el.scrollWidth - el.clientWidth;
+                const next = Math.max(0, Math.min(max, el.scrollLeft + delta));
+                if (next === el.scrollLeft) return;
+                event.preventDefault();
+                el.scrollLeft = next;
+              }}
+              onDoubleClick={(event) => {
+                if ((event.target as HTMLElement).closest('.workspace-tab, .workspace-tab-add')) return;
+                createUntitledEditorTab();
+              }}
+            >
               {tabs.filter((tab) => !tab.parentTabId && tab.session.id !== localSession.id).map((tab) => (
                 <div
                   key={tab.id}
@@ -7126,7 +7392,8 @@ export function App() {
                   onPointerDown={(event) => {
                     if (tab.kind === 'terminal') startTabPointerDrag(tab.id, event);
                   }}
-                  className={`${activeTabId === tab.id ? 'workspace-tab active' : 'workspace-tab'}${getWorkspaceTabDropClass(tab.id)}`}
+                  onClick={() => selectSessionWorkspaceTab(tab.id)}
+                  className={`${!showEditor && activeTabId === tab.id ? 'workspace-tab active' : 'workspace-tab'}${getWorkspaceTabDropClass(tab.id)}`}
                 >
                   {tab.kind === 'terminal' ? <TerminalSquare size={15} /> : <FolderOpen size={15} />}
                   <span className={`workspace-tab-state ${tab.status}`} />
@@ -7142,6 +7409,35 @@ export function App() {
                   </button>
                 </div>
               ))}
+              {editorTabs.map((tab) => {
+                const dirty = tab.content !== tab.originalContent;
+                const active = showEditor && activeEditorTabId === tab.id;
+                return (
+                  <div
+                    key={tab.id}
+                    role="tab"
+                    tabIndex={0}
+                    draggable={false}
+                    className={`workspace-tab is-editor${active ? ' active' : ''}`}
+                    title={tab.isUntitled ? '未保存的空白文件' : tab.path}
+                    onDragStart={(event) => event.preventDefault()}
+                    onClick={() => selectEditorWorkspaceTab(tab.id)}
+                  >
+                    <FileText size={15} />
+                    <span>{editorTabLabel(tab, editorTabs)}</span>
+                    {dirty && <span className="workspace-tab-dirty" aria-hidden>•</span>}
+                    <button
+                      className="workspace-tab-close"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        closeEditorTab(tab.id);
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                );
+              })}
               <button className="workspace-tab-add" title="新建连接" onClick={openNewConnectionTab}>
                 <Plus size={16} />
               </button>
@@ -7149,38 +7445,23 @@ export function App() {
           )}
 
           <div className="workspace-body">
-            {activeTab && (showEditor || editorTabs.length > 0) && (
-              <div className="workspace-view-toggle">
-                <button
-                  className={!showEditor ? 'active' : ''}
-                  onClick={() => setShowEditor(false)}
-                >
-                  {activeTab.kind === 'terminal' ? <TerminalSquare size={14} /> : <FolderOpen size={14} />}
-                  {activeTab.kind === 'terminal' ? '终端' : '资源'}
-                </button>
-                <button
-                  className={showEditor ? 'active' : ''}
-                  onClick={() => setShowEditor(true)}
-                >
-                  <FileText size={14} /> 编辑器
-                  {editorTabs.length > 0 && <span className="view-toggle-badge">{editorTabs.length}</span>}
-                </button>
-              </div>
-            )}
-            {showEditor ? (
+            {/* 无终端会话时：编辑器占满主区；有终端时编辑嵌在 pane 内 */}
+            {showEditor && (!activeTab || activeTab.kind !== 'terminal') ? (
               <EditorPanel
                 tabs={editorTabs}
                 activeTabId={activeEditorTabId}
-                onSelectTab={setActiveEditorTabId}
+                onSelectTab={selectEditorWorkspaceTab}
                 onCloseTab={closeEditorTab}
                 onSave={saveEditorFile}
                 onContentChange={updateEditorContent}
                 onCreateUntitled={createUntitledEditorTab}
+                showTabBar={false}
+                visible={showEditor}
               />
             ) : !activeTab ? (
               <div className="empty-workspace">
                 <h2>没有活动标签页</h2>
-                <p>点击下方按钮新建连接。</p>
+                <p>双击标签栏空白新建编辑器，或点 + 打开连接管理。</p>
                 <button className="empty-primary-action" onClick={openNewConnectionTab}>
                   <Plus size={17} />
                   <span>新建连接</span>
@@ -7707,7 +7988,7 @@ export function App() {
 
                           <label className="ai-settings-row ai-settings-row-inline">
                             <div className="ai-settings-row-copy">
-                              <span>账号名称</span>
+                              <span>供应商名称</span>
                             </div>
                             <input
                               className="ai-settings-input ai-settings-input-inline"

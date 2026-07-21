@@ -77,7 +77,13 @@ function formatLoadingBytes(bytes: number): string {
 }
 
 function tabModelUri(tabId: string): monaco.Uri {
-  return monaco.Uri.parse(`pandaterm-tab:///${encodeURIComponent(tabId)}`);
+  // tabId 常含绝对路径（/home/...、C:\...）。
+  // scheme:/// + encode(id) 在 decode 后 path 会变成 //...，无 authority 时 Monaco 直接抛 UriError。
+  return monaco.Uri.from({
+    scheme: 'pandaterm-tab',
+    authority: 'model',
+    path: `/${encodeURIComponent(tabId)}`,
+  });
 }
 
 function saveEditorViewState(

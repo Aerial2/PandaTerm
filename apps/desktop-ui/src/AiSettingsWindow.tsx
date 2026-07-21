@@ -1159,7 +1159,7 @@ export function AiSettingsWindow() {
 
                           <label className="ai-settings-row ai-settings-row-inline">
                             <div className="ai-settings-row-copy">
-                              <span>账号名称</span>
+                              <span>供应商名称</span>
                             </div>
                             <input
                               className="ai-settings-input ai-settings-input-inline"
