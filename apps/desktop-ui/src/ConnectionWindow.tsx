@@ -24,9 +24,17 @@ import {
   writeClipboardText,
 } from './api';
 import type { CredentialStatus, Session, AuthType } from './api';
+import { SelectDropdown, type SelectOption } from './SelectDropdown';
 import './styles.css';
 
 type ConnectionAuthMethod = 'password' | 'public_key' | 'keyboard_interactive' | 'gssapi';
+
+const AUTH_METHOD_OPTIONS: readonly SelectOption<ConnectionAuthMethod>[] = [
+  { value: 'password', label: 'Password', description: '密码登录' },
+  { value: 'public_key', label: 'Public Key', description: '私钥文件' },
+  { value: 'keyboard_interactive', label: 'Keyboard Interactive', description: '交互式认证' },
+  { value: 'gssapi', label: 'GSSAPI', description: 'Kerberos / SSPI' },
+];
 
 type ConnectionFormState = {
   name: string;
@@ -778,36 +786,31 @@ export function ConnectionWindow() {
               </label>
               <label className="connection-form-wide">
                 <span>认证方式</span>
-                <select
+                <SelectDropdown
                   value={connectionAuthMethod}
-                  onChange={(event) => {
-                    setConnectionAuthMethod(event.target.value as ConnectionAuthMethod);
+                  options={AUTH_METHOD_OPTIONS}
+                  aria-label="认证方式"
+                  onChange={(next) => {
+                    setConnectionAuthMethod(next);
                     setConnectionFormError('');
                   }}
-                >
-                  <option value="password">Password</option>
-                  <option value="public_key">Public Key</option>
-                  <option value="keyboard_interactive">Keyboard Interactive</option>
-                  <option value="gssapi">GSSAPI</option>
-                </select>
+                />
               </label>
 
               {connectionAuthMethod === 'password' && (
-                <div className="connection-form-wide connection-auth-fields">
-                  <label>
-                    <span>密码</span>
-                    <input
-                      type="password"
-                      value={connectionForm.password}
-                      placeholder={editingId ? '留空则保留已保存密码' : '输入 SSH 登录密码'}
-                      onChange={(event) => updateConnectionForm('password', event.target.value)}
-                    />
-                  </label>
-                </div>
+                <label className="connection-form-wide">
+                  <span>密码</span>
+                  <input
+                    type="password"
+                    value={connectionForm.password}
+                    placeholder={editingId ? '留空则保留已保存密码' : '输入 SSH 登录密码'}
+                    onChange={(event) => updateConnectionForm('password', event.target.value)}
+                  />
+                </label>
               )}
 
               {connectionAuthMethod === 'public_key' && (
-                <div className="connection-form-wide connection-auth-fields">
+                <>
                   <label>
                     <span>私钥路径</span>
                     <input
@@ -825,34 +828,30 @@ export function ConnectionWindow() {
                       onChange={(event) => updateConnectionForm('privateKeyPassphrase', event.target.value)}
                     />
                   </label>
-                </div>
+                </>
               )}
 
               {connectionAuthMethod === 'keyboard_interactive' && (
-                <div className="connection-form-wide connection-auth-fields">
-                  <label>
-                    <span>交互提示响应</span>
-                    <input
-                      type="password"
-                      value={connectionForm.keyboardInteractiveResponse}
-                      placeholder={editingId ? '留空则保留已保存响应' : '用于 Keyboard Interactive 的默认响应'}
-                      onChange={(event) => updateConnectionForm('keyboardInteractiveResponse', event.target.value)}
-                    />
-                  </label>
-                </div>
+                <label className="connection-form-wide">
+                  <span>交互提示响应</span>
+                  <input
+                    type="password"
+                    value={connectionForm.keyboardInteractiveResponse}
+                    placeholder={editingId ? '留空则保留已保存响应' : '用于 Keyboard Interactive 的默认响应'}
+                    onChange={(event) => updateConnectionForm('keyboardInteractiveResponse', event.target.value)}
+                  />
+                </label>
               )}
 
               {connectionAuthMethod === 'gssapi' && (
-                <div className="connection-form-wide connection-auth-fields">
-                  <label>
-                    <span>GSSAPI Principal</span>
-                    <input
-                      value={connectionForm.gssapiPrincipal}
-                      placeholder="例如：user@REALM.COM，可留空使用当前身份"
-                      onChange={(event) => updateConnectionForm('gssapiPrincipal', event.target.value)}
-                    />
-                  </label>
-                </div>
+                <label className="connection-form-wide">
+                  <span>GSSAPI Principal</span>
+                  <input
+                    value={connectionForm.gssapiPrincipal}
+                    placeholder="例如：user@REALM.COM，可留空使用当前身份"
+                    onChange={(event) => updateConnectionForm('gssapiPrincipal', event.target.value)}
+                  />
+                </label>
               )}
             </div>
             <footer className="connection-panel-actions">

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { emitTo, listen } from '@tauri-apps/api/event';
 import {
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Cpu,
   Download,
@@ -22,6 +23,10 @@ import {
   getAiProviderConfig,
   saveAiProviderConfig,
   syncAiProviderModels,
+  testAiProvider,
+  addAiProviderAccount,
+  deleteAiProviderAccount,
+  setActiveAiProviderAccount,
   getMcpConfig,
   saveMcpConfig,
   reconnectMcpServer,
@@ -46,6 +51,8 @@ import {
 import {
   type AiConfigDraft,
   type AiSettingsTab,
+  AI_API_FORMAT_OPTIONS,
+  DEFAULT_AI_CONFIG_DRAFT,
   createEmptyMcpServer,
   countEnabledMcpTools,
   formatMcpServerCommandLine,
@@ -58,12 +65,17 @@ import {
   mcpServerAvatarLetter,
   mcpServerStatusDot,
   mcpStatusLabel,
-  normalizeAiReasoningEffort,
+  normalizeAiApiFormat,
   parseMcpServerJsonText,
   resolveAiModelCatalog,
+  resolveAiTestModel,
+  buildAiProviderTestLog,
+  aiConfigToDraft,
+  aiConfigToProviderState,
   snapshotToMcpDraft,
   toggleMcpToolDisabled,
 } from './aiSettingsModel';
+import { SelectDropdown } from './SelectDropdown';
 import './styles.css';
 
 const initialTab: AiSettingsTab = new URLSearchParams(window.location.search).get('tab') === 'mcp' ? 'mcp' : 'models';
@@ -86,17 +98,21 @@ export function AiSettingsWindow() {
   const [aiSettingsTab, setAiSettingsTab] = useState<AiSettingsTab>(initialTab);
   const [aiSettingsNavQuery, setAiSettingsNavQuery] = useState('');
   const [aiModelListQuery, setAiModelListQuery] = useState('');
+  const [aiSettingsApiKeysOpen, setAiSettingsApiKeysOpen] = useState(true);
   const [aiProviderConfig, setAiProviderConfig] = useState<AiProviderConfig | null>(null);
   const [aiConfigDraft, setAiConfigDraft] = useState<AiConfigDraft>({
-    base_url: 'https://api.openai.com/v1',
-    model: 'gpt-4o-mini',
-    models: ['gpt-4o-mini'],
-    enabled_models: ['gpt-4o-mini'],
-    use_api_key: true,
+    ...DEFAULT_AI_CONFIG_DRAFT,
   });
   const [isAiConfigLoading, setIsAiConfigLoading] = useState(false);
   const [isAiConfigSaving, setIsAiConfigSaving] = useState(false);
   const [isAiModelsSyncing, setIsAiModelsSyncing] = useState(false);
+  const [aiTestModel, setAiTestModel] = useState('');
+  const [isAiProviderTesting, setIsAiProviderTesting] = useState(false);
+  const [aiProviderTestDialog, setAiProviderTestDialog] = useState<{
+    open: boolean;
+    lines: string[];
+    status: 'idle' | 'running' | 'done' | 'error';
+  }>({ open: false, lines: [], status: 'idle' });
   const [aiConfigError, setAiConfigError] = useState('');
   const [isAiApiKeyVisible, setIsAiApiKeyVisible] = useState(false);
   const [aiApiKeyDraft, setAiApiKeyDraft] = useState('');
@@ -128,23 +144,35 @@ export function AiSettingsWindow() {
 
   function applyAiProviderConfigState(config: AiProviderConfig) {
     const catalog = resolveAiModelCatalog(config);
-    setAiProviderConfig({
-      base_url: config.base_url,
-      model: catalog.model,
-      models: catalog.models,
-      enabled_models: catalog.enabled_models,
-      reasoning_effort: normalizeAiReasoningEffort(config.reasoning_effort),
-      use_api_key: config.use_api_key,
-      api_key_configured: config.api_key_configured,
-      api_key: null,
-      error: config.error,
-    });
-    setAiConfigDraft({
-      base_url: config.base_url,
-      model: catalog.model,
-      models: catalog.models,
-      enabled_models: catalog.enabled_models,
-      use_api_key: config.use_api_key,
+    setAiProviderConfig(aiConfigToProviderState(config));
+    setAiConfigDraft(aiConfigToDraft(config));
+    setAiTestModel((current) => resolveAiTestModel(catalog.models, current, catalog.model));
+  }
+
+  function fillAiApiKeyFromConfig(config: AiProviderConfig) {
+    const revealed = config.api_key?.trim() ?? '';
+    aiApiKeyBaselineRef.current = revealed;
+    setAiApiKeyDraft(revealed);
+    setIsAiApiKeyVisible(false);
+  }
+
+  function withAiAccountSwitchGuard(action: () => void | Promise<void>) {
+    const dirty = isAiConfigDraftDirty(
+      aiConfigDraft,
+      aiApiKeyDraft,
+      aiApiKeyBaselineRef.current,
+      aiProviderConfig,
+    );
+    if (!dirty) {
+      void action();
+      return;
+    }
+    setConfirmDialog({
+      title: '放弃未保存的更改？',
+      message: '当前账号有未保存的改动。切换后将丢失这些草稿。',
+      confirmLabel: '放弃并继续',
+      danger: true,
+      onConfirm: () => { void action(); },
     });
   }
 
@@ -155,29 +183,9 @@ export function AiSettingsWindow() {
     try {
       const config = await getAiProviderConfig();
       if (generation !== aiConfigRefreshGenerationRef.current) return;
-      const catalog = resolveAiModelCatalog(config);
-      setAiProviderConfig({
-        base_url: config.base_url,
-        model: catalog.model,
-        models: catalog.models,
-        enabled_models: catalog.enabled_models,
-        reasoning_effort: normalizeAiReasoningEffort(config.reasoning_effort),
-        use_api_key: config.use_api_key,
-        api_key_configured: config.api_key_configured,
-        api_key: null,
-        error: config.error,
-      });
-      setAiConfigDraft({
-        base_url: config.base_url,
-        model: catalog.model,
-        models: catalog.models,
-        enabled_models: catalog.enabled_models,
-        use_api_key: config.use_api_key,
-      });
-      const revealed = config.api_key?.trim() ?? '';
-      aiApiKeyBaselineRef.current = revealed;
-      setAiApiKeyDraft(revealed);
-      if (config.api_key_configured && !revealed && !config.error) {
+      applyAiProviderConfigState(config);
+      fillAiApiKeyFromConfig(config);
+      if (config.api_key_configured && !(config.api_key?.trim()) && !config.error) {
         setAiConfigError('已配置密钥，但当前进程未能解密回填。请完全重启 PandaTerm 后再打开设置。');
       }
       if (config.error) setAiConfigError(config.error);
@@ -187,6 +195,80 @@ export function AiSettingsWindow() {
     } finally {
       if (generation === aiConfigRefreshGenerationRef.current) setIsAiConfigLoading(false);
     }
+  }
+
+  async function addAiAccount() {
+    if (isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || isAiProviderTesting) return;
+    withAiAccountSwitchGuard(async () => {
+      setIsAiConfigLoading(true);
+      setAiConfigError('');
+      try {
+        const config = await addAiProviderAccount();
+        applyAiProviderConfigState(config);
+        fillAiApiKeyFromConfig(config);
+        setAiSettingsApiKeysOpen(true);
+        void emitTo('main', 'ai-provider-config-changed');
+      } catch (error) {
+        setAiConfigError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setIsAiConfigLoading(false);
+      }
+    });
+  }
+
+  async function switchAiAccount(accountId: string) {
+    const nextId = accountId.trim();
+    if (!nextId || nextId === (aiConfigDraft.account_id || '').trim()) return;
+    if (isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || isAiProviderTesting) return;
+    withAiAccountSwitchGuard(async () => {
+      setIsAiConfigLoading(true);
+      setAiConfigError('');
+      try {
+        const config = await setActiveAiProviderAccount(nextId);
+        applyAiProviderConfigState(config);
+        fillAiApiKeyFromConfig(config);
+        if (config.api_key_configured && !(config.api_key?.trim()) && !config.error) {
+          setAiConfigError('已配置密钥，但当前进程未能解密回填。请完全重启 PandaTerm 后再打开设置。');
+        }
+        void emitTo('main', 'ai-provider-config-changed');
+      } catch (error) {
+        setAiConfigError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setIsAiConfigLoading(false);
+      }
+    });
+  }
+
+  async function removeAiAccount(accountId: string) {
+    const targetId = accountId.trim();
+    if (!targetId) return;
+    if ((aiProviderConfig?.accounts?.length ?? 0) <= 1) {
+      setAiConfigError('至少保留一个 AI 账号');
+      return;
+    }
+    if (isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || isAiProviderTesting) return;
+    setConfirmDialog({
+      title: '删除账号？',
+      message: '将删除该账号的接口与密钥配置，且不可恢复。',
+      confirmLabel: '删除',
+      danger: true,
+      onConfirm: () => {
+        void (async () => {
+          setIsAiConfigLoading(true);
+          setAiConfigError('');
+          try {
+            const config = await deleteAiProviderAccount(targetId);
+            applyAiProviderConfigState(config);
+            fillAiApiKeyFromConfig(config);
+            void emitTo('main', 'ai-provider-config-changed');
+          } catch (error) {
+            setAiConfigError(error instanceof Error ? error.message : String(error));
+          } finally {
+            setIsAiConfigLoading(false);
+          }
+        })();
+      },
+    });
   }
 
   async function refreshMcpConfig() {
@@ -226,7 +308,11 @@ export function AiSettingsWindow() {
   }
 
   function requestClose() {
-    if (isAiConfigSaving || isAiModelsSyncing || isMcpSaving || mcpBusyServerId) return;
+    if (isAiConfigSaving || isAiModelsSyncing || isAiProviderTesting || isMcpSaving || mcpBusyServerId) return;
+    if (aiProviderTestDialog.open) {
+      setAiProviderTestDialog({ open: false, lines: [], status: 'idle' });
+      return;
+    }
     const modelsDirty = isAiConfigDraftDirty(
       aiConfigDraft,
       aiApiKeyDraft,
@@ -299,11 +385,16 @@ export function AiSettingsWindow() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
+      if (aiProviderTestDialog.open) {
+        if (isAiProviderTesting) return;
+        setAiProviderTestDialog({ open: false, lines: [], status: 'idle' });
+        return;
+      }
       if (confirmDialog) {
         setConfirmDialog(null);
         return;
       }
-      if (isAiConfigSaving || isAiModelsSyncing || isMcpSaving || mcpBusyServerId) return;
+      if (isAiConfigSaving || isAiModelsSyncing || isAiProviderTesting || isMcpSaving || mcpBusyServerId) return;
       event.preventDefault();
       requestClose();
     };
@@ -674,12 +765,15 @@ export function AiSettingsWindow() {
     try {
       const catalog = resolveAiModelCatalog(aiConfigDraft);
       const config = await saveAiProviderConfig({
+        account_id: aiConfigDraft.account_id || undefined,
+        account_name: aiConfigDraft.account_name.trim() || '默认',
         base_url: aiConfigDraft.base_url,
         model: catalog.model,
         models: catalog.models,
         enabled_models: catalog.enabled_models,
         reasoning_effort: aiProviderConfig?.reasoning_effort ?? 'none',
-        use_api_key: aiConfigDraft.use_api_key,
+        api_format: aiConfigDraft.api_format,
+        use_api_key: true,
       }, apiKey);
       applyAiProviderConfigState(config);
       void emitTo('main', 'ai-provider-config-changed');
@@ -700,36 +794,35 @@ export function AiSettingsWindow() {
     setAiConfigError('');
     try {
       const config = await syncAiProviderModels({
+        account_id: aiConfigDraft.account_id || null,
         base_url: aiConfigDraft.base_url,
-        use_api_key: aiConfigDraft.use_api_key,
+        use_api_key: true,
         api_key: apiKey || null,
+        api_format: aiConfigDraft.api_format,
       });
       const catalog = resolveAiModelCatalog(config);
-      setAiProviderConfig({
-        base_url: config.base_url,
-        model: catalog.model,
+      const preferredModel = catalog.models.includes(aiConfigDraft.model) ? aiConfigDraft.model : catalog.model;
+      const nextCatalog = resolveAiModelCatalog({
+        model: preferredModel,
         models: catalog.models,
         enabled_models: catalog.enabled_models,
-        reasoning_effort: normalizeAiReasoningEffort(config.reasoning_effort),
-        use_api_key: config.use_api_key,
-        api_key_configured: config.api_key_configured,
-        api_key: null,
-        error: config.error,
       });
-      setAiConfigDraft((current) => {
-        const preferredModel = catalog.models.includes(current.model) ? current.model : catalog.model;
-        const next = resolveAiModelCatalog({
-          model: preferredModel,
-          models: catalog.models,
-          enabled_models: catalog.enabled_models,
-        });
-        return {
-          ...current,
-          models: next.models,
-          enabled_models: next.enabled_models,
-          model: next.model,
-        };
-      });
+      setAiProviderConfig(aiConfigToProviderState({
+        ...config,
+        model: nextCatalog.model,
+        models: nextCatalog.models,
+        enabled_models: nextCatalog.enabled_models,
+      }));
+      setAiConfigDraft((current) => ({
+        ...aiConfigToDraft({
+          ...config,
+          model: nextCatalog.model,
+          models: nextCatalog.models,
+          enabled_models: nextCatalog.enabled_models,
+        }),
+        account_name: current.account_name,
+      }));
+      setAiTestModel((current) => resolveAiTestModel(nextCatalog.models, current, nextCatalog.model));
       if (config.api_key) {
         const revealed = config.api_key.trim();
         aiApiKeyBaselineRef.current = revealed;
@@ -740,6 +833,70 @@ export function AiSettingsWindow() {
       setAiConfigError(error instanceof Error ? error.message : String(error));
     } finally {
       setIsAiModelsSyncing(false);
+    }
+  }
+
+  async function runAiProviderTest() {
+    if (isAiProviderTesting || isAiConfigSaving || isAiModelsSyncing) return;
+    const model = resolveAiTestModel(aiConfigDraft.models, aiTestModel, aiConfigDraft.model);
+    if (!model) {
+      setAiConfigError('请先选择或填写要测试的模型');
+      return;
+    }
+    if (!aiConfigDraft.base_url.trim()) {
+      setAiConfigError('请先填写接口地址');
+      return;
+    }
+    const baseUrl = aiConfigDraft.base_url.trim();
+    const apiFormat = aiConfigDraft.api_format;
+    setIsAiProviderTesting(true);
+    setAiConfigError('');
+    setAiProviderTestDialog({
+      open: true,
+      status: 'running',
+      lines: buildAiProviderTestLog({
+        phase: 'start',
+        model,
+        baseUrl,
+        apiFormat,
+      }),
+    });
+    try {
+      const result = await testAiProvider({
+        base_url: baseUrl,
+        model,
+        api_format: apiFormat,
+        use_api_key: true,
+        api_key: aiApiKeyDraft || null,
+      });
+      setAiProviderTestDialog({
+        open: true,
+        status: 'done',
+        lines: buildAiProviderTestLog({
+          phase: 'success',
+          model: result.model || model,
+          baseUrl: result.base_url || baseUrl,
+          apiFormat: result.api_format || apiFormat,
+          content: result.content,
+          ttftMs: result.ttft_ms,
+          totalMs: result.total_ms,
+        }),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setAiProviderTestDialog({
+        open: true,
+        status: 'error',
+        lines: buildAiProviderTestLog({
+          phase: 'error',
+          model,
+          baseUrl,
+          apiFormat,
+          error: message,
+        }),
+      });
+    } finally {
+      setIsAiProviderTesting(false);
     }
   }
 
@@ -824,114 +981,8 @@ export function AiSettingsWindow() {
                   }}
                 >
                   <div className="ai-settings-body">
-                    <section className="ai-settings-section">
-                      <div className="ai-settings-section-title">API Keys</div>
-
-                      <label className="ai-settings-row ai-settings-row-inline">
-                        <div className="ai-settings-row-copy">
-                          <span>Override OpenAI Base URL</span>
-                          <em>Domain or full base URL; backend appends /chat/completions and /models</em>
-                        </div>
-                        <input
-                          autoFocus
-                          className="ai-settings-input ai-settings-input-inline"
-                          value={aiConfigDraft.base_url}
-                          placeholder="https://api.openai.com/v1"
-                          spellCheck={false}
-                          disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
-                          onChange={(event) => setAiConfigDraft((current) => ({ ...current, base_url: event.target.value }))}
-                        />
-                      </label>
-
-                      <div className="ai-settings-divider" />
-
-                      <div className="ai-settings-row ai-settings-row-toggle">
-                        <div className="ai-settings-row-copy">
-                          <span>OpenAI API Key</span>
-                          <em>Bearer auth; stored locally in the credential vault</em>
-                        </div>
-                        <button
-                          type="button"
-                          role="switch"
-                          aria-checked={aiConfigDraft.use_api_key}
-                          className={`ai-settings-switch${aiConfigDraft.use_api_key ? ' on' : ''}`}
-                          disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
-                          onClick={() => setAiConfigDraft((current) => ({ ...current, use_api_key: !current.use_api_key }))}
-                        >
-                          <i />
-                        </button>
-                      </div>
-
-                      {aiConfigDraft.use_api_key && (
-                        <label className="ai-settings-row compact ai-settings-row-inline">
-                          <div className="ai-settings-row-copy">
-                            <span>Key</span>
-                            <em>{aiProviderConfig?.api_key_configured && !aiApiKeyDraft ? 'Configured in vault' : 'Paste provider key'}</em>
-                          </div>
-                          <div className="ai-settings-secret ai-settings-secret-inline">
-                            <input
-                              ref={aiApiKeyInputRef}
-                              type={isAiApiKeyVisible ? 'text' : 'password'}
-                              className="ai-settings-input"
-                              value={aiApiKeyDraft}
-                              placeholder={aiProviderConfig?.api_key_configured && !aiApiKeyDraft ? '••••••••' : 'sk-...'}
-                              autoComplete="off"
-                              spellCheck={false}
-                              disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
-                              onChange={(event) => setAiApiKeyDraft(event.target.value)}
-                            />
-                            <button
-                              type="button"
-                              className="ai-settings-secret-toggle"
-                              aria-label={isAiApiKeyVisible ? '隐藏密钥' : '显示密钥'}
-                              title={isAiApiKeyVisible ? '隐藏密钥' : '显示密钥'}
-                              disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
-                              onClick={() => setIsAiApiKeyVisible((current) => !current)}
-                            >
-                              {isAiApiKeyVisible
-                                ? <EyeOff size={15} aria-hidden />
-                                : <Eye size={15} aria-hidden />}
-                            </button>
-                          </div>
-                        </label>
-                      )}
-                    </section>
-
                     <section className="ai-settings-section ai-settings-section-models">
-                      <div className="ai-settings-section-title-row">
-                        <div className="ai-settings-section-title">Model Visibility</div>
-                        <button
-                          type="button"
-                          className="ai-settings-ghost-btn"
-                          title="从供应商同步 /models"
-                          disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error) || !aiConfigDraft.base_url.trim()}
-                          onClick={() => void syncAiModelsFromProvider()}
-                        >
-                          <RefreshCw size={14} className={isAiModelsSyncing ? 'spin' : undefined} aria-hidden />
-                          <span>{isAiModelsSyncing ? 'Syncing…' : 'Sync Models'}</span>
-                        </button>
-                      </div>
-
-                      <div className="ai-settings-model-list-block">
-                        <div className="ai-settings-row-copy ai-settings-list-hint">
-                          <span>Available Models</span>
-                          <em>
-                            {(() => {
-                              const catalog = resolveAiModelCatalog(aiConfigDraft);
-                              const query = aiModelListQuery.trim().toLowerCase();
-                              const visibleCount = query
-                                ? catalog.models.filter((model) => model.toLowerCase().includes(query)).length
-                                : catalog.models.length;
-                              const enabledCount = catalog.enabled_models.length;
-                              if (catalog.models.length === 0) {
-                                return 'Toggle visibility in chat · click name to set current';
-                              }
-                              return query
-                                ? `${visibleCount} of ${catalog.models.length} · ${enabledCount} enabled in chat`
-                                : `${catalog.models.length} models · ${enabledCount} enabled in chat`;
-                            })()}
-                          </em>
-                        </div>
+                      <div className="ai-settings-model-list-block ai-settings-model-list-block-solo">
                         <div className="ai-settings-model-filter">
                           <Search size={14} aria-hidden />
                           <input
@@ -955,6 +1006,15 @@ export function AiSettingsWindow() {
                               <X size={13} aria-hidden />
                             </button>
                           ) : null}
+                          <button
+                            type="button"
+                            className="ai-settings-model-filter-sync"
+                            title="Sync models from provider"
+                            disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error) || !aiConfigDraft.base_url.trim()}
+                            onClick={() => void syncAiModelsFromProvider()}
+                          >
+                            <RefreshCw size={14} className={isAiModelsSyncing ? 'spin' : undefined} aria-hidden />
+                          </button>
                         </div>
                         {(() => {
                           const catalog = resolveAiModelCatalog(aiConfigDraft);
@@ -964,13 +1024,13 @@ export function AiSettingsWindow() {
                             ? catalog.models.filter((model) => model.toLowerCase().includes(query))
                             : catalog.models;
                           if (catalog.models.length === 0) {
-                            return <div className="ai-settings-model-empty">No models yet — sync from provider</div>;
+                            return <div className="ai-settings-model-empty">No models yet — set Base URL / Key then sync</div>;
                           }
                           if (visibleModels.length === 0) {
                             return <div className="ai-settings-model-empty">No models match “{aiModelListQuery.trim()}”</div>;
                           }
                           return (
-                            <div className="ai-settings-model-list" role="listbox" aria-label="模型列表">
+                            <div className="ai-settings-model-list" role="listbox" aria-label="Models">
                               {visibleModels.map((model) => {
                                 const isCurrent = model === catalog.model;
                                 const isEnabled = catalog.enabled_models.includes(model);
@@ -986,7 +1046,7 @@ export function AiSettingsWindow() {
                                       type="button"
                                       className="ai-settings-model-name"
                                       disabled={disabled}
-                                      title={isCurrent ? '当前模型' : '设为当前模型'}
+                                      title={isCurrent ? 'Current model' : 'Set as current model'}
                                       onClick={() => setAiDraftCurrentModel(model)}
                                     >
                                       <span>{model}</span>
@@ -1000,8 +1060,8 @@ export function AiSettingsWindow() {
                                       disabled={disabled || (isEnabled && !canDisable)}
                                       title={
                                         isEnabled
-                                          ? (isCurrent ? '当前模型始终可见' : '从聊天列表移除')
-                                          : '加入聊天列表'
+                                          ? (isCurrent ? 'Current model stays visible' : 'Hide from chat list')
+                                          : 'Show in chat list'
                                       }
                                       onClick={() => toggleAiDraftEnabledModel(model)}
                                     >
@@ -1016,6 +1076,228 @@ export function AiSettingsWindow() {
                       </div>
                     </section>
 
+                    <section className="ai-settings-section ai-settings-section-api-keys">
+                      <button
+                        type="button"
+                        className="ai-settings-collapse-title"
+                        aria-expanded={aiSettingsApiKeysOpen}
+                        onClick={() => setAiSettingsApiKeysOpen((open) => !open)}
+                      >
+                        {aiSettingsApiKeysOpen
+                          ? <ChevronDown size={15} aria-hidden />
+                          : <ChevronRight size={15} aria-hidden />}
+                        <span>API Keys</span>
+                      </button>
+
+                      {aiSettingsApiKeysOpen && (
+                        <div className="ai-settings-collapse-body">
+                          <div className="ai-settings-account-bar">
+                            <div className="ai-settings-account-list" role="tablist" aria-label="API 账号">
+                              {(aiProviderConfig?.accounts?.length
+                                ? aiProviderConfig.accounts
+                                : [{
+                                  id: aiConfigDraft.account_id || 'default',
+                                  name: aiConfigDraft.account_name || '默认',
+                                  base_url: aiConfigDraft.base_url,
+                                  model: aiConfigDraft.model,
+                                  api_format: aiConfigDraft.api_format,
+                                  api_key_configured: Boolean(aiProviderConfig?.api_key_configured),
+                                }]
+                              ).map((account) => {
+                                const active = account.id === (aiConfigDraft.account_id || aiProviderConfig?.active_account_id);
+                                const label = active
+                                  ? (aiConfigDraft.account_name.trim() || account.name || '未命名')
+                                  : (account.name || '未命名');
+                                return (
+                                  <button
+                                    key={account.id}
+                                    type="button"
+                                    role="tab"
+                                    aria-selected={active}
+                                    className={`ai-settings-account-chip${active ? ' active' : ''}`}
+                                    title={label}
+                                    disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || isAiProviderTesting || Boolean(aiProviderConfig?.error)}
+                                    onClick={() => void switchAiAccount(account.id)}
+                                  >
+                                    {label}
+                                    {account.api_key_configured ? '' : ' ·未配置'}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                            <div className="ai-settings-account-actions">
+                              <button
+                                type="button"
+                                className="ai-settings-account-icon-btn"
+                                title="添加账号"
+                                aria-label="添加账号"
+                                disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || isAiProviderTesting || Boolean(aiProviderConfig?.error)}
+                                onClick={() => void addAiAccount()}
+                              >
+                                <Plus size={15} aria-hidden />
+                              </button>
+                              <button
+                                type="button"
+                                className="ai-settings-account-icon-btn danger"
+                                title="删除当前账号"
+                                aria-label="删除当前账号"
+                                disabled={
+                                  isAiConfigLoading
+                                  || isAiConfigSaving
+                                  || isAiModelsSyncing
+                                  || isAiProviderTesting
+                                  || Boolean(aiProviderConfig?.error)
+                                  || (aiProviderConfig?.accounts?.length ?? 1) <= 1
+                                  || !aiConfigDraft.account_id
+                                }
+                                onClick={() => void removeAiAccount(aiConfigDraft.account_id)}
+                              >
+                                <Trash2 size={15} aria-hidden />
+                              </button>
+                            </div>
+                          </div>
+
+                          <label className="ai-settings-row ai-settings-row-inline">
+                            <div className="ai-settings-row-copy">
+                              <span>账号名称</span>
+                            </div>
+                            <input
+                              className="ai-settings-input ai-settings-input-inline"
+                              value={aiConfigDraft.account_name}
+                              placeholder="例如 OpenAI / 公司中转"
+                              spellCheck={false}
+                              disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                              onChange={(event) => setAiConfigDraft((current) => ({
+                                ...current,
+                                account_name: event.target.value,
+                              }))}
+                            />
+                          </label>
+
+                          <div className="ai-settings-divider" />
+
+                          <div className="ai-settings-row ai-settings-row-inline">
+                            <div className="ai-settings-row-copy">
+                              <span>兼容格式</span>
+                            </div>
+                            <div className="ai-settings-select-inline">
+                              <SelectDropdown
+                                value={aiConfigDraft.api_format}
+                                options={AI_API_FORMAT_OPTIONS}
+                                aria-label="接口兼容格式"
+                                disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                                onChange={(next) => setAiConfigDraft((current) => ({ ...current, api_format: next }))}
+                              />
+                            </div>
+                          </div>
+
+                          <div className="ai-settings-divider" />
+
+                          <label className="ai-settings-row ai-settings-row-inline">
+                            <div className="ai-settings-row-copy">
+                              <span>接口地址</span>
+                            </div>
+                            <input
+                              className="ai-settings-input ai-settings-input-inline"
+                              value={aiConfigDraft.base_url}
+                              placeholder="https://api.openai.com/v1"
+                              spellCheck={false}
+                              disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                              onChange={(event) => setAiConfigDraft((current) => ({ ...current, base_url: event.target.value }))}
+                            />
+                          </label>
+
+                          <div className="ai-settings-divider" />
+
+                          <label className="ai-settings-row ai-settings-row-inline">
+                            <div className="ai-settings-row-copy">
+                              <span>访问密钥</span>
+                            </div>
+                            <div className="ai-settings-secret ai-settings-secret-inline">
+                              <input
+                                ref={aiApiKeyInputRef}
+                                type={isAiApiKeyVisible ? 'text' : 'password'}
+                                className="ai-settings-input"
+                                value={aiApiKeyDraft}
+                                placeholder={aiProviderConfig?.api_key_configured && !aiApiKeyDraft ? '••••••••' : 'sk-...'}
+                                autoComplete="off"
+                                spellCheck={false}
+                                disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                                onChange={(event) => setAiApiKeyDraft(event.target.value)}
+                              />
+                              <button
+                                type="button"
+                                className="ai-settings-secret-toggle"
+                                aria-label={isAiApiKeyVisible ? 'Hide key' : 'Show key'}
+                                title={isAiApiKeyVisible ? 'Hide key' : 'Show key'}
+                                disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                                onClick={() => setIsAiApiKeyVisible((current) => !current)}
+                              >
+                                {isAiApiKeyVisible
+                                  ? <EyeOff size={15} aria-hidden />
+                                  : <Eye size={15} aria-hidden />}
+                              </button>
+                            </div>
+                          </label>
+
+                          <div className="ai-settings-divider" />
+
+                          <div className="ai-settings-model-probe-row">
+                            <div className="ai-settings-model-probe-select">
+                              <SelectDropdown
+                                value={resolveAiTestModel(aiConfigDraft.models, aiTestModel, aiConfigDraft.model)}
+                                options={aiConfigDraft.models.map((item) => ({ value: item, label: item }))}
+                                placeholder={aiConfigDraft.models.length ? '选择测试模型' : '请先刷新模型'}
+                                aria-label="选择测试模型"
+                                disabled={
+                                  isAiConfigLoading
+                                  || isAiConfigSaving
+                                  || isAiModelsSyncing
+                                  || isAiProviderTesting
+                                  || Boolean(aiProviderConfig?.error)
+                                  || aiConfigDraft.models.length === 0
+                                }
+                                onChange={(next) => setAiTestModel(next)}
+                              />
+                            </div>
+                            <button
+                              type="button"
+                              className="ai-settings-model-probe-icon-btn"
+                              title="刷新模型列表"
+                              aria-label="刷新模型列表"
+                              disabled={
+                                isAiConfigLoading
+                                || isAiConfigSaving
+                                || isAiModelsSyncing
+                                || isAiProviderTesting
+                                || Boolean(aiProviderConfig?.error)
+                                || !aiConfigDraft.base_url.trim()
+                              }
+                              onClick={() => void syncAiModelsFromProvider()}
+                            >
+                              <RefreshCw size={15} className={isAiModelsSyncing ? 'spin' : undefined} aria-hidden />
+                            </button>
+                            <button
+                              type="button"
+                              className="ai-settings-btn primary ai-settings-model-probe-test-btn"
+                              disabled={
+                                isAiConfigLoading
+                                || isAiConfigSaving
+                                || isAiModelsSyncing
+                                || isAiProviderTesting
+                                || Boolean(aiProviderConfig?.error)
+                                || !aiConfigDraft.base_url.trim()
+                                || !resolveAiTestModel(aiConfigDraft.models, aiTestModel, aiConfigDraft.model)
+                              }
+                              onClick={() => void runAiProviderTest()}
+                            >
+                              {isAiProviderTesting ? '测试中…' : '测试模型'}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </section>
+
                     {aiConfigError && <p className="ai-settings-error">{aiConfigError}</p>}
                   </div>
 
@@ -1026,7 +1308,7 @@ export function AiSettingsWindow() {
                       disabled={isAiConfigSaving || isAiModelsSyncing}
                       onClick={() => requestClose()}
                     >
-                      Cancel
+                      取消
                     </button>
                     <button
                       type="submit"
@@ -1047,15 +1329,15 @@ export function AiSettingsWindow() {
                       }
                     >
                       {isAiConfigSaving
-                        ? 'Saving…'
+                        ? '保存中…'
                         : isAiConfigDraftDirty(
                             aiConfigDraft,
                             aiApiKeyDraft,
                             aiApiKeyBaselineRef.current,
                             aiProviderConfig,
                           )
-                          ? 'Save'
-                          : 'Saved'}
+                          ? '保存'
+                          : '已保存'}
                     </button>
                   </footer>
                 </form>
@@ -1552,6 +1834,37 @@ export function AiSettingsWindow() {
           </div>
 
       </div>
+
+      {aiProviderTestDialog.open && (
+        <div
+          className="dialog-backdrop"
+          onMouseDown={() => {
+            if (isAiProviderTesting) return;
+            setAiProviderTestDialog({ open: false, lines: [], status: 'idle' });
+          }}
+        >
+          <div
+            className="dialog-card ai-provider-test-dialog"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <h3>测试模型</h3>
+            <pre className="ai-provider-test-log" aria-live="polite">
+              {aiProviderTestDialog.lines.join('\n')}
+            </pre>
+            <div className="dialog-actions">
+              <button
+                type="button"
+                className="dialog-btn primary"
+                disabled={isAiProviderTesting}
+                autoFocus
+                onClick={() => setAiProviderTestDialog({ open: false, lines: [], status: 'idle' })}
+              >
+                {isAiProviderTesting ? '测试中…' : '关闭'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {confirmDialog && (
         <div className="dialog-backdrop" onMouseDown={() => setConfirmDialog(null)}>

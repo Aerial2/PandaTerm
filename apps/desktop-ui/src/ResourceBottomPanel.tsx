@@ -1,4 +1,14 @@
-import { memo, useEffect, useRef, useState, useSyncExternalStore, type MouseEvent } from 'react';
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type MouseEvent,
+  type UIEvent,
+} from 'react';
 import { ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
 import {
   deleteTransferRecord,
@@ -17,6 +27,10 @@ export type { LogEntry, TransferRecord };
 export { isTransferTerminal, transferKindLabel };
 
 export type ResourceBottomTab = 'transfer' | 'log' | 'local';
+
+/** 固定行高：虚拟列表按此计算窗口，CSS 必须与之对齐 */
+const TRANSFER_ROW_HEIGHT = 56;
+const TRANSFER_OVERSCAN = 8;
 
 function formatFileSize(size: number) {
   if (size === 0) return '0 B';
@@ -77,6 +91,117 @@ function transferStatusDetail(record: Pick<TransferRecord, 'status' | 'message'>
   return '';
 }
 
+type TransferVirtualRange = {
+  start: number;
+  end: number;
+};
+
+function computeTransferVirtualRange(
+  scrollTop: number,
+  viewportHeight: number,
+  count: number,
+): TransferVirtualRange {
+  if (count <= 0) return { start: 0, end: 0 };
+  const start = Math.max(0, Math.floor(scrollTop / TRANSFER_ROW_HEIGHT) - TRANSFER_OVERSCAN);
+  const visible = Math.ceil(Math.max(viewportHeight, 1) / TRANSFER_ROW_HEIGHT) + TRANSFER_OVERSCAN * 2;
+  const end = Math.min(count, start + visible);
+  return { start, end };
+}
+
+type TransferRowProps = {
+  record: TransferRecord;
+  index: number;
+  onContextMenu: (event: MouseEvent, record: TransferRecord) => void;
+};
+
+const TransferRow = memo(function TransferRow({ record, index, onContextMenu }: TransferRowProps) {
+  const statusLabel = transferStatusLabel(record);
+  const statusDetail = transferStatusDetail(record);
+  const elapsedLabel = formatTransferDuration(transferElapsedMs(record));
+  const sizeLabel =
+    record.status === 'uploading' && record.progress >= 0
+      ? `${formatFileSize(record.transferred)} / ${formatFileSize(record.size)}`
+      : formatFileSize(record.size);
+  const speedLabel =
+    record.status === 'uploading' && record.progress >= 0 && record.speed > 0
+      ? formatSpeed(record.speed)
+      : record.status === 'success' && record.speed > 0
+        ? formatSpeed(record.speed)
+        : '-';
+  const speedClass =
+    record.status === 'uploading' && record.speed > 0
+      ? 'transfer-inline-value is-active'
+      : record.status === 'success' && record.speed > 0
+        ? 'transfer-inline-value is-avg'
+        : 'transfer-inline-value is-muted';
+  const durationClass =
+    record.status === 'uploading' || record.status === 'pending'
+      ? 'transfer-inline-value is-active'
+      : 'transfer-inline-value';
+
+  return (
+    <tr
+      className={`transfer-row ${record.status}`}
+      onContextMenu={(event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onContextMenu(event, record);
+      }}
+    >
+      <td className="transfer-td-index">{index + 1}</td>
+      <td className="transfer-td-name">
+        <div className="transfer-name-cell">
+          <span className="transfer-filename" title={record.fileName}>
+            {record.fileName}
+          </span>
+          {record.target ? (
+            <span className="transfer-target" title={record.target}>
+              {record.target}
+            </span>
+          ) : null}
+          {record.status === 'uploading' && record.progress >= 0 && (
+            <div className="transfer-progress-bar">
+              <div className="transfer-progress-fill" style={{ width: `${record.progress}%` }} />
+            </div>
+          )}
+        </div>
+      </td>
+      <td className="transfer-td-metrics" title={`${sizeLabel} | ${speedLabel}`}>
+        <span className="transfer-inline-text">
+          <span className="transfer-inline-value">{sizeLabel}</span>
+          <span className="transfer-inline-sep" aria-hidden>
+            |
+          </span>
+          <span className={speedClass}>{speedLabel}</span>
+        </span>
+      </td>
+      <td className="transfer-td-time" title={`${record.time} | ${elapsedLabel}`}>
+        <span className="transfer-inline-text">
+          <span className="transfer-inline-value is-muted">{record.time}</span>
+          <span className="transfer-inline-sep" aria-hidden>
+            |
+          </span>
+          <span className={durationClass}>{elapsedLabel}</span>
+        </span>
+      </td>
+      <td
+        className="transfer-td-kind"
+        title={statusDetail || `${transferKindLabel(record.direction)} | ${statusLabel}`}
+      >
+        <span className="transfer-inline-text">
+          <span className="transfer-inline-value">{transferKindLabel(record.direction)}</span>
+          <span className="transfer-inline-sep" aria-hidden>
+            |
+          </span>
+          <span className={`transfer-inline-value transfer-kind-status ${record.status}`}>
+            {statusLabel}
+          </span>
+        </span>
+      </td>
+    </tr>
+  );
+});
+
 type ResourceBottomPanelProps = {
   /** 取消进行中的传输（abort + store 更新由外部完成） */
   onCancelTransfer: (id: string) => void;
@@ -87,6 +212,7 @@ type ResourceBottomPanelProps = {
 /**
  * 底部资源面板：tab / 折叠 / 高度 / 传输列表状态内聚。
  * 传输进度从 appShellStore 订阅，上传时不拖垮 App。
+ * 传输表使用固定行高虚拟窗口：数据可无限增长，DOM 只保留可视区附近行。
  */
 export const ResourceBottomPanel = memo(function ResourceBottomPanel({
   onCancelTransfer,
@@ -105,10 +231,25 @@ export const ResourceBottomPanel = memo(function ResourceBottomPanel({
     y: number;
     record: TransferRecord;
   } | null>(null);
+  const [virtualRange, setVirtualRange] = useState<TransferVirtualRange>({ start: 0, end: 0 });
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const transferScrollRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const expandedHeightRef = useRef(180);
   const lastOpenLocalKeyRef = useRef(0);
+
+  const syncVirtualRange = useCallback(() => {
+    const el = transferScrollRef.current;
+    const count = transferRecords.length;
+    if (!el || count === 0) {
+      setVirtualRange((prev) => (prev.start === 0 && prev.end === 0 ? prev : { start: 0, end: 0 }));
+      return;
+    }
+    const next = computeTransferVirtualRange(el.scrollTop, el.clientHeight, count);
+    setVirtualRange((prev) =>
+      prev.start === next.start && prev.end === next.end ? prev : next,
+    );
+  }, [transferRecords.length]);
 
   function expandIfNeeded(minHeight = 0) {
     if (collapsed) {
@@ -149,6 +290,56 @@ export const ResourceBottomPanel = memo(function ResourceBottomPanel({
       window.removeEventListener('blur', close);
     };
   }, [transferContextMenu]);
+
+  useEffect(() => {
+    if (collapsed || tab !== 'transfer') return;
+    syncVirtualRange();
+    const el = transferScrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      syncVirtualRange();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [collapsed, tab, syncVirtualRange, height]);
+
+  const onTransferScroll = useCallback(
+    (event: UIEvent<HTMLDivElement>) => {
+      const el = event.currentTarget;
+      const next = computeTransferVirtualRange(el.scrollTop, el.clientHeight, transferRecords.length);
+      setVirtualRange((prev) =>
+        prev.start === next.start && prev.end === next.end ? prev : next,
+      );
+    },
+    [transferRecords.length],
+  );
+
+  const onRowContextMenu = useCallback((event: MouseEvent, record: TransferRecord) => {
+    setTransferContextMenu({ x: event.clientX, y: event.clientY, record });
+  }, []);
+
+  // 首帧尚未量到 scroll 容器高度时，用保守视口高度估窗口，避免 end=0 空白
+  const effectiveRange = useMemo(() => {
+    const count = transferRecords.length;
+    if (count === 0) return { start: 0, end: 0 };
+    if (virtualRange.end > virtualRange.start) {
+      return {
+        start: Math.min(virtualRange.start, count),
+        end: Math.min(virtualRange.end, count),
+      };
+    }
+    return computeTransferVirtualRange(0, 240, count);
+  }, [transferRecords.length, virtualRange]);
+
+  const visibleRows = useMemo(() => {
+    const { start, end } = effectiveRange;
+    if (end <= start) return [] as Array<{ record: TransferRecord; index: number }>;
+    const slice = transferRecords.slice(start, end);
+    return slice.map((record, offset) => ({ record, index: start + offset }));
+  }, [transferRecords, effectiveRange]);
+
+  const topPad = effectiveRange.start * TRANSFER_ROW_HEIGHT;
+  const bottomPad = Math.max(0, transferRecords.length - effectiveRange.end) * TRANSFER_ROW_HEIGHT;
 
   const localActive = !collapsed && tab === 'local';
 
@@ -236,6 +427,8 @@ export const ResourceBottomPanel = memo(function ResourceBottomPanel({
       <div
         className="resource-bottom-content transfer-table-wrap"
         hidden={collapsed || tab !== 'transfer'}
+        ref={transferScrollRef}
+        onScroll={onTransferScroll}
       >
         {transferRecords.length === 0 ? (
           <div className="resource-bottom-empty">暂无传输任务</div>
@@ -251,93 +444,24 @@ export const ResourceBottomPanel = memo(function ResourceBottomPanel({
               </tr>
             </thead>
             <tbody>
-              {transferRecords.map((record, idx) => {
-                const statusLabel = transferStatusLabel(record);
-                const statusDetail = transferStatusDetail(record);
-                const elapsedLabel = formatTransferDuration(transferElapsedMs(record));
-                const sizeLabel =
-                  record.status === 'uploading' && record.progress >= 0
-                    ? `${formatFileSize(record.transferred)} / ${formatFileSize(record.size)}`
-                    : formatFileSize(record.size);
-                const speedLabel =
-                  record.status === 'uploading' && record.progress >= 0 && record.speed > 0
-                    ? formatSpeed(record.speed)
-                    : record.status === 'success' && record.speed > 0
-                      ? formatSpeed(record.speed)
-                      : '-';
-                const speedClass =
-                  record.status === 'uploading' && record.speed > 0
-                    ? 'transfer-inline-value is-active'
-                    : record.status === 'success' && record.speed > 0
-                      ? 'transfer-inline-value is-avg'
-                      : 'transfer-inline-value is-muted';
-                const durationClass =
-                  record.status === 'uploading' || record.status === 'pending'
-                    ? 'transfer-inline-value is-active'
-                    : 'transfer-inline-value';
-                return (
-                  <tr
-                    key={record.id}
-                    className={`transfer-row ${record.status}`}
-                    onContextMenu={(event: MouseEvent) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      setTransferContextMenu({ x: event.clientX, y: event.clientY, record });
-                    }}
-                  >
-                    <td className="transfer-td-index">{idx + 1}</td>
-                    <td className="transfer-td-name">
-                      <div className="transfer-name-cell">
-                        <span className="transfer-filename" title={record.fileName}>
-                          {record.fileName}
-                        </span>
-                        {record.target ? (
-                          <span className="transfer-target" title={record.target}>
-                            {record.target}
-                          </span>
-                        ) : null}
-                        {record.status === 'uploading' && record.progress >= 0 && (
-                          <div className="transfer-progress-bar">
-                            <div className="transfer-progress-fill" style={{ width: `${record.progress}%` }} />
-                          </div>
-                        )}
-                      </div>
-                    </td>
-                    <td className="transfer-td-metrics" title={`${sizeLabel} | ${speedLabel}`}>
-                      <span className="transfer-inline-text">
-                        <span className="transfer-inline-value">{sizeLabel}</span>
-                        <span className="transfer-inline-sep" aria-hidden>
-                          |
-                        </span>
-                        <span className={speedClass}>{speedLabel}</span>
-                      </span>
-                    </td>
-                    <td className="transfer-td-time" title={`${record.time} | ${elapsedLabel}`}>
-                      <span className="transfer-inline-text">
-                        <span className="transfer-inline-value is-muted">{record.time}</span>
-                        <span className="transfer-inline-sep" aria-hidden>
-                          |
-                        </span>
-                        <span className={durationClass}>{elapsedLabel}</span>
-                      </span>
-                    </td>
-                    <td
-                      className="transfer-td-kind"
-                      title={statusDetail || `${transferKindLabel(record.direction)} | ${statusLabel}`}
-                    >
-                      <span className="transfer-inline-text">
-                        <span className="transfer-inline-value">{transferKindLabel(record.direction)}</span>
-                        <span className="transfer-inline-sep" aria-hidden>
-                          |
-                        </span>
-                        <span className={`transfer-inline-value transfer-kind-status ${record.status}`}>
-                          {statusLabel}
-                        </span>
-                      </span>
-                    </td>
-                  </tr>
-                );
-              })}
+              {topPad > 0 ? (
+                <tr className="transfer-virtual-spacer" aria-hidden>
+                  <td colSpan={5} style={{ height: topPad, padding: 0, border: 0 }} />
+                </tr>
+              ) : null}
+              {visibleRows.map(({ record, index }) => (
+                <TransferRow
+                  key={record.id}
+                  record={record}
+                  index={index}
+                  onContextMenu={onRowContextMenu}
+                />
+              ))}
+              {bottomPad > 0 ? (
+                <tr className="transfer-virtual-spacer" aria-hidden>
+                  <td colSpan={5} style={{ height: bottomPad, padding: 0, border: 0 }} />
+                </tr>
+              ) : null}
             </tbody>
           </table>
         )}

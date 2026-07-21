@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod about;
 mod mcp;
 
 use std::collections::{HashMap, HashSet};
@@ -141,69 +142,123 @@ struct CredentialProtectionRequest {
     master_password: Option<String>,
 }
 
-const AI_CONFIG_VERSION: u8 = 1;
+const AI_CONFIG_VERSION: u8 = 2;
 const AI_API_KEY_PREFIX: &str = "credential:ai:openai-compatible:api-key";
 const DEFAULT_AI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_AI_MODEL: &str = "gpt-4o-mini";
 /// 默认不发送 reasoning_effort，兼容非推理模型
 const DEFAULT_AI_REASONING_EFFORT: &str = "none";
+/// 默认 OpenAI 兼容协议
+const DEFAULT_AI_API_FORMAT: &str = "openai";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_AI_MESSAGES: usize = 100;
 const MAX_AI_MESSAGE_CHARS: usize = 32_000;
 const MAX_AI_TOTAL_CHARS: usize = 200_000;
+const MAX_AI_ACCOUNTS: usize = 32;
 
 fn default_ai_reasoning_effort() -> String {
     DEFAULT_AI_REASONING_EFFORT.to_string()
 }
 
+fn default_ai_api_format() -> String {
+    DEFAULT_AI_API_FORMAT.to_string()
+}
+
+/// 单个供应商账号（接口地址 + 密钥 + 模型目录）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AiProviderConfigStore {
-    version: u8,
+struct AiProviderAccountStore {
+    id: String,
+    #[serde(default = "default_ai_account_name")]
+    name: String,
     base_url: String,
     model: String,
-    /// 可选模型目录（同步 + 自定义）；同步时不会清空未出现在远端的自定义项
     #[serde(default)]
     models: Vec<String>,
-    /// 出现在聊天模型列表中的已选模型（子集）；缺省迁移为全部 models
     #[serde(default)]
     enabled_models: Vec<String>,
-    /// OpenAI-compatible reasoning_effort；none 表示请求体不带该字段
-    #[serde(default = "default_ai_reasoning_effort")]
-    reasoning_effort: String,
+    #[serde(default = "default_ai_api_format")]
+    api_format: String,
     use_api_key: bool,
     api_key_secret_id: Option<String>,
 }
 
+fn default_ai_account_name() -> String {
+    "默认".to_string()
+}
+
+fn new_default_ai_account() -> AiProviderAccountStore {
+    AiProviderAccountStore {
+        id: "default".to_string(),
+        name: default_ai_account_name(),
+        base_url: DEFAULT_AI_BASE_URL.to_string(),
+        model: DEFAULT_AI_MODEL.to_string(),
+        models: vec![DEFAULT_AI_MODEL.to_string()],
+        enabled_models: vec![DEFAULT_AI_MODEL.to_string()],
+        api_format: DEFAULT_AI_API_FORMAT.to_string(),
+        use_api_key: true,
+        api_key_secret_id: None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiProviderConfigStore {
+    version: u8,
+    active_account_id: String,
+    accounts: Vec<AiProviderAccountStore>,
+    /// 全局推理力度（聊天用）
+    #[serde(default = "default_ai_reasoning_effort")]
+    reasoning_effort: String,
+}
+
 impl Default for AiProviderConfigStore {
     fn default() -> Self {
+        let account = new_default_ai_account();
         Self {
             version: AI_CONFIG_VERSION,
-            base_url: DEFAULT_AI_BASE_URL.to_string(),
-            model: DEFAULT_AI_MODEL.to_string(),
-            models: vec![DEFAULT_AI_MODEL.to_string()],
-            enabled_models: vec![DEFAULT_AI_MODEL.to_string()],
+            active_account_id: account.id.clone(),
+            accounts: vec![account],
             reasoning_effort: DEFAULT_AI_REASONING_EFFORT.to_string(),
-            use_api_key: true,
-            api_key_secret_id: None,
         }
     }
 }
 
+/// 设置页账号列表项（不含密钥明文）
+#[derive(Debug, Clone, Serialize)]
+struct AiProviderAccountView {
+    id: String,
+    name: String,
+    base_url: String,
+    model: String,
+    api_format: String,
+    api_key_configured: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct AiProviderConfig {
+    /// 当前激活账号
+    account_id: String,
+    account_name: String,
     base_url: String,
     model: String,
     models: Vec<String>,
     enabled_models: Vec<String>,
     reasoning_effort: String,
+    api_format: String,
     use_api_key: bool,
     api_key_configured: bool,
-    /// 本地桌面设置可回填展示；仅来自本机 vault 解密结果
     api_key: Option<String>,
+    /// 全部账号摘要（设置页切换）
+    accounts: Vec<AiProviderAccountView>,
+    active_account_id: String,
     error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct SaveAiProviderConfigRequest {
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    account_name: Option<String>,
     base_url: String,
     model: String,
     #[serde(default)]
@@ -212,16 +267,50 @@ struct SaveAiProviderConfigRequest {
     enabled_models: Option<Vec<String>>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    api_format: Option<String>,
     use_api_key: bool,
     api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct SyncAiModelsRequest {
-    /// 可选：用草稿 Base URL 拉列表；缺省用已保存配置
+    #[serde(default)]
+    account_id: Option<String>,
     base_url: Option<String>,
     use_api_key: Option<bool>,
     api_key: Option<String>,
+    #[serde(default)]
+    api_format: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AiAccountIdRequest {
+    account_id: String,
+}
+
+/// 使用草稿配置发送一条测试消息（不落盘；流式以测量首字耗时）
+#[derive(Debug, Clone, Deserialize)]
+struct TestAiProviderRequest {
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    api_format: Option<String>,
+    #[serde(default)]
+    use_api_key: Option<bool>,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TestAiProviderResponse {
+    content: String,
+    model: String,
+    base_url: String,
+    api_format: String,
+    connect_ms: u64,
+    ttft_ms: u64,
+    total_ms: u64,
 }
 
 const AI_CONVERSATION_VERSION: u8 = 2;
@@ -768,18 +857,165 @@ fn load_ai_config() -> Result<AiProviderConfigStore, String> {
         }
         Err(error) => return Err(format!("AI 供应商配置读取失败：{error}")),
     };
-    let mut config: AiProviderConfigStore = serde_json::from_str(&content)
+    let value: Value = serde_json::from_str(&content)
         .map_err(|error| format!("AI 供应商配置已损坏，已拒绝覆盖原文件：{error}"))?;
-    if config.version != AI_CONFIG_VERSION {
-        return Err(format!("不支持的 AI 供应商配置版本：{}", config.version));
-    }
-    validate_ai_base_url(&config.base_url)?;
-    config.model = validate_ai_model(&config.model)?;
-    config.models = normalize_ai_models(&config.models, &config.model)?;
-    config.enabled_models =
-        normalize_enabled_ai_models(&config.models, &config.enabled_models, &config.model)?;
-    config.reasoning_effort = validate_ai_reasoning_effort(&config.reasoning_effort)?;
+    let mut config = if value
+        .get("accounts")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+    {
+        serde_json::from_value::<AiProviderConfigStore>(value)
+            .map_err(|error| format!("AI 供应商配置已损坏，已拒绝覆盖原文件：{error}"))?
+    } else {
+        migrate_ai_config_v1(value)?
+    };
+    normalize_ai_config_store(&mut config)?;
     Ok(config)
+}
+
+/// v1 扁平结构 → 多账号
+fn migrate_ai_config_v1(value: Value) -> Result<AiProviderConfigStore, String> {
+    let base_url = value
+        .get("base_url")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_AI_BASE_URL)
+        .to_string();
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_AI_MODEL)
+        .to_string();
+    let models = value
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![model.clone()]);
+    let enabled_models = value
+        .get("enabled_models")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| models.clone());
+    let reasoning_effort = value
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_AI_REASONING_EFFORT)
+        .to_string();
+    let api_format = value
+        .get("api_format")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_AI_API_FORMAT)
+        .to_string();
+    let use_api_key = value
+        .get("use_api_key")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let api_key_secret_id = value
+        .get("api_key_secret_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let account = AiProviderAccountStore {
+        id: "default".to_string(),
+        name: default_ai_account_name(),
+        base_url,
+        model,
+        models,
+        enabled_models,
+        api_format,
+        use_api_key,
+        api_key_secret_id,
+    };
+    Ok(AiProviderConfigStore {
+        version: AI_CONFIG_VERSION,
+        active_account_id: account.id.clone(),
+        accounts: vec![account],
+        reasoning_effort,
+    })
+}
+
+fn normalize_ai_config_store(config: &mut AiProviderConfigStore) -> Result<(), String> {
+    if config.accounts.is_empty() {
+        *config = AiProviderConfigStore::default();
+        return Ok(());
+    }
+    if config.accounts.len() > MAX_AI_ACCOUNTS {
+        return Err(format!("AI 账号数量不能超过 {MAX_AI_ACCOUNTS}"));
+    }
+    let mut seen = HashSet::new();
+    for account in &mut config.accounts {
+        account.id = account.id.trim().to_string();
+        if account.id.is_empty() {
+            account.id = Uuid::new_v4().to_string();
+        }
+        if !seen.insert(account.id.clone()) {
+            return Err(format!("AI 账号 id 重复：{}", account.id));
+        }
+        account.name = normalize_ai_account_name(&account.name);
+        validate_ai_base_url(&account.base_url)?;
+        account.model = validate_ai_model(&account.model)?;
+        account.models = normalize_ai_models(&account.models, &account.model)?;
+        account.enabled_models =
+            normalize_enabled_ai_models(&account.models, &account.enabled_models, &account.model)?;
+        account.api_format = validate_ai_api_format(&account.api_format)?;
+    }
+    if !config
+        .accounts
+        .iter()
+        .any(|item| item.id == config.active_account_id)
+    {
+        config.active_account_id = config.accounts[0].id.clone();
+    }
+    config.reasoning_effort = validate_ai_reasoning_effort(&config.reasoning_effort)?;
+    config.version = AI_CONFIG_VERSION;
+    Ok(())
+}
+
+fn normalize_ai_account_name(raw: &str) -> String {
+    let name = raw.trim();
+    if name.is_empty() {
+        return default_ai_account_name();
+    }
+    name.chars().take(64).collect()
+}
+
+fn find_ai_account<'a>(
+    config: &'a AiProviderConfigStore,
+    account_id: Option<&str>,
+) -> Result<&'a AiProviderAccountStore, String> {
+    let id = account_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(config.active_account_id.as_str());
+    config
+        .accounts
+        .iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| format!("未找到 AI 账号：{id}"))
+}
+
+fn find_ai_account_mut<'a>(
+    config: &'a mut AiProviderConfigStore,
+    account_id: Option<&str>,
+) -> Result<&'a mut AiProviderAccountStore, String> {
+    let id = account_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(config.active_account_id.as_str())
+        .to_string();
+    config
+        .accounts
+        .iter_mut()
+        .find(|item| item.id == id)
+        .ok_or_else(|| format!("未找到 AI 账号：{id}"))
 }
 
 fn save_ai_config(config: &AiProviderConfigStore) -> Result<(), String> {
@@ -5090,6 +5326,19 @@ fn validate_ai_reasoning_effort(effort: &str) -> Result<String, String> {
     }
 }
 
+/// 接口协议：openai（chat/completions）| claude（Anthropic /messages）
+fn validate_ai_api_format(format: &str) -> Result<String, String> {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "openai" => Ok("openai".to_string()),
+        "claude" | "anthropic" => Ok("claude".to_string()),
+        _ => Err("接口兼容格式无效，可选：openai / claude".to_string()),
+    }
+}
+
+fn is_claude_api_format(format: &str) -> bool {
+    format.eq_ignore_ascii_case("claude")
+}
+
 /// 仅在非 none 时注入 chat completions 请求字段
 fn ai_request_reasoning_effort(effort: &str) -> Option<&str> {
     let effort = effort.trim();
@@ -5234,26 +5483,184 @@ fn ai_chat_completions_url(base_url: &str) -> Result<Url, String> {
     ai_resource_url(base_url, "chat/completions")
 }
 
+fn ai_messages_url(base_url: &str) -> Result<Url, String> {
+    ai_resource_url(base_url, "messages")
+}
+
+fn ai_chat_endpoint(base_url: &str, api_format: &str) -> Result<Url, String> {
+    if is_claude_api_format(api_format) {
+        ai_messages_url(base_url)
+    } else {
+        ai_chat_completions_url(base_url)
+    }
+}
+
 fn ai_models_url(base_url: &str) -> Result<Url, String> {
     ai_resource_url(base_url, "models")
+}
+
+fn apply_ai_provider_auth(
+    builder: reqwest::RequestBuilder,
+    api_format: &str,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let Some(key) = api_key.filter(|value| !value.is_empty()) else {
+        return builder;
+    };
+    if is_claude_api_format(api_format) {
+        builder
+            .header("x-api-key", key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+    } else {
+        builder.bearer_auth(key)
+    }
+}
+
+/// 将内部 chat 消息转为 Anthropic Messages 请求体
+fn build_claude_messages_payload(
+    model: &str,
+    messages: &[AiChatMessage],
+    stream: bool,
+) -> Result<Value, String> {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut claude_messages: Vec<Value> = Vec::new();
+    for message in messages {
+        let role = message.role.trim().to_ascii_lowercase();
+        let content = message.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        match role.as_str() {
+            "system" => system_parts.push(content.to_string()),
+            "user" | "assistant" => {
+                // Anthropic 要求 user/assistant 交替；连续同角色时合并
+                if let Some(last) = claude_messages.last_mut() {
+                    if last.get("role").and_then(|v| v.as_str()) == Some(role.as_str()) {
+                        if let Some(existing) = last.get("content").and_then(|v| v.as_str()) {
+                            let merged = format!("{existing}\n\n{content}");
+                            last["content"] = Value::String(merged);
+                            continue;
+                        }
+                    }
+                }
+                claude_messages.push(serde_json::json!({
+                    "role": role,
+                    "content": content,
+                }));
+            }
+            _ => {
+                return Err(format!("Claude 格式暂不支持消息角色：{role}"));
+            }
+        }
+    }
+    if claude_messages.is_empty() {
+        return Err("Claude 请求缺少 user/assistant 消息".to_string());
+    }
+    // 必须以 user 开头
+    if claude_messages
+        .first()
+        .and_then(|item| item.get("role"))
+        .and_then(|v| v.as_str())
+        != Some("user")
+    {
+        claude_messages.insert(
+            0,
+            serde_json::json!({
+                "role": "user",
+                "content": "(continue)",
+            }),
+        );
+    }
+    let mut payload = serde_json::json!({
+        "model": model,
+        "max_tokens": 8192,
+        "stream": stream,
+        "messages": claude_messages,
+    });
+    if !system_parts.is_empty() {
+        payload["system"] = Value::String(system_parts.join("\n\n"));
+    }
+    Ok(payload)
+}
+
+fn extract_claude_text_content(body: &Value) -> Option<String> {
+    let content = body.get("content")?.as_array()?;
+    let mut parts = Vec::new();
+    for block in content {
+        if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(""))
+    }
+}
+
+fn extract_claude_stream_delta(data: &str) -> Result<Option<String>, String> {
+    let value: Value = serde_json::from_str(data)
+        .map_err(|error| format!("Claude 流式响应格式不兼容：{error}"))?;
+    let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match event_type {
+        "content_block_delta" => {
+            let text = value
+                .pointer("/delta/text")
+                .and_then(|v| v.as_str())
+                .filter(|t| !t.is_empty())
+                .map(ToString::to_string);
+            Ok(text)
+        }
+        "error" => {
+            let message = value
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Claude 流式错误");
+            Err(message.to_string())
+        }
+        _ => Ok(None),
+    }
 }
 
 fn ai_config_snapshot(
     config: &AiProviderConfigStore,
     api_key: Option<String>,
     error: Option<String>,
-) -> AiProviderConfig {
-    AiProviderConfig {
-        base_url: config.base_url.clone(),
-        model: config.model.clone(),
-        models: config.models.clone(),
-        enabled_models: config.enabled_models.clone(),
+) -> Result<AiProviderConfig, String> {
+    let active = find_ai_account(config, None)?;
+    let accounts = config
+        .accounts
+        .iter()
+        .map(|item| AiProviderAccountView {
+            id: item.id.clone(),
+            name: item.name.clone(),
+            base_url: item.base_url.clone(),
+            model: item.model.clone(),
+            api_format: item.api_format.clone(),
+            api_key_configured: item.api_key_secret_id.is_some(),
+        })
+        .collect();
+    Ok(AiProviderConfig {
+        account_id: active.id.clone(),
+        account_name: active.name.clone(),
+        base_url: active.base_url.clone(),
+        model: active.model.clone(),
+        models: active.models.clone(),
+        enabled_models: active.enabled_models.clone(),
         reasoning_effort: config.reasoning_effort.clone(),
-        use_api_key: config.use_api_key,
-        api_key_configured: config.api_key_secret_id.is_some(),
+        api_format: active.api_format.clone(),
+        use_api_key: active.use_api_key,
+        api_key_configured: active.api_key_secret_id.is_some(),
         api_key,
+        accounts,
+        active_account_id: config.active_account_id.clone(),
         error,
-    }
+    })
 }
 
 fn resolve_ai_api_key(
@@ -5458,16 +5865,16 @@ async fn get_ai_provider_config(
 ) -> Result<AiProviderConfig, String> {
     let config = state.ai_config.lock().await.clone();
     let error = state.ai_config_error.lock().await.clone();
+    let active = find_ai_account(&config, None)?;
     let credentials = state.credentials.lock().await;
-    // 解密失败不阻塞配置读取；仅无法回填明文，由前端提示重启
-    let api_key = match resolve_ai_api_key(&credentials, config.api_key_secret_id.as_deref()) {
+    let api_key = match resolve_ai_api_key(&credentials, active.api_key_secret_id.as_deref()) {
         Ok(key) => key,
         Err(reveal_error) => {
             eprintln!("[AI] reveal api key failed: {reveal_error}");
             None
         }
     };
-    Ok(ai_config_snapshot(&config, api_key, error))
+    ai_config_snapshot(&config, api_key, error)
 }
 
 #[tauri::command]
@@ -5481,12 +5888,20 @@ async fn save_ai_provider_config(
     let base_url = validate_ai_base_url(&request.base_url)?.to_string();
     let model = validate_ai_model(&request.model)?;
     let supplied_key = request.api_key.filter(|key| !key.trim().is_empty());
-    let current = state.ai_config.lock().await.clone();
-    if request.use_api_key && supplied_key.is_none() && current.api_key_secret_id.is_none() {
+    let mut current = state.ai_config.lock().await.clone();
+    let account_id = request
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(current.active_account_id.as_str())
+        .to_string();
+    let existing = find_ai_account(&current, Some(&account_id))?;
+    if request.use_api_key && supplied_key.is_none() && existing.api_key_secret_id.is_none() {
         return Err("启用 API Key 时必须输入密钥".to_string());
     }
     let models = normalize_ai_models(
-        request.models.as_deref().unwrap_or(&current.models),
+        request.models.as_deref().unwrap_or(&existing.models),
         &model,
     )?;
     let enabled_models = normalize_enabled_ai_models(
@@ -5494,7 +5909,7 @@ async fn save_ai_provider_config(
         request
             .enabled_models
             .as_deref()
-            .unwrap_or(&current.enabled_models),
+            .unwrap_or(&existing.enabled_models),
         &model,
     )?;
     let reasoning_effort = validate_ai_reasoning_effort(
@@ -5503,35 +5918,51 @@ async fn save_ai_provider_config(
             .as_deref()
             .unwrap_or(&current.reasoning_effort),
     )?;
+    let api_format = validate_ai_api_format(
+        request
+            .api_format
+            .as_deref()
+            .unwrap_or(&existing.api_format),
+    )?;
+    let account_name = normalize_ai_account_name(
+        request
+            .account_name
+            .as_deref()
+            .unwrap_or(&existing.name),
+    );
+    let old_secret_id = existing.api_key_secret_id.clone();
 
     let mut credentials = state.credentials.lock().await;
     let next_secret_id = if let Some(key) = supplied_key.as_deref() {
         let id = format!("{AI_API_KEY_PREFIX}:{}", Uuid::new_v4());
         Some(store_credential(&mut credentials, id, key.trim())?)
     } else if request.use_api_key {
-        current.api_key_secret_id.clone()
+        old_secret_id.clone()
     } else {
         None
     };
-    let next = AiProviderConfigStore {
-        version: AI_CONFIG_VERSION,
-        base_url,
-        model,
-        models,
-        enabled_models,
-        reasoning_effort,
-        use_api_key: request.use_api_key,
-        api_key_secret_id: next_secret_id,
-    };
 
-    if next.api_key_secret_id != current.api_key_secret_id {
+    {
+        let account = find_ai_account_mut(&mut current, Some(&account_id))?;
+        account.name = account_name;
+        account.base_url = base_url;
+        account.model = model;
+        account.models = models;
+        account.enabled_models = enabled_models;
+        account.api_format = api_format;
+        account.use_api_key = request.use_api_key;
+        account.api_key_secret_id = next_secret_id.clone();
+    }
+    current.active_account_id = account_id;
+    current.reasoning_effort = reasoning_effort;
+    current.version = AI_CONFIG_VERSION;
+    normalize_ai_config_store(&mut current)?;
+
+    if next_secret_id != old_secret_id {
         save_credential_vault(&credentials.vault)?;
     }
-    save_ai_config(&next)?;
-    if let Some(old_id) = current
-        .api_key_secret_id
-        .filter(|old_id| Some(old_id) != next.api_key_secret_id.as_ref())
-    {
+    save_ai_config(&current)?;
+    if let Some(old_id) = old_secret_id.filter(|old_id| Some(old_id) != next_secret_id.as_ref()) {
         credentials.vault.entries.remove(&old_id);
         if let Err(error) = save_credential_vault(&credentials.vault) {
             eprintln!("[Credential] obsolete AI API key cleanup deferred: {error}");
@@ -5540,10 +5971,108 @@ async fn save_ai_provider_config(
     let api_key = if let Some(key) = supplied_key {
         Some(key.trim().to_string())
     } else {
-        resolve_ai_api_key(&credentials, next.api_key_secret_id.as_deref())?
+        let active = find_ai_account(&current, None)?;
+        resolve_ai_api_key(&credentials, active.api_key_secret_id.as_deref())?
     };
-    *state.ai_config.lock().await = next.clone();
-    Ok(ai_config_snapshot(&next, api_key, None))
+    *state.ai_config.lock().await = current.clone();
+    ai_config_snapshot(&current, api_key, None)
+}
+
+#[tauri::command]
+async fn add_ai_provider_account(
+    state: State<'_, Arc<AppState>>,
+) -> Result<AiProviderConfig, String> {
+    if let Some(error) = state.ai_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let mut current = state.ai_config.lock().await.clone();
+    if current.accounts.len() >= MAX_AI_ACCOUNTS {
+        return Err(format!("AI 账号数量不能超过 {MAX_AI_ACCOUNTS}"));
+    }
+    let index = current.accounts.len() + 1;
+    let account = AiProviderAccountStore {
+        id: Uuid::new_v4().to_string(),
+        name: format!("账号 {index}"),
+        base_url: DEFAULT_AI_BASE_URL.to_string(),
+        model: DEFAULT_AI_MODEL.to_string(),
+        models: vec![DEFAULT_AI_MODEL.to_string()],
+        enabled_models: vec![DEFAULT_AI_MODEL.to_string()],
+        api_format: DEFAULT_AI_API_FORMAT.to_string(),
+        use_api_key: true,
+        api_key_secret_id: None,
+    };
+    current.active_account_id = account.id.clone();
+    current.accounts.push(account);
+    current.version = AI_CONFIG_VERSION;
+    normalize_ai_config_store(&mut current)?;
+    save_ai_config(&current)?;
+    *state.ai_config.lock().await = current.clone();
+    ai_config_snapshot(&current, None, None)
+}
+
+#[tauri::command]
+async fn delete_ai_provider_account(
+    request: AiAccountIdRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<AiProviderConfig, String> {
+    if let Some(error) = state.ai_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let account_id = request.account_id.trim().to_string();
+    if account_id.is_empty() {
+        return Err("账号 id 不能为空".to_string());
+    }
+    let mut current = state.ai_config.lock().await.clone();
+    if current.accounts.len() <= 1 {
+        return Err("至少保留一个 AI 账号".to_string());
+    }
+    let removed = find_ai_account(&current, Some(&account_id))?.clone();
+    current.accounts.retain(|item| item.id != account_id);
+    if current.active_account_id == account_id {
+        current.active_account_id = current.accounts[0].id.clone();
+    }
+    current.version = AI_CONFIG_VERSION;
+    normalize_ai_config_store(&mut current)?;
+    save_ai_config(&current)?;
+    if let Some(secret_id) = removed.api_key_secret_id {
+        let mut credentials = state.credentials.lock().await;
+        credentials.vault.entries.remove(&secret_id);
+        if let Err(error) = save_credential_vault(&credentials.vault) {
+            eprintln!("[Credential] deleted AI account key cleanup deferred: {error}");
+        }
+    }
+    *state.ai_config.lock().await = current.clone();
+    let active = find_ai_account(&current, None)?;
+    let credentials = state.credentials.lock().await;
+    let api_key = resolve_ai_api_key(&credentials, active.api_key_secret_id.as_deref())?;
+    ai_config_snapshot(&current, api_key, None)
+}
+
+#[tauri::command]
+async fn set_active_ai_provider_account(
+    request: AiAccountIdRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<AiProviderConfig, String> {
+    if let Some(error) = state.ai_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let account_id = request.account_id.trim().to_string();
+    let mut current = state.ai_config.lock().await.clone();
+    find_ai_account(&current, Some(&account_id))?;
+    current.active_account_id = account_id;
+    current.version = AI_CONFIG_VERSION;
+    save_ai_config(&current)?;
+    *state.ai_config.lock().await = current.clone();
+    let active = find_ai_account(&current, None)?;
+    let credentials = state.credentials.lock().await;
+    let api_key = match resolve_ai_api_key(&credentials, active.api_key_secret_id.as_deref()) {
+        Ok(key) => key,
+        Err(reveal_error) => {
+            eprintln!("[AI] reveal api key failed: {reveal_error}");
+            None
+        }
+    };
+    ai_config_snapshot(&current, api_key, None)
 }
 
 #[tauri::command]
@@ -5554,16 +6083,24 @@ async fn sync_ai_provider_models(
     if let Some(error) = state.ai_config_error.lock().await.clone() {
         return Err(error);
     }
-    let current = state.ai_config.lock().await.clone();
+    let mut current = state.ai_config.lock().await.clone();
+    let account_id = request
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(current.active_account_id.as_str())
+        .to_string();
+    let existing = find_ai_account(&current, Some(&account_id))?.clone();
     let base_url = validate_ai_base_url(
         request
             .base_url
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or(&current.base_url),
+            .unwrap_or(&existing.base_url),
     )?
     .to_string();
-    let use_api_key = request.use_api_key.unwrap_or(current.use_api_key);
+    let use_api_key = request.use_api_key.unwrap_or(existing.use_api_key);
     let supplied_key = request
         .api_key
         .as_deref()
@@ -5574,7 +6111,7 @@ async fn sync_ai_provider_models(
         if let Some(key) = supplied_key {
             Some(Zeroizing::new(key))
         } else {
-            let secret_id = current
+            let secret_id = existing
                 .api_key_secret_id
                 .as_deref()
                 .ok_or_else(|| "尚未配置 AI API Key".to_string())?;
@@ -5586,10 +6123,13 @@ async fn sync_ai_provider_models(
     };
 
     let endpoint = ai_models_url(&base_url)?;
+    let format_for_auth = if let Some(raw) = request.api_format.as_deref() {
+        validate_ai_api_format(raw)?
+    } else {
+        existing.api_format.clone()
+    };
     let mut builder = state.ai_http.get(endpoint);
-    if let Some(key) = api_key.as_deref() {
-        builder = builder.bearer_auth(key);
-    }
+    builder = apply_ai_provider_auth(builder, &format_for_auth, api_key.as_ref().map(|value| value.as_str()));
     let response = builder
         .send()
         .await
@@ -5607,24 +6147,19 @@ async fn sync_ai_provider_models(
         ));
     }
     let synced = parse_openai_model_ids(&body)?;
-    let models = normalize_ai_models(&merge_ai_models(&current.models, &synced)?, &current.model)?;
-    // 同步后仅保留仍存在的已选模型；当前 model 始终保留
+    let models = normalize_ai_models(&merge_ai_models(&existing.models, &synced)?, &existing.model)?;
     let enabled_models =
-        normalize_enabled_ai_models(&models, &current.enabled_models, &current.model)?;
-    let next = AiProviderConfigStore {
-        version: AI_CONFIG_VERSION,
-        base_url: current.base_url,
-        model: current.model,
-        models,
-        enabled_models,
-        reasoning_effort: current.reasoning_effort,
-        use_api_key: current.use_api_key,
-        api_key_secret_id: current.api_key_secret_id,
-    };
-    save_ai_config(&next)?;
-    *state.ai_config.lock().await = next.clone();
+        normalize_enabled_ai_models(&models, &existing.enabled_models, &existing.model)?;
+    {
+        let account = find_ai_account_mut(&mut current, Some(&account_id))?;
+        account.models = models;
+        account.enabled_models = enabled_models;
+    }
+    current.version = AI_CONFIG_VERSION;
+    save_ai_config(&current)?;
+    *state.ai_config.lock().await = current.clone();
     let revealed = api_key.as_ref().map(|key| key.as_str().to_string());
-    Ok(ai_config_snapshot(&next, revealed, None))
+    ai_config_snapshot(&current, revealed, None)
 }
 
 #[tauri::command]
@@ -5737,9 +6272,10 @@ async fn ai_chat(
         return Err(error);
     }
     let config = state.ai_config.lock().await.clone();
-    let endpoint = ai_chat_completions_url(&config.base_url)?;
-    let api_key = if config.use_api_key {
-        let secret_id = config
+    let account = find_ai_account(&config, None)?.clone();
+    let endpoint = ai_chat_endpoint(&account.base_url, &account.api_format)?;
+    let api_key = if account.use_api_key {
+        let secret_id = account
             .api_key_secret_id
             .as_deref()
             .ok_or_else(|| "尚未配置 AI API Key".to_string())?;
@@ -5749,15 +6285,19 @@ async fn ai_chat(
         None
     };
 
-    let payload = OpenAiChatRequest {
-        model: &config.model,
-        messages: &request.messages,
-        reasoning_effort: ai_request_reasoning_effort(&config.reasoning_effort),
+    let mut builder = state.ai_http.post(endpoint);
+    builder = apply_ai_provider_auth(builder, &account.api_format, api_key.as_ref().map(|value| value.as_str()));
+    let builder = if is_claude_api_format(&account.api_format) {
+        let payload = build_claude_messages_payload(&account.model, &request.messages, false)?;
+        builder.json(&payload)
+    } else {
+        let payload = OpenAiChatRequest {
+            model: &account.model,
+            messages: &request.messages,
+            reasoning_effort: ai_request_reasoning_effort(&config.reasoning_effort),
+        };
+        builder.json(&payload)
     };
-    let mut builder = state.ai_http.post(endpoint).json(&payload);
-    if let Some(key) = api_key.as_deref() {
-        builder = builder.bearer_auth(key);
-    }
     let response = builder
         .send()
         .await
@@ -5774,6 +6314,18 @@ async fn ai_chat(
             extract_provider_error(&body)
         ));
     }
+    if is_claude_api_format(&account.api_format) {
+        let value: Value = serde_json::from_str(&body)
+            .map_err(|error| format!("AI 供应商响应格式不兼容：{error}"))?;
+        let content = extract_claude_text_content(&value)
+            .ok_or_else(|| "AI 供应商响应中没有可用文本".to_string())?;
+        let model = value
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&account.model)
+            .to_string();
+        return Ok(AiChatResponse { content, model });
+    }
     let response: OpenAiChatResponse = serde_json::from_str(&body)
         .map_err(|error| format!("AI 供应商响应格式不兼容：{error}"))?;
     let content = response
@@ -5783,8 +6335,239 @@ async fn ai_chat(
         .ok_or_else(|| "AI 供应商响应中没有可用文本".to_string())?;
     Ok(AiChatResponse {
         content,
-        model: response.model.unwrap_or(config.model),
+        model: response.model.unwrap_or(account.model),
     })
+}
+
+/// 用草稿配置流式探测连通性：发 “hi”，统计首字/总耗时（不修改已保存配置）
+#[tauri::command]
+async fn test_ai_provider(
+    request: TestAiProviderRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<TestAiProviderResponse, String> {
+    if let Some(error) = state.ai_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    let base_url = validate_ai_base_url(&request.base_url)?.to_string();
+    let model = validate_ai_model(&request.model)?;
+    let current = state.ai_config.lock().await.clone();
+    let active = find_ai_account(&current, None)?;
+    let api_format = validate_ai_api_format(
+        request
+            .api_format
+            .as_deref()
+            .unwrap_or(&active.api_format),
+    )?;
+    let use_api_key = request.use_api_key.unwrap_or(true);
+    let supplied_key = request
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(ToString::to_string);
+    let api_key = if use_api_key {
+        if let Some(key) = supplied_key {
+            Some(Zeroizing::new(key))
+        } else {
+            let secret_id = active
+                .api_key_secret_id
+                .as_deref()
+                .ok_or_else(|| "尚未配置 AI API Key".to_string())?;
+            let credentials = state.credentials.lock().await;
+            Some(Zeroizing::new(resolve_credential(&credentials, secret_id)?))
+        }
+    } else {
+        None
+    };
+
+    let messages = vec![AiChatMessage {
+        role: "user".to_string(),
+        content: "hi".to_string(),
+    }];
+    let claude_format = is_claude_api_format(&api_format);
+    let endpoint = ai_chat_endpoint(&base_url, &api_format)?;
+    let mut builder = state.ai_http.post(endpoint);
+    builder = apply_ai_provider_auth(builder, &api_format, api_key.as_ref().map(|value| value.as_str()));
+    let builder = if claude_format {
+        let payload = build_claude_messages_payload(&model, &messages, true)?;
+        builder.json(&payload)
+    } else {
+        let payload = OpenAiChatStreamRequest {
+            model: &model,
+            messages: &messages,
+            stream: true,
+            reasoning_effort: None,
+            tools: None,
+            tool_choice: None,
+        };
+        builder.json(&payload)
+    };
+
+    let started = Instant::now();
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| format!("连接 API 失败：{error}"))?;
+    let connect_ms = elapsed_ms(started);
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // 部分网关忽略 stream，直接回 JSON
+    if content_type.contains("application/json") && !content_type.contains("event-stream") {
+        let body = response
+            .text()
+            .await
+            .map_err(|error| format!("测试响应读取失败：{error}"))?;
+        let total_ms = elapsed_ms(started);
+        if !status.is_success() {
+            return Err(format!(
+                "API 返回 HTTP {}：{}",
+                status.as_u16(),
+                extract_provider_error(&body)
+            ));
+        }
+        let (content, response_model) = if claude_format {
+            let value: Value = serde_json::from_str(&body)
+                .map_err(|error| format!("测试响应格式不兼容：{error}"))?;
+            let content = extract_claude_text_content(&value)
+                .ok_or_else(|| "测试响应中没有可用文本".to_string())?;
+            let response_model = value
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&model)
+                .to_string();
+            (content, response_model)
+        } else {
+            let parsed: OpenAiChatResponse = serde_json::from_str(&body)
+                .map_err(|error| format!("测试响应格式不兼容：{error}"))?;
+            let content = parsed
+                .choices
+                .first()
+                .and_then(|choice| extract_ai_content(&choice.message.content))
+                .ok_or_else(|| "测试响应中没有可用文本".to_string())?;
+            (
+                content,
+                parsed.model.unwrap_or_else(|| model.clone()),
+            )
+        };
+        return Ok(TestAiProviderResponse {
+            content,
+            model: response_model,
+            base_url,
+            api_format,
+            connect_ms,
+            // 非流式无法拆分首字，用总耗时近似
+            ttft_ms: total_ms,
+            total_ms,
+        });
+    }
+
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_default();
+        return Err(format!(
+            "API 返回 HTTP {}：{}",
+            status.as_u16(),
+            extract_provider_error(&body)
+        ));
+    }
+
+    let mut response = response;
+    let mut buffer = Vec::new();
+    let mut content = String::new();
+    let mut response_model = model.clone();
+    let mut ttft_ms: Option<u64> = None;
+
+    'stream: loop {
+        match response.chunk().await {
+            Ok(Some(bytes)) => buffer.extend_from_slice(&bytes),
+            Ok(None) => break,
+            Err(error) => {
+                return Err(format!("测试流式响应读取失败：{error}"));
+            }
+        }
+        for event in take_sse_events(&mut buffer) {
+            let data = match sse_data(&event) {
+                Ok(Some(data)) => data,
+                Ok(None) => continue,
+                Err(error) => return Err(error),
+            };
+            if data == "[DONE]" {
+                break 'stream;
+            }
+            if claude_format {
+                if data.contains("\"message_stop\"") {
+                    break 'stream;
+                }
+                match extract_claude_stream_delta(&data) {
+                    Ok(Some(delta)) => {
+                        if ttft_ms.is_none() {
+                            ttft_ms = Some(elapsed_ms(started));
+                        }
+                        content.push_str(&delta);
+                    }
+                    Ok(None) => {
+                        if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                            if let Some(m) = value
+                                .pointer("/message/model")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| value.get("model").and_then(|v| v.as_str()))
+                            {
+                                if !m.is_empty() {
+                                    response_model = m.to_string();
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                let chunk: OpenAiStreamChunk = serde_json::from_str(&data)
+                    .map_err(|error| format!("测试流式响应格式不兼容：{error}"))?;
+                if let Some(m) = chunk.model.filter(|value| !value.is_empty()) {
+                    response_model = m;
+                }
+                for choice in chunk.choices {
+                    if let Some(piece) = choice.delta.content.as_ref().and_then(extract_ai_content) {
+                        if !piece.is_empty() {
+                            if ttft_ms.is_none() {
+                                ttft_ms = Some(elapsed_ms(started));
+                            }
+                            content.push_str(&piece);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let total_ms = elapsed_ms(started);
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return Err("测试响应中没有可用文本".to_string());
+    }
+    let ttft_ms = ttft_ms.unwrap_or(total_ms);
+
+    Ok(TestAiProviderResponse {
+        content,
+        model: response_model,
+        base_url,
+        api_format,
+        connect_ms,
+        ttft_ms,
+        total_ms,
+    })
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn validate_ai_stored_action(action: &AiStoredAction) -> Result<usize, String> {
@@ -6155,9 +6938,10 @@ async fn ai_chat_stream(
         return Err(error);
     }
     let config = state.ai_config.lock().await.clone();
-    let endpoint = ai_chat_completions_url(&config.base_url)?;
-    let api_key = if config.use_api_key {
-        let secret_id = config
+    let account = find_ai_account(&config, None)?.clone();
+    let endpoint = ai_chat_endpoint(&account.base_url, &account.api_format)?;
+    let api_key = if account.use_api_key {
+        let secret_id = account
             .api_key_secret_id
             .as_deref()
             .ok_or_else(|| "尚未配置 AI API Key".to_string())?;
@@ -6175,29 +6959,53 @@ async fn ai_chat_stream(
         .as_deref()
         .map(str::trim)
         .is_some_and(|mode| mode.eq_ignore_ascii_case("agent"));
+    let claude_format = is_claude_api_format(&account.api_format);
+    if claude_format && agent_mode {
+        emit_ai_stream_event(
+            &app,
+            &request.request_id,
+            "error",
+            None,
+            None,
+            Some("Claude 接口格式暂不支持 Agent 工具调用，请切换到 OpenAI 格式或使用 Ask 模式".to_string()),
+        );
+        finish_ai_generation(&state, &request.request_id, &generation.signal).await;
+        return Ok(());
+    }
     let agent_tools = if agent_mode {
         Some(agent_openai_tools())
     } else {
         None
     };
-    let payload = OpenAiChatStreamRequest {
-        model: &config.model,
-        messages: &request.messages,
-        stream: true,
-        reasoning_effort: ai_request_reasoning_effort(&config.reasoning_effort),
-        tools: agent_tools.as_deref(),
-        tool_choice: agent_mode.then_some("auto"),
+    let mut builder = state.ai_http.post(endpoint);
+    builder = apply_ai_provider_auth(builder, &account.api_format, api_key.as_ref().map(|value| value.as_str()));
+    let builder = if claude_format {
+        let payload = match build_claude_messages_payload(&account.model, &request.messages, true) {
+            Ok(payload) => payload,
+            Err(error) => {
+                emit_ai_stream_event(&app, &request.request_id, "error", None, None, Some(error));
+                finish_ai_generation(&state, &request.request_id, &generation.signal).await;
+                return Ok(());
+            }
+        };
+        builder.json(&payload)
+    } else {
+        let payload = OpenAiChatStreamRequest {
+            model: &account.model,
+            messages: &request.messages,
+            stream: true,
+            reasoning_effort: ai_request_reasoning_effort(&config.reasoning_effort),
+            tools: agent_tools.as_deref(),
+            tool_choice: agent_mode.then_some("auto"),
+        };
+        builder.json(&payload)
     };
-    let mut builder = state.ai_http.post(endpoint).json(&payload);
-    if let Some(key) = api_key.as_deref() {
-        builder = builder.bearer_auth(key);
-    }
     emit_ai_stream_event(
         &app,
         &request.request_id,
         "started",
         None,
-        Some(config.model.clone()),
+        Some(account.model.clone()),
         None,
     );
     let send_result = tokio::select! {
@@ -6244,7 +7052,7 @@ async fn ai_chat_stream(
     }
 
     let mut buffer = Vec::new();
-    let mut response_model = config.model;
+    let mut response_model = account.model;
     let mut completed = false;
     let mut cancelled = false;
     let mut stream_error = None;
@@ -6311,6 +7119,41 @@ async fn ai_chat_stream(
                     completed = true;
                 }
                 break;
+            }
+            if claude_format {
+                if data.contains("\"message_stop\"") {
+                    if !completed {
+                        emit_ai_stream_event_with_tools(
+                            &app,
+                            &request.request_id,
+                            "completed",
+                            None,
+                            Some(response_model.clone()),
+                            None,
+                            None,
+                        );
+                        completed = true;
+                    }
+                    break;
+                }
+                match extract_claude_stream_delta(&data) {
+                    Ok(Some(content)) => {
+                        emit_ai_stream_event(
+                            &app,
+                            &request.request_id,
+                            "delta",
+                            Some(content),
+                            None,
+                            None,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        stream_error = Some(error);
+                        break 'stream;
+                    }
+                }
+                continue;
             }
             let chunk: OpenAiStreamChunk = match serde_json::from_str(&data) {
                 Ok(chunk) => chunk,
@@ -6829,6 +7672,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(state)
         .setup(|app| {
             #[cfg(target_os = "windows")]
@@ -6889,7 +7733,11 @@ fn main() {
             set_credential_protection,
             get_ai_provider_config,
             save_ai_provider_config,
+            add_ai_provider_account,
+            delete_ai_provider_account,
+            set_active_ai_provider_account,
             sync_ai_provider_models,
+            test_ai_provider,
             get_mcp_config,
             save_mcp_config,
             reconnect_mcp_server,
@@ -6934,6 +7782,8 @@ fn main() {
             get_process_list,
             get_upload_concurrency,
             apply_window_dark_mode,
+            about::fetch_latest_github_version,
+            about::open_external_url,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run PandaTerm");

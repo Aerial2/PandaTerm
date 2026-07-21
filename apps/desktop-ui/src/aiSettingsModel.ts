@@ -1,14 +1,96 @@
-import type { AiProviderConfig, McpConfigSnapshot, McpServerConfig, McpTransport } from './api';
+import type { AiApiFormat, AiProviderConfig, McpConfigSnapshot, McpServerConfig, McpTransport } from './api';
+import type { SelectOption } from './SelectDropdown';
 
 export type AiSettingsTab = 'models' | 'mcp';
 
 export type AiConfigDraft = {
+  account_id: string;
+  account_name: string;
   base_url: string;
   model: string;
   models: string[];
   enabled_models: string[];
+  api_format: AiApiFormat;
   use_api_key: boolean;
 };
+
+/** 设置页初始草稿 / 兜底 */
+export const DEFAULT_AI_CONFIG_DRAFT: AiConfigDraft = {
+  account_id: 'default',
+  account_name: '默认',
+  base_url: 'https://api.openai.com/v1',
+  model: 'gpt-4o-mini',
+  models: ['gpt-4o-mini'],
+  enabled_models: ['gpt-4o-mini'],
+  api_format: 'openai',
+  use_api_key: true,
+};
+
+export const AI_API_FORMAT_OPTIONS: readonly SelectOption<AiApiFormat>[] = [
+  { value: 'openai', label: 'OpenAI', description: 'chat/completions' },
+  { value: 'claude', label: 'Claude', description: 'Anthropic messages' },
+] as const;
+
+export function normalizeAiApiFormat(raw?: string | null): AiApiFormat {
+  const value = (raw ?? '').trim().toLowerCase();
+  if (value === 'claude' || value === 'anthropic') return 'claude';
+  return 'openai';
+}
+
+/** 测试耗时展示：<1s 用 ms，否则用 s */
+export function formatAiTestDurationMs(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return '—';
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
+
+/** 在模型列表中解析「用于测试」的当前选择 */
+export function resolveAiTestModel(models: string[], preferred: string, fallback: string): string {
+  const list = models.map((item) => item.trim()).filter(Boolean);
+  const pick = preferred.trim();
+  if (pick && list.includes(pick)) return pick;
+  const fb = fallback.trim();
+  if (fb && list.includes(fb)) return fb;
+  return list[0] || pick || fb || '';
+}
+
+export type AiProviderTestLogPhase = 'start' | 'success' | 'error';
+
+/** 连通性测试弹窗日志：模型 / 接口 / 首字 / 总耗时 / 回复 */
+export function buildAiProviderTestLog(input: {
+  phase: AiProviderTestLogPhase;
+  model: string;
+  baseUrl: string;
+  apiFormat: string;
+  content?: string;
+  ttftMs?: number | null;
+  totalMs?: number | null;
+  error?: string;
+}): string[] {
+  const formatLabel = input.apiFormat.trim().toLowerCase() === 'claude' ? 'claude' : 'openai';
+  const lines = [
+    `模型：${input.model}`,
+    `接口：${input.baseUrl}`,
+    `格式：${formatLabel}`,
+  ];
+  if (input.phase === 'start') {
+    return [...lines, '状态：请求中…'];
+  }
+  if (input.phase === 'error') {
+    const out = [...lines, '状态：失败'];
+    if (input.totalMs != null) out.push(`总耗时：${formatAiTestDurationMs(input.totalMs)}`);
+    out.push(`错误：${(input.error ?? '未知错误').trim() || '未知错误'}`);
+    return out;
+  }
+  return [
+    ...lines,
+    '状态：成功',
+    `首字响应：${formatAiTestDurationMs(input.ttftMs)}`,
+    `总耗时：${formatAiTestDurationMs(input.totalMs)}`,
+    '回复：',
+    (input.content ?? '').trim() || '(空)',
+  ];
+}
 
 export function resolveAiModelCatalog(config: Pick<AiProviderConfig, 'model' | 'models' | 'enabled_models'>) {
   const model = config.model.trim();
@@ -98,12 +180,55 @@ export function isAiConfigDraftDirty(
   if (!saved) return true;
   const draftCatalog = resolveAiModelCatalog(draft);
   const savedCatalog = resolveAiModelCatalog(saved);
+  if ((draft.account_id || '').trim() !== (saved.account_id || saved.active_account_id || '').trim()) return true;
+  if ((draft.account_name || '').trim() !== (saved.account_name || '').trim()) return true;
   if (draft.base_url.trim() !== saved.base_url.trim()) return true;
-  if (Boolean(draft.use_api_key) !== Boolean(saved.use_api_key)) return true;
+  if (normalizeAiApiFormat(draft.api_format) !== normalizeAiApiFormat(saved.api_format)) return true;
   if (draftCatalog.model !== savedCatalog.model) return true;
   if (draftCatalog.models.join('\0') !== savedCatalog.models.join('\0')) return true;
   if (draftCatalog.enabled_models.join('\0') !== savedCatalog.enabled_models.join('\0')) return true;
   return false;
+}
+
+/** 从后端配置填充设置草稿（当前激活账号） */
+export function aiConfigToDraft(config: AiProviderConfig): AiConfigDraft {
+  const catalog = resolveAiModelCatalog(config);
+  return {
+    account_id: config.account_id || config.active_account_id || '',
+    account_name: (config.account_name || '默认').trim() || '默认',
+    base_url: config.base_url,
+    model: catalog.model,
+    models: catalog.models,
+    enabled_models: catalog.enabled_models,
+    api_format: normalizeAiApiFormat(config.api_format),
+    use_api_key: true,
+  };
+}
+
+/**
+ * 设置页 provider 状态：保留多账号摘要，不长期挂明文密钥。
+ * （api_key 只进草稿 input）
+ */
+export function aiConfigToProviderState(config: AiProviderConfig): AiProviderConfig {
+  const catalog = resolveAiModelCatalog(config);
+  const accountId = (config.account_id || config.active_account_id || '').trim();
+  const accounts = Array.isArray(config.accounts) ? config.accounts : [];
+  return {
+    account_id: accountId,
+    account_name: (config.account_name || '默认').trim() || '默认',
+    base_url: config.base_url,
+    model: catalog.model,
+    models: catalog.models,
+    enabled_models: catalog.enabled_models,
+    reasoning_effort: normalizeAiReasoningEffort(config.reasoning_effort),
+    api_format: normalizeAiApiFormat(config.api_format),
+    use_api_key: true,
+    api_key_configured: Boolean(config.api_key_configured),
+    api_key: null,
+    accounts,
+    active_account_id: (config.active_account_id || accountId).trim(),
+    error: config.error ?? null,
+  };
 }
 
 export function mergeMcpServerImports(

@@ -756,6 +756,8 @@ pub fn export_mcp_servers_cursor_json(servers: &[McpServerConfig]) -> Result<Str
 
 /// 合并导入服务器到现有列表。
 /// `overwrite=true`：同 id 覆盖；`false`：同 id 跳过。
+/// 生产路径合并在前端 `mergeMcpServerImports`；此处供单元测试与逻辑对齐。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn merge_mcp_server_imports(
     existing: Vec<McpServerConfig>,
     imported: Vec<McpServerConfig>,
@@ -763,6 +765,7 @@ pub fn merge_mcp_server_imports(
     merge_mcp_server_imports_with_strategy(existing, imported, true)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn merge_mcp_server_imports_with_strategy(
     existing: Vec<McpServerConfig>,
     imported: Vec<McpServerConfig>,
@@ -1005,6 +1008,8 @@ fn resolve_with_pathext_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// 仅用于单元测试：生产启动已改用 CreateProcess 分参，不再手工拼 cmd 命令行。
+#[cfg(test)]
 fn windows_quote_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "\"\"".to_string();

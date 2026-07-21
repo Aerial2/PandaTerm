@@ -9,7 +9,7 @@
  */
 
 /** GitHub owner/repo，用于拉取最新 release / tag */
-export const PANDATERM_GITHUB_REPO = 'PandaTerm/PandaTerm';
+export const PANDATERM_GITHUB_REPO = 'Aerial2/PandaTerm';
 
 export type LatestVersionOk = {
   ok: true;
@@ -69,76 +69,20 @@ export async function getCurrentAppVersion(): Promise<string> {
   }
 }
 
-type GithubReleaseJson = {
-  tag_name?: string;
-  html_url?: string;
-};
-
-type GithubTagJson = {
-  name?: string;
-};
-
-async function githubGet(path: string): Promise<Response> {
-  return fetch(`https://api.github.com${path}`, {
-    headers: {
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-    },
-  });
-}
-
-async function fetchLatestFromTags(repo: string): Promise<LatestVersionResult> {
-  const res = await githubGet(`/repos/${repo}/tags?per_page=1`);
-  if (!res.ok) {
-    if (res.status === 404) {
-      return { ok: false, error: `仓库不存在或未公开：${repo}` };
-    }
-    return { ok: false, error: `GitHub tags HTTP ${res.status}` };
-  }
-  const list = (await res.json()) as GithubTagJson[];
-  const tag = list[0]?.name?.trim() ?? '';
-  if (!tag) {
-    return { ok: false, error: '仓库尚无 release / tag' };
-  }
-  return {
-    ok: true,
-    version: normalizeVersion(tag),
-    tag,
-    htmlUrl: githubReleasesUrl(repo),
-    source: 'tag',
-  };
-}
-
-/**
- * 从 GitHub 获取最新版本：
- * 1) GET /repos/{owner}/{repo}/releases/latest
- * 2) 404 时 GET /repos/{owner}/{repo}/tags?per_page=1
- */
 export async function fetchLatestGithubVersion(
   repo = PANDATERM_GITHUB_REPO,
 ): Promise<LatestVersionResult> {
   try {
-    const res = await githubGet(`/repos/${repo}/releases/latest`);
-    if (res.status === 404) {
-      return await fetchLatestFromTags(repo);
-    }
-    if (!res.ok) {
-      return { ok: false, error: `GitHub releases HTTP ${res.status}` };
-    }
-    const data = (await res.json()) as GithubReleaseJson;
-    const tag = data.tag_name?.trim() ?? '';
-    if (!tag) {
-      return { ok: false, error: 'release 缺少 tag_name' };
-    }
-    return {
-      ok: true,
-      version: normalizeVersion(tag),
-      tag,
-      htmlUrl: data.html_url?.trim() || githubReleasesUrl(repo),
-      source: 'release',
-    };
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<LatestVersionOk>('fetch_latest_github_version', { repo });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, error: message || '网络请求失败' };
+    return { ok: false, error: message || '版本检查失败' };
   }
+}
+
+/** 由 Rust 后端调用系统默认浏览器，失败时向界面返回具体原因。 */
+export async function openExternalUrl(url: string): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('open_external_url', { url });
 }

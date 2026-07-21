@@ -467,7 +467,21 @@ export async function setCredentialProtection(
   });
 }
 
+export type AiApiFormat = 'openai' | 'claude';
+
+export type AiProviderAccountView = {
+  id: string;
+  name: string;
+  base_url: string;
+  model: string;
+  api_format: string;
+  api_key_configured: boolean;
+};
+
 export type AiProviderConfig = {
+  /** 当前激活账号 */
+  account_id: string;
+  account_name: string;
   base_url: string;
   model: string;
   models: string[];
@@ -475,10 +489,14 @@ export type AiProviderConfig = {
   enabled_models: string[];
   /** OpenAI-compatible reasoning_effort；none 表示请求不带该字段 */
   reasoning_effort: string;
+  /** 接口兼容格式：openai | claude */
+  api_format: AiApiFormat | string;
   use_api_key: boolean;
   api_key_configured: boolean;
   /** 本机 vault 解密后的密钥；仅用于设置页回填展示 */
   api_key?: string | null;
+  accounts: AiProviderAccountView[];
+  active_account_id: string;
   error?: string | null;
 };
 
@@ -606,35 +624,93 @@ export async function getAiProviderConfig(): Promise<AiProviderConfig> {
 
 export async function saveAiProviderConfig(
   config: Pick<AiProviderConfig, 'base_url' | 'model' | 'use_api_key'> & {
+    account_id?: string;
+    account_name?: string;
     models?: string[];
     enabled_models?: string[];
     reasoning_effort?: string;
+    api_format?: string;
   },
   apiKey?: string | null,
 ): Promise<AiProviderConfig> {
   return await invoke<AiProviderConfig>('save_ai_provider_config', {
     request: {
+      account_id: config.account_id ?? null,
+      account_name: config.account_name ?? null,
       base_url: config.base_url,
       model: config.model,
       models: config.models ?? null,
       enabled_models: config.enabled_models ?? null,
       reasoning_effort: config.reasoning_effort ?? null,
+      api_format: config.api_format ?? null,
       use_api_key: config.use_api_key,
       api_key: apiKey || null,
     },
   });
 }
 
+export async function addAiProviderAccount(): Promise<AiProviderConfig> {
+  return await invoke<AiProviderConfig>('add_ai_provider_account');
+}
+
+export async function deleteAiProviderAccount(accountId: string): Promise<AiProviderConfig> {
+  return await invoke<AiProviderConfig>('delete_ai_provider_account', {
+    request: { account_id: accountId },
+  });
+}
+
+export async function setActiveAiProviderAccount(accountId: string): Promise<AiProviderConfig> {
+  return await invoke<AiProviderConfig>('set_active_ai_provider_account', {
+    request: { account_id: accountId },
+  });
+}
+
 export async function syncAiProviderModels(options?: {
+  account_id?: string | null;
   base_url?: string | null;
   use_api_key?: boolean | null;
   api_key?: string | null;
+  api_format?: string | null;
 }): Promise<AiProviderConfig> {
   return await invoke<AiProviderConfig>('sync_ai_provider_models', {
     request: {
+      account_id: options?.account_id ?? null,
       base_url: options?.base_url ?? null,
       use_api_key: options?.use_api_key ?? null,
       api_key: options?.api_key || null,
+      api_format: options?.api_format ?? null,
+    },
+  });
+}
+
+export type AiProviderTestResult = {
+  content: string;
+  model: string;
+  base_url: string;
+  api_format: string;
+  /** 发起 → HTTP 响应头 */
+  connect_ms: number;
+  /** 发起 → 首个文本 token */
+  ttft_ms: number;
+  /** 发起 → 完整结束 */
+  total_ms: number;
+};
+
+/** 使用草稿配置流式探测连通性（不落盘；返回首字/总耗时） */
+export async function testAiProvider(request: {
+  base_url: string;
+  model: string;
+  api_format?: string | null;
+  use_api_key?: boolean | null;
+  api_key?: string | null;
+}): Promise<AiProviderTestResult> {
+  return await invoke<AiProviderTestResult>('test_ai_provider', {
+    request: {
+      base_url: request.base_url,
+      model: request.model,
+      api_format: request.api_format ?? null,
+      use_api_key: request.use_api_key ?? true,
+      api_key: request.api_key || null,
     },
   });
 }

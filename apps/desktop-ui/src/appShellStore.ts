@@ -43,10 +43,33 @@ let transferLogSnapshot: TransferLogSnapshot = {
   logEntries: [],
 };
 const transferLogListeners = new Set<() => void>();
+/** 进度类写入合并到下一帧再通知 UI，避免高频进度事件拖垮列表 */
+let transferLogRaf: number | null = null;
 
-function emitTransferLog(next: TransferLogSnapshot): void {
-  transferLogSnapshot = next;
+function flushTransferLogListeners(): void {
+  if (transferLogRaf != null) {
+    cancelAnimationFrame(transferLogRaf);
+    transferLogRaf = null;
+  }
   transferLogListeners.forEach((listener) => listener());
+}
+
+function scheduleTransferLogListeners(): void {
+  if (transferLogRaf != null) return;
+  transferLogRaf = requestAnimationFrame(() => {
+    transferLogRaf = null;
+    transferLogListeners.forEach((listener) => listener());
+  });
+}
+
+/** sync：立刻通知（增删/终态）；raf：同帧多次进度更新只通知一次 */
+function emitTransferLog(next: TransferLogSnapshot, mode: 'sync' | 'raf' = 'sync'): void {
+  transferLogSnapshot = next;
+  if (mode === 'sync') {
+    flushTransferLogListeners();
+    return;
+  }
+  scheduleTransferLogListeners();
 }
 
 export function getTransferLogSnapshot(): TransferLogSnapshot {
@@ -98,30 +121,50 @@ export function addTransferRecords(
   }));
   emitTransferLog({
     ...transferLogSnapshot,
-    transferRecords: [...fulls, ...transferLogSnapshot.transferRecords].slice(0, 100),
+    // 不截断：条数上限交给 UI 虚拟列表承担渲染成本
+    transferRecords: [...fulls, ...transferLogSnapshot.transferRecords],
   });
   return fulls.map((row) => row.id);
+}
+
+function transferRecordChanged(prev: TransferRecord, next: TransferRecord): boolean {
+  return (
+    prev.fileName !== next.fileName ||
+    prev.direction !== next.direction ||
+    prev.target !== next.target ||
+    prev.size !== next.size ||
+    prev.status !== next.status ||
+    prev.message !== next.message ||
+    prev.time !== next.time ||
+    prev.progress !== next.progress ||
+    prev.transferred !== next.transferred ||
+    prev.speed !== next.speed ||
+    prev.startTime !== next.startTime ||
+    prev.endTime !== next.endTime
+  );
 }
 
 export function updateTransferRecord(
   id: string,
   patch: Partial<TransferRecord> | ((prev: TransferRecord) => Partial<TransferRecord>),
 ): void {
-  let changed = false;
-  const transferRecords = transferLogSnapshot.transferRecords.map((row) => {
-    if (row.id !== id) return row;
-    changed = true;
-    const next: TransferRecord = {
-      ...row,
-      ...(typeof patch === 'function' ? patch(row) : patch),
-    };
-    if (isTransferTerminal(next.status) && next.endTime == null) {
-      next.endTime = Date.now();
-    }
-    return next;
-  });
-  if (!changed) return;
-  emitTransferLog({ ...transferLogSnapshot, transferRecords });
+  const index = transferLogSnapshot.transferRecords.findIndex((row) => row.id === id);
+  if (index < 0) return;
+  const row = transferLogSnapshot.transferRecords[index];
+  const next: TransferRecord = {
+    ...row,
+    ...(typeof patch === 'function' ? patch(row) : patch),
+  };
+  if (isTransferTerminal(next.status) && next.endTime == null) {
+    next.endTime = Date.now();
+  }
+  if (!transferRecordChanged(row, next)) return;
+
+  const transferRecords = transferLogSnapshot.transferRecords.slice();
+  transferRecords[index] = next;
+  // 终态立刻刷新；进度/速度等高频字段合并到 rAF
+  const mode = isTransferTerminal(next.status) || next.status !== row.status ? 'sync' : 'raf';
+  emitTransferLog({ ...transferLogSnapshot, transferRecords }, mode);
 }
 
 export function deleteTransferRecord(id: string): void {

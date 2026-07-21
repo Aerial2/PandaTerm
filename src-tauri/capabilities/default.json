@@ -22,6 +22,7 @@
     "core:app:default",
     "core:path:default",
     "clipboard-manager:allow-read-text",
-    "clipboard-manager:allow-write-text"
+    "clipboard-manager:allow-write-text",
+    "opener:allow-open-url"
   ]
 }

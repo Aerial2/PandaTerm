@@ -17,6 +17,7 @@ import {
   githubReleasesUrl,
   githubRepoUrl,
   isNewerVersion,
+  openExternalUrl,
   PANDATERM_GITHUB_REPO,
   type LatestVersionResult,
 } from './aboutModel';
@@ -63,6 +64,7 @@ type AboutState = {
   currentVersion: string;
   latest: LatestVersionResult | null;
   loadingLatest: boolean;
+  linkError: string | null;
 };
 
 /**
@@ -84,13 +86,19 @@ export function TopMenubar({
     currentVersion: '…',
     latest: null,
     loadingLatest: false,
+    linkError: null,
   });
 
   const hasSession = Boolean(sessionName || sessionUser || sessionHost);
-  const displayHost = showIp ? sessionHost : maskHost(sessionHost);
-  const statusText = hasSession
-    ? `${sessionName}${sessionName && (sessionUser || sessionHost) ? ' · ' : ''}${sessionUser}${sessionUser || sessionHost ? '@' : ''}${displayHost}`
-    : '';
+  const displayHost = sessionHost ? (showIp ? sessionHost : maskHost(sessionHost)) : '';
+  // name · user@host；缺省字段不硬拼 @
+  const accountPart =
+    sessionUser && displayHost
+      ? `${sessionUser}@${displayHost}`
+      : sessionUser || displayHost;
+  const statusText = sessionName && accountPart
+    ? `${sessionName} · ${accountPart}`
+    : sessionName || accountPart;
 
   useEffect(() => {
     if (!activeMenu) return;
@@ -105,7 +113,7 @@ export function TopMenubar({
     if (!aboutOpen) return;
     let cancelled = false;
 
-    setAbout((prev) => ({ ...prev, loadingLatest: true, latest: null }));
+    setAbout((prev) => ({ ...prev, loadingLatest: true, latest: null, linkError: null }));
 
     void (async () => {
       const currentVersion = await getCurrentAppVersion();
@@ -114,7 +122,7 @@ export function TopMenubar({
 
       const latest = await fetchLatestGithubVersion();
       if (cancelled) return;
-      setAbout({ currentVersion, latest, loadingLatest: false });
+      setAbout({ currentVersion, latest, loadingLatest: false, linkError: null });
     })();
 
     return () => {
@@ -137,6 +145,19 @@ export function TopMenubar({
 
   function openAbout() {
     setAboutOpen(true);
+  }
+
+  async function openAboutLink(url: string) {
+    setAbout((current) => ({ ...current, linkError: null }));
+    try {
+      await openExternalUrl(url);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setAbout((current) => ({
+        ...current,
+        linkError: message || '系统浏览器打开失败',
+      }));
+    }
   }
 
   const latestLabel = about.loadingLatest
@@ -302,20 +323,22 @@ export function TopMenubar({
             <>
               <span
                 className="top-status-text"
-                title={showIp ? statusText : undefined}
+                title={showIp || !sessionHost ? statusText : undefined}
               >
                 {statusText}
               </span>
-              <button
-                type="button"
-                className="top-status-ip-toggle"
-                onClick={toggleShowIp}
-                title={showIp ? '隐藏 IP' : '显示 IP'}
-                aria-label={showIp ? '隐藏 IP' : '显示 IP'}
-                aria-pressed={showIp}
-              >
-                {showIp ? <Eye size={14} /> : <EyeOff size={14} />}
-              </button>
+              {sessionHost ? (
+                <button
+                  type="button"
+                  className="top-status-ip-toggle"
+                  onClick={toggleShowIp}
+                  title={showIp ? '隐藏 IP' : '显示 IP'}
+                  aria-label={showIp ? '隐藏 IP' : '显示 IP'}
+                  aria-pressed={showIp}
+                >
+                  {showIp ? <Eye size={14} /> : <EyeOff size={14} />}
+                </button>
+              ) : null}
             </>
           )}
         </div>
@@ -356,12 +379,18 @@ export function TopMenubar({
                   target="_blank"
                   rel="noreferrer"
                   title={PANDATERM_GITHUB_REPO}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    void openAboutLink(githubRepoUrl(PANDATERM_GITHUB_REPO));
+                  }}
                 >
                   GitHub · {PANDATERM_GITHUB_REPO}
                 </a>
               </div>
             </div>
-            {!about.loadingLatest && about.latest && !about.latest.ok ? (
+            {about.linkError ? (
+              <p className="about-dialog-error">{about.linkError}</p>
+            ) : !about.loadingLatest && about.latest && !about.latest.ok ? (
               <p className="about-dialog-error">{about.latest.error}</p>
             ) : null}
             <div className="dialog-actions">
@@ -369,7 +398,7 @@ export function TopMenubar({
                 type="button"
                 className="dialog-btn"
                 onClick={() => {
-                  window.open(releaseUrl, '_blank', 'noopener,noreferrer');
+                  void openAboutLink(releaseUrl);
                 }}
               >
                 打开发布页
