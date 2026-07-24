@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { Terminal, type ITheme } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import {
   addLogEntry,
@@ -14,6 +14,7 @@ import {
   updateTransferRecord,
 } from './appShellStore';
 import { EditorPanel, detectLanguage, type EditorTab } from './EditorPanel';
+import { scrollHorizontallyOnWheel } from './wheelScroll';
 import { VscodeFileIcon } from './FileIcon';
 import { ResourceBottomPanel } from './ResourceBottomPanel';
 import { StatusBar } from './StatusBar';
@@ -25,7 +26,6 @@ import {
   compareResource,
   formatFileSize,
   formatModifiedTime,
-  getFileExt,
   getMediaKind,
   isArchive,
   joinRemotePath,
@@ -34,15 +34,12 @@ import {
   type InlineRenameState,
   type ResourceFile,
   type ResourceSortKey,
-  type UploadConflictAction,
   type UploadConflictApplyAll,
   type UploadConflictDecision,
   type UploadConflictDialogState,
 } from './resourceModel';
 import {
   TERMINAL_PANE_EDGE_DROP_RATIO,
-  TERMINAL_SPLIT_RATIO_MAX,
-  TERMINAL_SPLIT_RATIO_MIN,
   TERMINAL_TAB_DRAG_THRESHOLD,
   activateTerminalPaneTab,
   addTerminalTabToPane,
@@ -57,9 +54,7 @@ import {
   reorderPaneTabIds,
   terminalLayoutContainsSplit,
   updateTerminalSplitRatio,
-  type TabKind,
   type TerminalActivityEntry,
-  type TerminalDragOperation,
   type TerminalDragState,
   type TerminalDropSide,
   type TerminalLayoutNode,
@@ -68,7 +63,6 @@ import {
   type TerminalSizeSnapshot,
   type TerminalSplitDirection,
   type TerminalSplitResizeCandidate,
-  type TerminalStatus,
   type WorkspaceTab,
 } from './terminalLayout';
 import { TopMenubar } from './TopMenubar';
@@ -125,8 +119,6 @@ import {
   connectSession,
   disconnectSession,
   getLocalTerminalProfile,
-  getSystemMonitor,
-  getProcessList,
   getAiProviderConfig,
   saveAiProviderConfig,
   syncAiProviderModels,
@@ -148,13 +140,11 @@ import {
   saveAiConversation,
   deleteAiConversation,
   runAiTerminalCommand,
-  type ProcessInfo,
   type McpServerConfig,
   type McpConfigSnapshot,
   type McpImportCandidate,
   listLocalDirectory,
   listRemoteDirectory,
-  listSessions,
   readLocalFileFull,
   readRemoteFileFull,
   writeLocalFile,
@@ -165,7 +155,6 @@ import {
   uploadLocalFile,
   cancelTransfer,
   uploadDirectory,
-  readFileAsDataUrl,
   downloadRemoteFile,
   extractArchive,
   createArchive,
@@ -187,7 +176,9 @@ import {
   openAiSettingsWindow,
   preloadConnectionWindows,
 } from './api';
-import type { AiChatMessage, AiChatStreamEvent, AiProviderConfig, LocalDirectoryEntry, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, TerminalStatusEvent, SystemMonitorData } from './api';
+import type { AiChatStreamEvent, AiProviderConfig, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, TerminalStatusEvent } from './api';
+import { useSystemMonitor } from './useSystemMonitor';
+import { useMediaViewer } from './useMediaViewer';
 import {
   applyTerminalLifecycleState,
   shouldApplyTerminalStatus,
@@ -243,26 +234,17 @@ import {
   AI_AGENT_MAX_CONTINUATIONS,
   AI_AGENT_RESULT_LABEL_PREFIX,
   AI_EMPTY_SUGGESTIONS,
-  AI_HISTORY_CHAR_BUDGET,
-  AI_HISTORY_MESSAGE_LIMIT,
   AI_MODE_OPTIONS,
   AI_REASONING_EFFORT_OPTIONS,
-  AI_REQUEST_MESSAGE_CHAR_LIMIT,
-  AI_REQUEST_TRUNCATION_MARKER,
-  aiAgentContinuationCount,
-  aiSystemMessage,
   buildAgentContinuationPrompt,
   buildAiRequestMessages,
   canContinueAiAgent,
   estimateAiContextUsage,
   formatAiContextAmount,
-  formatAiRequestContent,
   formatMcpToolsCatalog,
   isAiAgentContinuationMessage,
-  limitAiRequestMessage,
   normalizeAiReasoningEffort,
   resolveAiChatModelOptions,
-  type AiContextUsage,
   type AiReasoningEffort,
 } from './aiChatModel';
 import {
@@ -345,13 +327,11 @@ const fallbackLocalTerminalProfile: LocalTerminalProfile = {
   banner: [],
 };
 
-const appWindowParams = new URLSearchParams(window.location.search);
 const isAiSettingsWindow = false;
 const initialAiSettingsTab: 'models' | 'mcp' = 'models';
 
 export function App() {
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
-  const [sessions, setSessions] = useState<Session[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   /** 左侧栏宽度：拖动中只改 DOM，pointerup 再 commit 一次 */
   const [resourcePanelWidth, setResourcePanelWidth] = useState(40);
@@ -361,14 +341,6 @@ export function App() {
   // Left-side activity bar state — which panel is open
   const [leftActivity, setLeftActivity] = useState<'files' | 'monitor' | 'processes' | 'ai' | null>('files');
 
-  const [monitorData, setMonitorData] = useState<SystemMonitorData | null>(null);
-  const [isLoadingMonitor, setIsLoadingMonitor] = useState(false);
-  const monitorRequestGenerationRef = useRef(0);
-  const [processList, setProcessList] = useState<ProcessInfo[]>([]);
-  const [isLoadingProcesses, setIsLoadingProcesses] = useState(false);
-  const processRequestGenerationRef = useRef(0);
-  const [processSortKey, setProcessSortKey] = useState<'cpu' | 'memory' | 'name'>('cpu');
-  const [processSearch, setProcessSearch] = useState('');
   const [aiWorkspace, setAiWorkspace] = useState(() => {
     const conversation = createAiConversationState();
     return { conversations: [conversation], activeConversationId: conversation.id };
@@ -414,7 +386,6 @@ export function App() {
   const aiApiKeyBaselineRef = useRef('');
   const aiApiKeyInputRef = useRef<HTMLInputElement | null>(null);
   const isAiSettingsOpenRef = useRef(false);
-  const aiSettingsAllowCloseRef = useRef(false);
   const openAiSettingsRef = useRef<(tab?: 'models' | 'mcp') => void>(() => {});
   const requestCloseAiSettingsRef = useRef<() => void>(() => {});
   isAiSettingsOpenRef.current = isAiSettingsOpen;
@@ -512,9 +483,6 @@ export function App() {
   const inlineRenameInputRef = useRef<HTMLInputElement | null>(null);
   const lastPlainFileClickRef = useRef<{ path: string; at: number } | null>(null);
   const pendingInlineRenameTimerRef = useRef<number | null>(null);
-  const [mediaViewer, setMediaViewer] = useState<{ url: string; name: string; kind: 'image' | 'video' | 'audio' } | null>(null);
-  const [isLoadingMedia, setIsLoadingMedia] = useState(false);
-  const [mediaError, setMediaError] = useState('');
   const [sortKey, setSortKey] = useState<ResourceSortKey>('name');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
   /** 递增以唤起底部面板本地终端 */
@@ -734,7 +702,6 @@ export function App() {
   // stack so switching between local and remote panes restores the right trail.
   const navHistoryRef = useRef<Map<string, { history: string[]; index: number }>>(new Map());
   const directoryLoadGenerationRef = useRef(0);
-  const mediaLoadGenerationRef = useRef(0);
 
   function getTerminalViewportSize(tabId: string) {
     const host = terminalHostsRef.current.get(tabId);
@@ -1051,8 +1018,7 @@ export function App() {
       resourceFilesRef.current = nextFiles;
       setSelectedFiles(new Set());
       setLastClickedIndex(-1);
-      setMediaViewer(null);
-      setMediaError('');
+      closeMediaViewer();
       return listing;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1115,8 +1081,7 @@ export function App() {
       resourceFilesRef.current = nextFiles;
       setSelectedFiles(new Set());
       setLastClickedIndex(-1);
-      setMediaViewer(null);
-      setMediaError('');
+      closeMediaViewer();
 
       // Update per-pane navigation history.
       const entry = navHistoryRef.current.get(paneKey);
@@ -1171,13 +1136,6 @@ export function App() {
   useEffect(() => {
     loadLocalDirectory(null);
     loadTerminalDirectory(fallbackLocalTerminalProfile.cwd);
-    listSessions()
-      .then(setSessions)
-      .catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        setStatusMessage(`加载连接列表失败：${message}`);
-        setSessions([]);
-      });
   }, []);
 
   useEffect(() => {
@@ -1249,21 +1207,36 @@ export function App() {
     : (statusFocusSession?.name ?? '');
   const topStatusUser = statusFocusEditor ? '' : (statusFocusSession?.username ?? '');
   const topStatusHost = statusFocusEditor ? '' : (statusFocusSession?.host ?? '');
-  // 其余逻辑仍用当前工作区会话（资源树 / 菜单兜底）
-  const activeSession = activePaneTab?.session ?? activeTab?.session ?? localSession;
   const activePaneTabRef = useRef<WorkspaceTab | null>(null);
   useEffect(() => {
     activePaneTabRef.current = activePaneTab;
   }, [activePaneTab]);
 
+  const {
+    monitorData,
+    isLoadingMonitor,
+    processList,
+    isLoadingProcesses,
+    processSortKey,
+    setProcessSortKey,
+    processSearch,
+    setProcessSearch,
+  } = useSystemMonitor({ leftActivity, activePaneTabRef, isLocalResourceTab });
+
+  const {
+    mediaViewer,
+    isLoadingMedia,
+    mediaError,
+    openMediaViewer,
+    closeMediaViewer,
+    resetMediaViewer,
+  } = useMediaViewer({ activePaneTabRef, isLocalResourceTab });
+
   // When the active pane changes (switching tabs, focusing a different split
   // pane, or after a remote connection establishes), reload the resource panel
   // so it reflects the newly focused terminal's filesystem.
   useEffect(() => {
-    mediaLoadGenerationRef.current += 1;
-    setIsLoadingMedia(false);
-    setMediaViewer(null);
-    setMediaError('');
+    resetMediaViewer();
     if (!activePaneTab) return;
     // Remote panes become browseable only after the SSH terminal is ready.
     const ready = isLocalResourceTab(activePaneTab) || activePaneTab.status === 'connected';
@@ -1928,36 +1901,6 @@ export function App() {
 
     // Everything else -> built-in editor
     void openFileInEditor(file);
-  }
-
-  async function openMediaViewer(file: ResourceFile, kind: 'image' | 'video' | 'audio') {
-    const generation = ++mediaLoadGenerationRef.current;
-    const tab = activePaneTabRef.current;
-    const paneId = tab?.id ?? null;
-    const terminalId = isLocalResourceTab(tab) ? null : tab?.terminalId ?? null;
-    const isCurrentTarget = () => {
-      const currentTab = activePaneTabRef.current;
-      const currentTerminalId = isLocalResourceTab(currentTab) ? null : currentTab?.terminalId ?? null;
-      return generation === mediaLoadGenerationRef.current
-        && paneId === (currentTab?.id ?? null)
-        && terminalId === currentTerminalId;
-    };
-    setMediaViewer(null);
-    setMediaError('');
-    setIsLoadingMedia(true);
-    try {
-      const url = await readFileAsDataUrl(file.path, terminalId);
-      if (!isCurrentTarget()) return;
-      setMediaViewer({ url, name: file.name, kind });
-      setStatusMessage(`正在查看：${file.name}`);
-    } catch (error) {
-      if (!isCurrentTarget()) return;
-      const message = error instanceof Error ? error.message : String(error);
-      setMediaError(message);
-      setStatusMessage(`无法查看媒体文件：${message}`);
-    } finally {
-      if (isCurrentTarget()) setIsLoadingMedia(false);
-    }
   }
 
   function createUntitledEditorTab() {
@@ -3389,39 +3332,6 @@ export function App() {
       window.removeEventListener('blur', close);
     };
   }, [terminalContextMenu]);
-
-  // Poll serially so a slow SSH sample cannot overlap with the next request.
-  useEffect(() => {
-    if (leftActivity !== 'monitor') return;
-    let cancelled = false;
-    let timeoutId: number | null = null;
-    const poll = async () => {
-      await refreshMonitorData();
-      if (!cancelled) timeoutId = window.setTimeout(() => void poll(), 1000);
-    };
-    void poll();
-    return () => {
-      cancelled = true;
-      monitorRequestGenerationRef.current++;
-      if (timeoutId !== null) window.clearTimeout(timeoutId);
-    };
-  }, [leftActivity]);
-
-  useEffect(() => {
-    if (leftActivity !== 'processes') return;
-    let cancelled = false;
-    let timeoutId: number | null = null;
-    const poll = async () => {
-      await refreshProcessList();
-      if (!cancelled) timeoutId = window.setTimeout(() => void poll(), 3000);
-    };
-    void poll();
-    return () => {
-      cancelled = true;
-      processRequestGenerationRef.current++;
-      if (timeoutId !== null) window.clearTimeout(timeoutId);
-    };
-  }, [leftActivity]);
 
   useEffect(() => {
     if (leftActivity !== 'ai') return;
@@ -5262,80 +5172,6 @@ export function App() {
     cancelEditUserMessage();
   }
 
-  async function refreshMonitorData() {
-    const generation = ++monitorRequestGenerationRef.current;
-    const tab = activePaneTabRef.current;
-    const local = isLocalResourceTab(tab);
-    if (!local && !tab?.terminalId) {
-      setMonitorData(null);
-      setIsLoadingMonitor(false);
-      setStatusMessage('远程终端尚未连接，无法获取系统监控数据');
-      return;
-    }
-    const terminalId = local ? null : tab?.terminalId ?? null;
-    const targetPaneId = tab?.id ?? null;
-    const isCurrentTarget = () => {
-      const currentTab = activePaneTabRef.current;
-      const currentLocal = isLocalResourceTab(currentTab);
-      const currentTerminalId = currentLocal ? null : currentTab?.terminalId ?? null;
-      return generation === monitorRequestGenerationRef.current
-        && targetPaneId === (currentTab?.id ?? null)
-        && local === currentLocal
-        && terminalId === currentTerminalId;
-    };
-    setIsLoadingMonitor(true);
-    try {
-      const data = await getSystemMonitor(terminalId);
-      if (isCurrentTarget()) {
-        setMonitorData(data);
-      }
-    } catch (error) {
-      if (isCurrentTarget()) {
-        const message = error instanceof Error ? error.message : String(error);
-        setStatusMessage(`获取系统监控数据失败：${message}`);
-      }
-    } finally {
-      if (isCurrentTarget()) setIsLoadingMonitor(false);
-    }
-  }
-
-  async function refreshProcessList() {
-    const generation = ++processRequestGenerationRef.current;
-    const tab = activePaneTabRef.current;
-    const local = isLocalResourceTab(tab);
-    if (!local && !tab?.terminalId) {
-      setProcessList([]);
-      setIsLoadingProcesses(false);
-      setStatusMessage('远程终端尚未连接，无法获取进程列表');
-      return;
-    }
-    const terminalId = local ? null : tab?.terminalId ?? null;
-    const targetPaneId = tab?.id ?? null;
-    const isCurrentTarget = () => {
-      const currentTab = activePaneTabRef.current;
-      const currentLocal = isLocalResourceTab(currentTab);
-      const currentTerminalId = currentLocal ? null : currentTab?.terminalId ?? null;
-      return generation === processRequestGenerationRef.current
-        && targetPaneId === (currentTab?.id ?? null)
-        && local === currentLocal
-        && terminalId === currentTerminalId;
-    };
-    setIsLoadingProcesses(true);
-    try {
-      const data = await getProcessList(terminalId);
-      if (isCurrentTarget()) {
-        setProcessList(data);
-      }
-    } catch (error) {
-      if (isCurrentTarget()) {
-        const message = error instanceof Error ? error.message : String(error);
-        setStatusMessage(`获取进程列表失败：${message}`);
-      }
-    } finally {
-      if (isCurrentTarget()) setIsLoadingProcesses(false);
-    }
-  }
-
   function formatBytes(bytes: number): string {
     if (bytes === 0) return '0 B';
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -6020,17 +5856,7 @@ export function App() {
         }}>
           <div
             className="terminal-pane-tabs"
-            onWheel={(event) => {
-              const el = event.currentTarget;
-              if (el.scrollWidth <= el.clientWidth) return;
-              const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
-              if (delta === 0) return;
-              const max = el.scrollWidth - el.clientWidth;
-              const next = Math.max(0, Math.min(max, el.scrollLeft + delta));
-              if (next === el.scrollLeft) return;
-              event.preventDefault();
-              el.scrollLeft = next;
-            }}
+            onWheel={scrollHorizontallyOnWheel}
           >
             {paneTabs.map((tab) => (
               <div
@@ -6594,7 +6420,7 @@ export function App() {
             </div>
 
             {/* Cursor 风格：会话 tabs，hover 显示删除 */}
-            <div className="ai-session-tabs" role="tablist" aria-label="AI 会话">
+            <div className="ai-session-tabs" role="tablist" aria-label="AI 会话" onWheel={scrollHorizontallyOnWheel}>
               {aiConversations.map((conversation) => {
                 const isActive = conversation.id === activeAiConversation?.id;
                 return (
@@ -7556,17 +7382,7 @@ export function App() {
               className="workspace-tabs"
               ref={workspaceTabsRef}
               title="双击空白处新建空白编辑器"
-              onWheel={(event) => {
-                const el = event.currentTarget;
-                if (el.scrollWidth <= el.clientWidth) return;
-                const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
-                if (delta === 0) return;
-                const max = el.scrollWidth - el.clientWidth;
-                const next = Math.max(0, Math.min(max, el.scrollLeft + delta));
-                if (next === el.scrollLeft) return;
-                event.preventDefault();
-                el.scrollLeft = next;
-              }}
+              onWheel={scrollHorizontallyOnWheel}
               onDoubleClick={(event) => {
                 if ((event.target as HTMLElement).closest('.workspace-tab, .workspace-tab-add')) return;
                 createUntitledEditorTab();
@@ -7692,7 +7508,7 @@ export function App() {
                   <div className="media-viewer">
                     <div className="media-viewer-header">
                       <span className="media-viewer-name">{mediaViewer.name}</span>
-                      <button className="media-viewer-close" title="关闭" onClick={() => setMediaViewer(null)}>
+                      <button className="media-viewer-close" title="关闭" onClick={() => closeMediaViewer()}>
                         <X size={16} />
                       </button>
                     </div>

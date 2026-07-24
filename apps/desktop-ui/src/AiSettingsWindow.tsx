@@ -76,6 +76,7 @@ import {
   toggleMcpToolDisabled,
 } from './aiSettingsModel';
 import { SelectDropdown } from './SelectDropdown';
+import { scrollHorizontallyOnWheel } from './wheelScroll';
 import './styles.css';
 
 const initialTab: AiSettingsTab = new URLSearchParams(window.location.search).get('tab') === 'mcp' ? 'mcp' : 'models';
@@ -1092,7 +1093,7 @@ export function AiSettingsWindow() {
                       {aiSettingsApiKeysOpen && (
                         <div className="ai-settings-collapse-body">
                           <div className="ai-settings-account-bar">
-                            <div className="ai-settings-account-list" role="tablist" aria-label="API 账号">
+                            <div className="ai-settings-account-list" role="tablist" aria-label="API 账号" onWheel={scrollHorizontallyOnWheel}>
                               {(aiProviderConfig?.accounts?.length
                                 ? aiProviderConfig.accounts
                                 : [{

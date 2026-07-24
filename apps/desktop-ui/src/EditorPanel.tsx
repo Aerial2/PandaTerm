@@ -3,6 +3,7 @@ import Editor, { loader, type OnMount, type BeforeMount } from '@monaco-editor/r
 import * as monaco from 'monaco-editor';
 import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
 import { X, Save, Circle, FileText } from 'lucide-react';
+import { scrollHorizontallyOnWheel } from './wheelScroll';
 
 // Use locally bundled monaco-editor (no CDN dependency) and wire up the Vite
 // worker so syntax highlighting works offline inside Tauri.
@@ -376,18 +377,7 @@ export function EditorPanel({
           <div
             className="editor-tabs"
             title="双击空白处新建空白文件"
-            onWheel={(event) => {
-              const el = event.currentTarget;
-              if (el.scrollWidth <= el.clientWidth) return;
-              const delta =
-                Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
-              if (delta === 0) return;
-              const max = el.scrollWidth - el.clientWidth;
-              const next = Math.max(0, Math.min(max, el.scrollLeft + delta));
-              if (next === el.scrollLeft) return;
-              event.preventDefault();
-              el.scrollLeft = next;
-            }}
+            onWheel={scrollHorizontallyOnWheel}
             onDoubleClick={(event) => {
               if (event.target === event.currentTarget) onCreateUntitled();
             }}

@@ -10,6 +10,7 @@ import {
   type UIEvent,
 } from 'react';
 import { ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
+import { scrollHorizontallyOnWheel } from './wheelScroll';
 import {
   deleteTransferRecord,
   getTransferLogSnapshot,
@@ -373,7 +374,7 @@ export const ResourceBottomPanel = memo(function ResourceBottomPanel({
         }}
       />
       <div className="resource-bottom-tabs">
-        <div className="resource-bottom-tabs-left">
+        <div className="resource-bottom-tabs-left" onWheel={scrollHorizontallyOnWheel}>
           <button
             type="button"
             className={tab === 'local' ? 'resource-bottom-tab active' : 'resource-bottom-tab'}
