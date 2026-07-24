@@ -6018,7 +6018,20 @@ export function App() {
           // 双击空白：新建编辑器；仅 + 打开连接管理
           createUntitledEditorTab();
         }}>
-          <div className="terminal-pane-tabs">
+          <div
+            className="terminal-pane-tabs"
+            onWheel={(event) => {
+              const el = event.currentTarget;
+              if (el.scrollWidth <= el.clientWidth) return;
+              const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+              if (delta === 0) return;
+              const max = el.scrollWidth - el.clientWidth;
+              const next = Math.max(0, Math.min(max, el.scrollLeft + delta));
+              if (next === el.scrollLeft) return;
+              event.preventDefault();
+              el.scrollLeft = next;
+            }}
+          >
             {paneTabs.map((tab) => (
               <div
                 key={tab.id}
