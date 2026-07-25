@@ -116,6 +116,12 @@ export function buildDuplicateName(name: string, existingNames: Set<string>) {
   return `${stem} (${Date.now()})${ext}`;
 }
 
+// 校验重命名冲突方案的新名字：非空、无路径分隔符、且不与目标目录已有名字重复。
+export function isUploadConflictRenameInvalid(dialog: UploadConflictDialogState): boolean {
+  const name = dialog.newName.trim();
+  return !name || name.includes('/') || name.includes('\\') || dialog.existingNames.includes(name);
+}
+
 export function toResourceFile(entry: LocalDirectoryEntry): ResourceFile {
   return {
     name: entry.name,
