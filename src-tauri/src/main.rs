@@ -6,6 +6,7 @@ mod archive;
 mod base64;
 mod credential;
 mod mcp;
+mod shell_text;
 mod storage;
 mod xshell;
 
@@ -30,7 +31,9 @@ use ai_config::{
 };
 use archive::{extract_command, extract_local_archive};
 use base64::{base64_decode, base64_encode};
-use encoding_rs::GBK;
+use shell_text::{
+    decode_shell_text, decode_terminal_bytes, shell_cwd_marker, split_shell_output,
+};
 use panda_core::{TerminalEvent, TerminalEventKind};
 use panda_crypto::{protect_secret, unprotect_secret, ProtectionMode, SecretError};
 use panda_session::{AuthType, Session, SessionCatalog};
@@ -928,71 +931,6 @@ fn local_prompt(path: &Path) -> String {
 
 fn is_clear_command(command: &str) -> bool {
     matches!(command.trim().to_lowercase().as_str(), "clear" | "cls")
-}
-
-fn shell_cwd_marker() -> &'static str {
-    "__PANDATERM_CWD__"
-}
-
-fn normalize_shell_text(text: String) -> String {
-    text.replace("\r\n", "\n")
-}
-
-fn decode_shell_text(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return String::new();
-    }
-
-    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-        return normalize_shell_text(text);
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let (text, _, _) = GBK.decode(bytes);
-        normalize_shell_text(text.into_owned())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        normalize_shell_text(String::from_utf8_lossy(bytes).into_owned())
-    }
-}
-
-fn decode_terminal_bytes(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return String::new();
-    }
-
-    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-        return text;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let (text, _, _) = GBK.decode(bytes);
-        text.into_owned()
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        String::from_utf8_lossy(bytes).into_owned()
-    }
-}
-
-fn split_shell_output(output: String) -> (String, Option<String>) {
-    if let Some(index) = output.rfind(shell_cwd_marker()) {
-        let before = output[..index].trim_end_matches(['\n', '\r']).to_string();
-        let after = output[index + shell_cwd_marker().len()..].trim();
-        let cwd = if after.is_empty() {
-            None
-        } else {
-            Some(after.to_string())
-        };
-        (before, cwd)
-    } else {
-        (output.trim_end_matches(['\n', '\r']).to_string(), None)
-    }
 }
 
 async fn run_local_shell_command(
