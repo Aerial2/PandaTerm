@@ -3361,16 +3361,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "panda-transfer"
-version = "0.1.1"
-dependencies = [
- "chrono",
- "serde",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
 name = "pandaterm"
 version = "0.1.1"
 dependencies = [
@@ -3379,7 +3369,6 @@ dependencies = [
  "panda-core",
  "panda-crypto",
  "panda-session",
- "panda-transfer",
  "portable-pty",
  "reqwest",
  "russh",

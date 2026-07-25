@@ -17,7 +17,6 @@ rootConfigs: `Cargo.toml`, `Cargo.lock`, `package.json`, `src-tauri/tauri.conf.j
 |------|------|------|------|--------|------|
 | panda-core | crates/panda-core | lib | panda-session | pandaterm | SSH client trait, terminal events, size |
 | panda-session | crates/panda-session | lib | — | panda-core,pandaterm | Session data, auth types, validation |
-| panda-transfer | crates/panda-transfer | lib | — | (future) | File transfer task queue abstractions |
 | panda-crypto | crates/panda-crypto | lib | — | (future) | Secret/credential store (stub) |
 | pandaterm | src-tauri | app | panda-core,panda-session | desktop-ui | Tauri backend, SSH conn, local PTY |
 | desktop-ui | apps/desktop-ui | app | @tauri-apps/api,xterm,React | — | Terminal UI, file browser, session mgr |
@@ -26,7 +25,7 @@ rootConfigs: `Cargo.toml`, `Cargo.lock`, `package.json`, `src-tauri/tauri.conf.j
 
 ## DEPENDENCY GRAPH
 
-pandaterm → panda-core, panda-session, panda-transfer  
+pandaterm → panda-core, panda-session  
 panda-core → panda-session  
 desktop-ui → @tauri-apps/api, @xterm/xterm
 
@@ -69,14 +68,6 @@ exports:
   `ReconnectPolicy` (enabled, max_attempts, delay_ms)  
   `SessionCatalog` (in-memory: search, upsert, all)  
   `validate_session()`, `demo_sessions()`  
-
-### panda-transfer (`crates/panda-transfer/src/lib.rs`)
-
-exports:  
-  `TransferTask` (id, session_id, direction, local/remote path, status, progress)  
-  `TransferDirection` (Upload|Download), `TransferStatus` (Pending|Running|Paused|Completed|Failed|Cancelled)  
-  `TransferProgress` (bytes_done, bytes_total, speed_bytes_per_sec, percent())  
-  `TransferQueue` (push, all) — in-memory queue  
 
 ### panda-crypto (`crates/panda-crypto/src/lib.rs`)
 
@@ -139,7 +130,6 @@ shared workspace deps: async-trait, chrono, serde, serde_json, thiserror, tokio 
 `apps/desktop-ui/` → React frontend app  
 `crates/panda-core/` → SSH abstraction + types  
 `crates/panda-session/` → session model + catalog  
-`crates/panda-transfer/` → file transfer abstractions  
 `crates/panda-crypto/` → secret management stubs  
 `target/` → Rust build artifacts (excluded)  
 `node_modules/` → npm deps (excluded)  
@@ -170,7 +160,6 @@ docker: none
 add remote SSH endpoint → `src-tauri/src/main.rs::connect_session`, `crates/panda-core/src/lib.rs::SshClient`  
 add local shell command → `src-tauri/src/main.rs::run_local_shell_command`, `run_windows_shell_command`, `run_unix_shell_command`  
 add terminal output event → `src-tauri/src/main.rs::emit_terminal_output`, `panda-core::TerminalEvent`  
-add file transfer task → `crates/panda-transfer/src/lib.rs::TransferTask`, `TransferQueue`  
 add session auth type → `crates/panda-session/src/lib.rs::AuthType`  
 add UI tab → `apps/desktop-ui/src/App.tsx::WorkspaceTab`, terminal state hooks  
 add Tauri command → `src-tauri/src/main.rs::fn command_name()` + `#[tauri::command]`  

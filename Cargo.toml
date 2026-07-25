@@ -2,7 +2,6 @@
 members = [
     "crates/panda-core",
     "crates/panda-session",
-    "crates/panda-transfer",
     "crates/panda-crypto",
     "src-tauri",
 ]
