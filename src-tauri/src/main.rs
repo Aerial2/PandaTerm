@@ -7,7 +7,7 @@ mod mcp;
 mod storage;
 mod xshell;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,9 +18,13 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ai_config::{
-    ai_chat_endpoint, ai_models_url, ai_request_reasoning_effort, is_claude_api_format,
-    merge_ai_models, normalize_ai_models, normalize_enabled_ai_models, validate_ai_api_format,
-    validate_ai_base_url, validate_ai_model, validate_ai_reasoning_effort, MAX_AI_MODELS,
+    ai_chat_endpoint, ai_models_url, ai_request_reasoning_effort, find_ai_account,
+    find_ai_account_mut, is_claude_api_format, load_ai_config, merge_ai_models,
+    normalize_ai_account_name, normalize_ai_config_store, normalize_ai_models,
+    normalize_enabled_ai_models, save_ai_config, validate_ai_api_format, validate_ai_base_url,
+    validate_ai_model, validate_ai_reasoning_effort, AiProviderAccountStore,
+    AiProviderConfigStore, AI_CONFIG_VERSION, DEFAULT_AI_API_FORMAT, DEFAULT_AI_BASE_URL,
+    DEFAULT_AI_MODEL, MAX_AI_ACCOUNTS, MAX_AI_MODELS,
 };
 use encoding_rs::GBK;
 use panda_core::{TerminalEvent, TerminalEventKind};
@@ -34,7 +38,7 @@ use credential::{
     CREDENTIAL_VERIFIER_VALUE,
 };
 use storage::{
-    ai_config_path, ai_conversations_path, atomic_write_bytes, atomic_write_text,
+    ai_conversations_path, atomic_write_bytes, atomic_write_text,
     known_hosts_path, pandaterm_data_dir, session_store_path,
 };
 use xshell::load_xshell_sessions;
@@ -119,85 +123,11 @@ enum RemoteTerminalCommand {
     Close,
 }
 
-const AI_CONFIG_VERSION: u8 = 2;
 const AI_API_KEY_PREFIX: &str = "credential:ai:openai-compatible:api-key";
-const DEFAULT_AI_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_AI_MODEL: &str = "gpt-4o-mini";
-/// 默认不发送 reasoning_effort，兼容非推理模型
-const DEFAULT_AI_REASONING_EFFORT: &str = "none";
-/// 默认 OpenAI 兼容协议
-const DEFAULT_AI_API_FORMAT: &str = "openai";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_AI_MESSAGES: usize = 100;
 const MAX_AI_MESSAGE_CHARS: usize = 32_000;
 const MAX_AI_TOTAL_CHARS: usize = 200_000;
-const MAX_AI_ACCOUNTS: usize = 32;
-
-fn default_ai_reasoning_effort() -> String {
-    DEFAULT_AI_REASONING_EFFORT.to_string()
-}
-
-fn default_ai_api_format() -> String {
-    DEFAULT_AI_API_FORMAT.to_string()
-}
-
-/// 单个供应商账号（接口地址 + 密钥 + 模型目录）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AiProviderAccountStore {
-    id: String,
-    #[serde(default = "default_ai_account_name")]
-    name: String,
-    base_url: String,
-    model: String,
-    #[serde(default)]
-    models: Vec<String>,
-    #[serde(default)]
-    enabled_models: Vec<String>,
-    #[serde(default = "default_ai_api_format")]
-    api_format: String,
-    use_api_key: bool,
-    api_key_secret_id: Option<String>,
-}
-
-fn default_ai_account_name() -> String {
-    "默认".to_string()
-}
-
-fn new_default_ai_account() -> AiProviderAccountStore {
-    AiProviderAccountStore {
-        id: "default".to_string(),
-        name: default_ai_account_name(),
-        base_url: DEFAULT_AI_BASE_URL.to_string(),
-        model: DEFAULT_AI_MODEL.to_string(),
-        models: vec![DEFAULT_AI_MODEL.to_string()],
-        enabled_models: vec![DEFAULT_AI_MODEL.to_string()],
-        api_format: DEFAULT_AI_API_FORMAT.to_string(),
-        use_api_key: true,
-        api_key_secret_id: None,
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AiProviderConfigStore {
-    version: u8,
-    active_account_id: String,
-    accounts: Vec<AiProviderAccountStore>,
-    /// 全局推理力度（聊天用）
-    #[serde(default = "default_ai_reasoning_effort")]
-    reasoning_effort: String,
-}
-
-impl Default for AiProviderConfigStore {
-    fn default() -> Self {
-        let account = new_default_ai_account();
-        Self {
-            version: AI_CONFIG_VERSION,
-            active_account_id: account.id.clone(),
-            accounts: vec![account],
-            reasoning_effort: DEFAULT_AI_REASONING_EFFORT.to_string(),
-        }
-    }
-}
 
 /// 设置页账号列表项（不含密钥明文）
 #[derive(Debug, Clone, Serialize)]
@@ -712,183 +642,6 @@ fn save_ai_conversations(store: &AiConversationStore) -> Result<(), String> {
         .map_err(|error| format!("AI 会话记录序列化失败：{error}"))?;
     atomic_write_text(&ai_conversations_path()?, &content)
         .map_err(|error| format!("AI 会话记录保存失败：{error}"))
-}
-
-fn load_ai_config() -> Result<AiProviderConfigStore, String> {
-    let path = ai_config_path()?;
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(AiProviderConfigStore::default());
-        }
-        Err(error) => return Err(format!("AI 供应商配置读取失败：{error}")),
-    };
-    let value: Value = serde_json::from_str(&content)
-        .map_err(|error| format!("AI 供应商配置已损坏，已拒绝覆盖原文件：{error}"))?;
-    let mut config = if value
-        .get("accounts")
-        .and_then(Value::as_array)
-        .is_some_and(|items| !items.is_empty())
-    {
-        serde_json::from_value::<AiProviderConfigStore>(value)
-            .map_err(|error| format!("AI 供应商配置已损坏，已拒绝覆盖原文件：{error}"))?
-    } else {
-        migrate_ai_config_v1(value)?
-    };
-    normalize_ai_config_store(&mut config)?;
-    Ok(config)
-}
-
-/// v1 扁平结构 → 多账号
-fn migrate_ai_config_v1(value: Value) -> Result<AiProviderConfigStore, String> {
-    let base_url = value
-        .get("base_url")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_AI_BASE_URL)
-        .to_string();
-    let model = value
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_AI_MODEL)
-        .to_string();
-    let models = value
-        .get("models")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| vec![model.clone()]);
-    let enabled_models = value
-        .get("enabled_models")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| models.clone());
-    let reasoning_effort = value
-        .get("reasoning_effort")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_AI_REASONING_EFFORT)
-        .to_string();
-    let api_format = value
-        .get("api_format")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_AI_API_FORMAT)
-        .to_string();
-    let use_api_key = value
-        .get("use_api_key")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let api_key_secret_id = value
-        .get("api_key_secret_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let account = AiProviderAccountStore {
-        id: "default".to_string(),
-        name: default_ai_account_name(),
-        base_url,
-        model,
-        models,
-        enabled_models,
-        api_format,
-        use_api_key,
-        api_key_secret_id,
-    };
-    Ok(AiProviderConfigStore {
-        version: AI_CONFIG_VERSION,
-        active_account_id: account.id.clone(),
-        accounts: vec![account],
-        reasoning_effort,
-    })
-}
-
-fn normalize_ai_config_store(config: &mut AiProviderConfigStore) -> Result<(), String> {
-    if config.accounts.is_empty() {
-        *config = AiProviderConfigStore::default();
-        return Ok(());
-    }
-    if config.accounts.len() > MAX_AI_ACCOUNTS {
-        return Err(format!("AI 账号数量不能超过 {MAX_AI_ACCOUNTS}"));
-    }
-    let mut seen = HashSet::new();
-    for account in &mut config.accounts {
-        account.id = account.id.trim().to_string();
-        if account.id.is_empty() {
-            account.id = Uuid::new_v4().to_string();
-        }
-        if !seen.insert(account.id.clone()) {
-            return Err(format!("AI 账号 id 重复：{}", account.id));
-        }
-        account.name = normalize_ai_account_name(&account.name);
-        validate_ai_base_url(&account.base_url)?;
-        account.model = validate_ai_model(&account.model)?;
-        account.models = normalize_ai_models(&account.models, &account.model)?;
-        account.enabled_models =
-            normalize_enabled_ai_models(&account.models, &account.enabled_models, &account.model)?;
-        account.api_format = validate_ai_api_format(&account.api_format)?;
-    }
-    if !config
-        .accounts
-        .iter()
-        .any(|item| item.id == config.active_account_id)
-    {
-        config.active_account_id = config.accounts[0].id.clone();
-    }
-    config.reasoning_effort = validate_ai_reasoning_effort(&config.reasoning_effort)?;
-    config.version = AI_CONFIG_VERSION;
-    Ok(())
-}
-
-fn normalize_ai_account_name(raw: &str) -> String {
-    let name = raw.trim();
-    if name.is_empty() {
-        return default_ai_account_name();
-    }
-    name.chars().take(64).collect()
-}
-
-fn find_ai_account<'a>(
-    config: &'a AiProviderConfigStore,
-    account_id: Option<&str>,
-) -> Result<&'a AiProviderAccountStore, String> {
-    let id = account_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(config.active_account_id.as_str());
-    config
-        .accounts
-        .iter()
-        .find(|item| item.id == id)
-        .ok_or_else(|| format!("未找到 AI 账号：{id}"))
-}
-
-fn find_ai_account_mut<'a>(
-    config: &'a mut AiProviderConfigStore,
-    account_id: Option<&str>,
-) -> Result<&'a mut AiProviderAccountStore, String> {
-    let id = account_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(config.active_account_id.as_str())
-        .to_string();
-    config
-        .accounts
-        .iter_mut()
-        .find(|item| item.id == id)
-        .ok_or_else(|| format!("未找到 AI 账号：{id}"))
-}
-
-fn save_ai_config(config: &AiProviderConfigStore) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(config)
-        .map_err(|error| format!("AI 供应商配置序列化失败：{error}"))?;
-    atomic_write_text(&ai_config_path()?, &content)
-        .map_err(|error| format!("AI 供应商配置保存失败：{error}"))
 }
 
 async fn ensure_session_store_available(state: &AppState) -> Result<(), String> {
