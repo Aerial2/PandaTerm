@@ -1,4 +1,4 @@
-﻿//! 本地文件系统领域：目录列举、文件预览/读取、路径规范化工具。
+//! 本地文件系统领域：目录列举、文件预览/读取、路径规范化工具。
 //! 均为无 State 依赖的自由函数；远程 SSH 变体留在 main.rs。
 
 use std::fs;
@@ -34,7 +34,7 @@ pub(crate) struct LocalFilePreview {
 }
 
 pub(crate) const LOCAL_FILE_PREVIEW_LIMIT: u64 = 512 * 1024;
-pub(crate) const LOCAL_FILE_FULL_LIMIT: u64 = 50 * 1024 * 1024;
+pub(crate) const LOCAL_FILE_FULL_LIMIT: u64 = 500 * 1024 * 1024;
 
 pub(crate) fn default_local_path() -> Result<PathBuf, String> {
     let home = std::env::var_os(if cfg!(target_os = "windows") {

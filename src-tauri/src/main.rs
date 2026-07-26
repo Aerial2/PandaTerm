@@ -10,6 +10,7 @@ mod legacy_secret;
 mod local_fs;
 mod local_shell;
 mod mcp;
+mod session_store;
 mod shell_text;
 mod sse;
 mod storage;
@@ -48,20 +49,20 @@ use panda_crypto::{protect_secret, unprotect_secret, ProtectionMode, SecretError
 use panda_session::{AuthType, Session, SessionCatalog};
 use credential::{
     credential_context, credential_id, credential_status_snapshot, ensure_vault_available,
-    is_credential_id, load_credential_vault, resolve_credential, save_credential_vault,
+    resolve_credential, save_credential_vault,
     store_credential, vault_master_password, CredentialProtectionRequest, CredentialStatus,
     CredentialVault, CredentialVaultState, CREDENTIAL_VAULT_VERSION, CREDENTIAL_VERIFIER_CONTEXT,
     CREDENTIAL_VERIFIER_VALUE,
 };
 use known_hosts::verify_or_trust_host_key;
-use legacy_secret::deobfuscate_secret;
+use session_store::{
+    load_secure_state, migrate_legacy_credentials, resolved_session, save_persistent_sessions,
+};
 use storage::{
     ai_conversations_path, atomic_write_bytes, atomic_write_text, pandaterm_data_dir,
-    session_store_path,
 };
 use sse::{sse_data, take_sse_events};
 use system_monitor::{ProcessInfo, SystemMonitorData};
-use xshell::load_xshell_sessions;
 use portable_pty::{native_pty_system, Child, MasterPty};
 use reqwest::{redirect::Policy, Client};
 use russh::ChannelMsg;
@@ -563,7 +564,7 @@ struct AiTerminalCommandResult {
 }
 
 
-const REMOTE_FILE_FULL_LIMIT: u64 = 50 * 1024 * 1024;
+const REMOTE_FILE_FULL_LIMIT: u64 = 500 * 1024 * 1024;
 const AI_TERMINAL_COMMAND_MAX_LENGTH: usize = 4_000;
 const AI_TERMINAL_OUTPUT_LIMIT: usize = 64 * 1024;
 const AI_TERMINAL_MIN_TIMEOUT_MS: u64 = 3_000;
@@ -643,157 +644,6 @@ async fn ensure_session_store_available(state: &AppState) -> Result<(), String> 
         Some(error) => Err(error.clone()),
         None => Ok(()),
     }
-}
-
-fn load_persistent_sessions() -> Result<Vec<Session>, String> {
-    let path = session_store_path()?;
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("连接配置读取失败：{error}")),
-    };
-
-    serde_json::from_str::<Vec<Session>>(&content)
-        .map_err(|error| format!("连接配置已损坏，已进入只读保护状态：{error}"))
-}
-
-fn save_persistent_sessions(sessions: &[Session]) -> Result<(), String> {
-    let path = session_store_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("连接配置目录创建失败：{error}"))?;
-    }
-
-    let content = serde_json::to_string_pretty(sessions)
-        .map_err(|error| format!("连接配置序列化失败：{error}"))?;
-    atomic_write_text(&path, &content)
-        .map_err(|error| format!("连接配置保存失败：{error}"))
-}
-
-fn same_session_identity(left: &Session, right: &Session) -> bool {
-    left.name.eq_ignore_ascii_case(&right.name)
-        && left.host.eq_ignore_ascii_case(&right.host)
-        && left.port == right.port
-        && left.username.eq_ignore_ascii_case(&right.username)
-}
-
-fn load_initial_sessions() -> Result<Vec<Session>, String> {
-    let mut sessions = load_persistent_sessions()?;
-
-    for xshell_session in load_xshell_sessions() {
-        if sessions
-            .iter()
-            .any(|session| same_session_identity(session, &xshell_session))
-        {
-            continue;
-        }
-        sessions.push(xshell_session);
-    }
-
-    // Preserve the persisted order so a user's custom drag-and-drop ordering
-    // survives restarts. Newly imported Xshell sessions are already sorted by
-    // name inside load_xshell_sessions and simply appended above.
-    Ok(sessions)
-}
-
-fn migrate_legacy_credentials(
-    sessions: &mut [Session],
-    credentials: &mut CredentialVaultState,
-) -> Result<bool, String> {
-    let mut changed = false;
-    for session in sessions {
-        let candidate = match &mut session.auth {
-            AuthType::Password { secret_id } => Some((secret_id, "password")),
-            AuthType::KeyboardInteractive { response_secret_id } => {
-                Some((response_secret_id, "keyboard-interactive"))
-            }
-            AuthType::PrivateKey {
-                passphrase_secret_id: Some(passphrase),
-                ..
-            } => Some((passphrase, "private-key-passphrase")),
-            AuthType::PrivateKey {
-                passphrase_secret_id: None,
-                ..
-            }
-            | AuthType::Agent
-            | AuthType::Gssapi { .. } => None,
-        };
-
-        let Some((value, kind)) = candidate else {
-            continue;
-        };
-        if value.is_empty() || is_credential_id(value) {
-            continue;
-        }
-
-        let plaintext = deobfuscate_secret(value);
-        let id = credential_id(session.id, kind);
-        *value = store_credential(credentials, id, &plaintext)?;
-        changed = true;
-    }
-    Ok(changed)
-}
-
-fn load_secure_state() -> (Vec<Session>, CredentialVaultState, Option<String>) {
-    let (mut sessions, session_store_error) = match load_initial_sessions() {
-        Ok(sessions) => (sessions, None),
-        Err(error) => {
-            eprintln!("[Session] {error}");
-            (Vec::new(), Some(error))
-        }
-    };
-    let (vault, load_error) = match load_credential_vault() {
-        Ok(vault) => (vault, None),
-        Err(error) => {
-            eprintln!("[Credential] {error}");
-            (CredentialVault::default(), Some(error))
-        }
-    };
-    let mut credentials = CredentialVaultState {
-        vault,
-        master_password: None,
-        load_error,
-    };
-
-    if credentials.load_error.is_none() && session_store_error.is_none() {
-        match migrate_legacy_credentials(&mut sessions, &mut credentials) {
-            Ok(true) => {
-                if let Err(error) = save_credential_vault(&credentials.vault)
-                    .and_then(|_| save_persistent_sessions(&sessions))
-                {
-                    eprintln!("[Credential] automatic migration failed: {error}");
-                }
-            }
-            Ok(false) => {}
-            Err(error) => eprintln!("[Credential] automatic migration failed: {error}"),
-        }
-    }
-
-    (sessions, credentials, session_store_error)
-}
-
-fn resolved_session(session: &Session, credentials: &CredentialVaultState) -> Result<Session, String> {
-    let mut resolved = session.clone();
-    match &mut resolved.auth {
-        AuthType::Password { secret_id } => {
-            *secret_id = resolve_credential(credentials, secret_id)?;
-        }
-        AuthType::KeyboardInteractive { response_secret_id } => {
-            *response_secret_id = resolve_credential(credentials, response_secret_id)?;
-        }
-        AuthType::PrivateKey {
-            passphrase_secret_id: Some(passphrase),
-            ..
-        } => {
-            *passphrase = resolve_credential(credentials, passphrase)?;
-        }
-        AuthType::PrivateKey {
-            passphrase_secret_id: None,
-            ..
-        }
-        | AuthType::Agent
-        | AuthType::Gssapi { .. } => {}
-    }
-    Ok(resolved)
 }
 
 fn local_terminal_profile() -> LocalTerminalProfile {
