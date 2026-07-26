@@ -5,6 +5,7 @@ mod ai_config;
 mod archive;
 mod base64;
 mod credential;
+mod local_fs;
 mod mcp;
 mod shell_text;
 mod storage;
@@ -19,7 +20,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ai_config::{
     ai_chat_endpoint, ai_models_url, ai_request_reasoning_effort, find_ai_account,
@@ -32,6 +33,7 @@ use ai_config::{
 };
 use archive::{extract_command, extract_local_archive};
 use base64::{base64_decode, base64_encode};
+use local_fs::{default_local_path, format_path, resolve_local_path, LocalDirectoryEntry, LocalDirectoryListing, LocalFilePreview, LOCAL_FILE_FULL_LIMIT};
 use shell_text::{
     decode_shell_text, decode_terminal_bytes, shell_cwd_marker, split_shell_output,
 };
@@ -551,33 +553,7 @@ struct AiTerminalCommandResult {
     timed_out: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LocalDirectoryEntry {
-    name: String,
-    path: String,
-    entry_type: String,
-    size: u64,
-    modified_ms: Option<u128>,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LocalDirectoryListing {
-    path: String,
-    parent: Option<String>,
-    entries: Vec<LocalDirectoryEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LocalFilePreview {
-    path: String,
-    name: String,
-    size: u64,
-    content: String,
-    truncated: bool,
-}
-
-const LOCAL_FILE_PREVIEW_LIMIT: u64 = 512 * 1024;
-const LOCAL_FILE_FULL_LIMIT: u64 = 50 * 1024 * 1024;
 const REMOTE_FILE_FULL_LIMIT: u64 = 50 * 1024 * 1024;
 const AI_TERMINAL_COMMAND_MAX_LENGTH: usize = 4_000;
 const AI_TERMINAL_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -1745,18 +1721,6 @@ fn spawn_terminal_reader(
     });
 }
 
-fn default_local_path() -> Result<PathBuf, String> {
-    let home = std::env::var_os(if cfg!(target_os = "windows") {
-        "USERPROFILE"
-    } else {
-        "HOME"
-    })
-    .map(PathBuf::from)
-    .filter(|path| path.is_dir())
-    .ok_or_else(|| "无法定位用户目录".to_string())?;
-
-    Ok(home)
-}
 
 fn default_download_directory() -> Result<PathBuf, String> {
     let downloads = default_local_path()?.join("Downloads");
@@ -1833,202 +1797,7 @@ fn write_unique_local_file(
     Err("下载目录中同名文件过多".to_string())
 }
 
-fn resolve_local_path(path: Option<String>) -> Result<PathBuf, String> {
-    match path.filter(|value| !value.trim().is_empty()) {
-        Some(value) => Ok(PathBuf::from(value)),
-        None => default_local_path(),
-    }
-}
 
-fn format_path(path: PathBuf) -> String {
-    let path_text = path.to_string_lossy();
-
-    if cfg!(target_os = "windows") {
-        if let Some(stripped) = path_text.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{}", stripped);
-        }
-
-        if let Some(stripped) = path_text.strip_prefix(r"\\?\") {
-            return stripped.to_string();
-        }
-    }
-
-    path_text.to_string()
-}
-
-#[tauri::command]
-async fn list_local_directory(path: Option<String>) -> Result<LocalDirectoryListing, String> {
-    // On Windows, a special "root" path lists available drive letters
-    // so users can navigate between drives like in File Explorer.
-    if cfg!(target_os = "windows") {
-        let resolved = resolve_local_path(path.clone())?;
-        // If the user navigated to the virtual root (e.g. by going "up" from C:\),
-        // list all available drive letters.
-        if resolved.to_string_lossy().trim_end_matches('\\').is_empty()
-            || resolved.to_string_lossy() == "This PC"
-            || resolved.to_string_lossy() == "此电脑"
-        {
-            return list_windows_drives();
-        }
-    }
-
-    let directory = resolve_local_path(path)?;
-    let canonical_directory = directory
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let mut entries = Vec::new();
-
-    for entry in fs::read_dir(&canonical_directory).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let metadata = entry.metadata().map_err(|error| error.to_string())?;
-        let entry_type = if metadata.is_dir() {
-            "directory"
-        } else {
-            "file"
-        }
-        .to_string();
-        let modified_ms = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_millis());
-
-        entries.push(LocalDirectoryEntry {
-            name: entry.file_name().to_string_lossy().to_string(),
-            path: format_path(entry.path()),
-            entry_type,
-            size: metadata.len(),
-            modified_ms,
-        });
-    }
-
-    entries.sort_by(|left, right| {
-        left.entry_type
-            .cmp(&right.entry_type)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-    });
-
-    // On Windows, when the current directory is a drive root (e.g. C:\),
-    // set parent to a virtual "This PC" so users can navigate to other drives.
-    let parent_path = if cfg!(target_os = "windows") {
-        let canonical_str = canonical_directory.to_string_lossy();
-        // e.g. canonical is "\\?\C:\" — parent would be "\\?\C" which is invalid
-        // Instead, set parent to the virtual root
-        if canonical_str.ends_with(":\\") || canonical_str.ends_with(":\\\\") {
-            Some("此电脑".to_string())
-        } else {
-            canonical_directory
-                .parent()
-                .map(|parent| format_path(parent.to_path_buf()))
-        }
-    } else {
-        canonical_directory
-            .parent()
-            .map(|parent| format_path(parent.to_path_buf()))
-    };
-
-    Ok(LocalDirectoryListing {
-        path: format_path(canonical_directory.clone()),
-        parent: parent_path,
-        entries,
-    })
-}
-
-fn windows_drive_letters() -> std::ops::RangeInclusive<char> {
-    'A'..='Z'
-}
-
-/// List available Windows drive letters as directory entries.
-fn list_windows_drives() -> Result<LocalDirectoryListing, String> {
-    let mut entries = Vec::new();
-    for letter in windows_drive_letters() {
-        let drive = format!("{letter}:\\");
-        if PathBuf::from(&drive).is_dir() {
-            entries.push(LocalDirectoryEntry {
-                name: format!("本地磁盘 ({letter}:)"),
-                path: drive.clone(),
-                entry_type: "directory".to_string(),
-                size: 0,
-                modified_ms: None,
-            });
-        }
-    }
-    Ok(LocalDirectoryListing {
-        path: "此电脑".to_string(),
-        parent: None,
-        entries,
-    })
-}
-
-#[tauri::command]
-async fn read_local_file_preview(path: String) -> Result<LocalFilePreview, String> {
-    let file_path = PathBuf::from(path);
-    let canonical_file = file_path
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let metadata = fs::metadata(&canonical_file).map_err(|error| error.to_string())?;
-
-    if !metadata.is_file() {
-        return Err("只能预览文件".to_string());
-    }
-
-    let read_size = metadata.len().min(LOCAL_FILE_PREVIEW_LIMIT) as usize;
-    let mut bytes = Vec::with_capacity(read_size);
-    fs::File::open(&canonical_file)
-        .map_err(|error| error.to_string())?
-        .take(LOCAL_FILE_PREVIEW_LIMIT)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    let content = String::from_utf8(bytes)
-        .map_err(|_| "暂不支持预览二进制文件".to_string())?;
-
-    Ok(LocalFilePreview {
-        path: format_path(canonical_file.clone()),
-        name: canonical_file
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| format_path(canonical_file.clone())),
-        size: metadata.len(),
-        content,
-        truncated: metadata.len() > LOCAL_FILE_PREVIEW_LIMIT,
-    })
-}
-
-#[tauri::command]
-async fn read_local_file_full(path: String) -> Result<LocalFilePreview, String> {
-    let file_path = PathBuf::from(path);
-    let canonical_file = file_path
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let metadata = fs::metadata(&canonical_file).map_err(|error| error.to_string())?;
-
-    if !metadata.is_file() {
-        return Err("只能读取文件".to_string());
-    }
-
-    if metadata.len() > LOCAL_FILE_FULL_LIMIT {
-        return Err(format!(
-            "文件过大（{} 字节），编辑器最多支持 {} 字节的文件",
-            metadata.len(),
-            LOCAL_FILE_FULL_LIMIT
-        ));
-    }
-
-    let bytes = fs::read(&canonical_file).map_err(|error| error.to_string())?;
-    let content = String::from_utf8(bytes)
-        .map_err(|_| "暂不支持编辑二进制文件".to_string())?;
-
-    Ok(LocalFilePreview {
-        path: format_path(canonical_file.clone()),
-        name: canonical_file
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| format_path(canonical_file.clone())),
-        size: metadata.len(),
-        content,
-        truncated: false,
-    })
-}
 
 const REMOTE_FILE_PREVIEW_LIMIT: usize = 64 * 1024;
 
@@ -6386,9 +6155,9 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            list_local_directory,
-            read_local_file_preview,
-            read_local_file_full,
+            local_fs::list_local_directory,
+            local_fs::read_local_file_preview,
+            local_fs::read_local_file_full,
             local_terminal_profile_command,
             local_terminal_start,
             local_terminal_input,
@@ -6536,7 +6305,7 @@ mod tests {
 
     #[test]
     fn drive_enumeration_includes_both_boundaries() {
-        let letters: Vec<char> = windows_drive_letters().collect();
+        let letters: Vec<char> = local_fs::windows_drive_letters().collect();
         assert_eq!(letters.len(), 26);
         assert_eq!(letters.first(), Some(&'A'));
         assert_eq!(letters.last(), Some(&'Z'));
