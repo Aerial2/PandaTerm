@@ -7,6 +7,7 @@ mod base64;
 mod credential;
 mod known_hosts;
 mod local_fs;
+mod local_shell;
 mod mcp;
 mod shell_text;
 mod sse;
@@ -36,9 +37,11 @@ use ai_config::{
 use archive::{extract_command, extract_local_archive};
 use base64::{base64_decode, base64_encode};
 use local_fs::{default_local_path, format_path, parse_remote_listing, resolve_local_path, LocalDirectoryListing, LocalFilePreview, LOCAL_FILE_FULL_LIMIT};
-use shell_text::{
-    decode_shell_text, decode_terminal_bytes, shell_cwd_marker, split_shell_output,
+use local_shell::{
+    is_clear_command, local_prompt, local_pty_command, local_pty_size, local_shell_name,
+    run_local_shell_command,
 };
+use shell_text::decode_terminal_bytes;
 use panda_core::{TerminalEvent, TerminalEventKind};
 use panda_crypto::{protect_secret, unprotect_secret, ProtectionMode, SecretError};
 use panda_session::{AuthType, Session, SessionCatalog};
@@ -57,7 +60,7 @@ use storage::{
 use sse::{sse_data, take_sse_events};
 use system_monitor::{ProcessInfo, SystemMonitorData};
 use xshell::load_xshell_sessions;
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, MasterPty};
 use reqwest::{redirect::Policy, Client};
 use russh::ChannelMsg;
 use serde::{Deserialize, Serialize};
@@ -841,140 +844,6 @@ fn local_terminal_profile() -> LocalTerminalProfile {
         cwd: format_path(cwd.clone()),
         prompt: local_prompt(&cwd),
         banner: Vec::new(),
-    }
-}
-
-fn local_shell_name() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "PowerShell"
-    } else if cfg!(target_os = "macos") {
-        "zsh"
-    } else {
-        "bash"
-    }
-}
-
-fn local_prompt(path: &Path) -> String {
-    if cfg!(target_os = "windows") {
-        format!("PS {}>", format_path(path.to_path_buf()))
-    } else {
-        format!("{} $", format_path(path.to_path_buf()))
-    }
-}
-
-fn is_clear_command(command: &str) -> bool {
-    matches!(command.trim().to_lowercase().as_str(), "clear" | "cls")
-}
-
-async fn run_local_shell_command(
-    command: &str,
-    cwd: &Path,
-) -> Result<(String, Option<String>, bool), String> {
-    if cfg!(target_os = "windows") {
-        run_windows_shell_command(command, cwd).await
-    } else {
-        run_unix_shell_command(command, cwd).await
-    }
-}
-
-async fn run_windows_shell_command(
-    command: &str,
-    cwd: &Path,
-) -> Result<(String, Option<String>, bool), String> {
-    let script = format!(
-        "& {{ param([string]$workingDirectory, [string]$userCommand) Set-Location -LiteralPath $workingDirectory; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); Invoke-Expression $userCommand; $exitCode = if ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 0 }}; Write-Output ('{}' + (Get-Location).Path); exit $exitCode }}",
-        shell_cwd_marker()
-    );
-
-    let output = Command::new("powershell.exe")
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .arg(format_path(cwd.to_path_buf()))
-        .arg(command)
-        .output()
-        .await
-        .map_err(|error| error.to_string())?;
-
-    let stdout = decode_shell_text(&output.stdout);
-    let stderr = decode_shell_text(&output.stderr);
-    let (stdout_body, next_cwd) = split_shell_output(stdout);
-    let body = [stdout_body, stderr]
-        .into_iter()
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    Ok((body, next_cwd, output.status.success()))
-}
-
-async fn run_unix_shell_command(
-    command: &str,
-    cwd: &Path,
-) -> Result<(String, Option<String>, bool), String> {
-    let shell = if cfg!(target_os = "macos") {
-        "/bin/zsh"
-    } else {
-        "/bin/bash"
-    };
-    let script = format!(
-        "cd -- \"$1\" || exit 1\neval \"$2\"\nstatus=$?\nprintf '\n%s%s\n' '{}' \"$PWD\"\nexit $status",
-        shell_cwd_marker()
-    );
-
-    let output = Command::new(shell)
-        .arg("-lc")
-        .arg(script)
-        .arg("pandaterm")
-        .arg(format_path(cwd.to_path_buf()))
-        .arg(command)
-        .output()
-        .await
-        .map_err(|error| error.to_string())?;
-
-    let stdout = decode_shell_text(&output.stdout);
-    let stderr = decode_shell_text(&output.stderr);
-    let (stdout_body, next_cwd) = split_shell_output(stdout);
-    let body = [stdout_body, stderr]
-        .into_iter()
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    Ok((body, next_cwd, output.status.success()))
-}
-
-fn local_pty_size(cols: Option<u16>, rows: Option<u16>) -> PtySize {
-    PtySize {
-        rows: rows.unwrap_or(32).max(1),
-        cols: cols.unwrap_or(120).max(1),
-        pixel_width: 0,
-        pixel_height: 0,
-    }
-}
-
-fn local_pty_command(cwd: &Path) -> CommandBuilder {
-    if cfg!(target_os = "windows") {
-        let mut command = CommandBuilder::new("powershell.exe");
-        command.arg("-NoLogo");
-        command.arg("-NoExit");
-        command.arg("-NoProfile");
-        command.arg("-Command");
-        command.arg(r#"[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); function global:prompt { "PS $($PWD.Path)>" }"#);
-        command.cwd(cwd);
-        command
-    } else {
-        let mut command = CommandBuilder::new(if cfg!(target_os = "macos") {
-            "/bin/zsh"
-        } else {
-            "/bin/bash"
-        });
-        command.cwd(cwd);
-        command
     }
 }
 
