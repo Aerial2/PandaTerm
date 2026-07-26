@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod about;
 mod ai_config;
@@ -33,7 +33,7 @@ use ai_config::{
 };
 use archive::{extract_command, extract_local_archive};
 use base64::{base64_decode, base64_encode};
-use local_fs::{default_local_path, format_path, resolve_local_path, LocalDirectoryEntry, LocalDirectoryListing, LocalFilePreview, LOCAL_FILE_FULL_LIMIT};
+use local_fs::{default_local_path, format_path, parse_remote_listing, resolve_local_path, LocalDirectoryListing, LocalFilePreview, LOCAL_FILE_FULL_LIMIT};
 use shell_text::{
     decode_shell_text, decode_terminal_bytes, shell_cwd_marker, split_shell_output,
 };
@@ -1539,68 +1539,6 @@ async fn exec_remote_command_full_with_progress(
     let _ = channel.close().await;
     emit_file_open_progress(app, transfer_id, stdout.len(), total);
     Ok((stdout, stderr, exit_code))
-}
-
-/// Parse the structured output produced by the remote `find` listing command.
-fn parse_remote_listing(text: &str) -> Result<LocalDirectoryListing, String> {
-    let mut lines = text.lines();
-    let path_line = lines.next().ok_or_else(|| "远程目录响应格式异常".to_string())?;
-    let path = path_line.strip_prefix("P:").unwrap_or(path_line).to_string();
-    let parent_line = lines.next().unwrap_or("");
-    let parent = parent_line
-        .strip_prefix("D:")
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string());
-
-    let mut entries = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(4, '\t');
-        let type_char = parts.next().unwrap_or("");
-        let size_str = parts.next().unwrap_or("0");
-        let mtime_str = parts.next().unwrap_or("0");
-        let name = parts.next().unwrap_or("");
-        if name.is_empty() {
-            continue;
-        }
-        let entry_type = match type_char.chars().next() {
-            Some('d') => "directory",
-            _ => "file",
-        }
-        .to_string();
-        let size: u64 = size_str.parse().unwrap_or(0);
-        let modified_ms = mtime_str
-            .split('.')
-            .next()
-            .and_then(|seconds| seconds.parse::<u64>().ok())
-            .map(|seconds| seconds as u128 * 1000);
-        let full_path = if path.ends_with('/') {
-            format!("{}{}", path, name)
-        } else {
-            format!("{}/{}", path, name)
-        };
-        entries.push(LocalDirectoryEntry {
-            name: name.to_string(),
-            path: full_path,
-            entry_type,
-            size,
-            modified_ms,
-        });
-    }
-
-    entries.sort_by(|left, right| {
-        left.entry_type
-            .cmp(&right.entry_type)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-    });
-
-    Ok(LocalDirectoryListing {
-        path,
-        parent,
-        entries,
-    })
 }
 
 fn local_terminal_exit_state(failure: Option<&str>) -> TerminalLifecycleState {

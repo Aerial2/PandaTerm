@@ -1,4 +1,4 @@
-//! 本地文件系统领域：目录列举、文件预览/读取、路径规范化工具。
+﻿//! 本地文件系统领域：目录列举、文件预览/读取、路径规范化工具。
 //! 均为无 State 依赖的自由函数；远程 SSH 变体留在 main.rs。
 
 use std::fs;
@@ -243,5 +243,67 @@ pub async fn read_local_file_full(path: String) -> Result<LocalFilePreview, Stri
         size: metadata.len(),
         content,
         truncated: false,
+    })
+}
+
+/// Parse the structured output produced by the remote `find` listing command.
+pub(crate) fn parse_remote_listing(text: &str) -> Result<LocalDirectoryListing, String> {
+    let mut lines = text.lines();
+    let path_line = lines.next().ok_or_else(|| "远程目录响应格式异常".to_string())?;
+    let path = path_line.strip_prefix("P:").unwrap_or(path_line).to_string();
+    let parent_line = lines.next().unwrap_or("");
+    let parent = parent_line
+        .strip_prefix("D:")
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let mut entries = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(4, '\t');
+        let type_char = parts.next().unwrap_or("");
+        let size_str = parts.next().unwrap_or("0");
+        let mtime_str = parts.next().unwrap_or("0");
+        let name = parts.next().unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let entry_type = match type_char.chars().next() {
+            Some('d') => "directory",
+            _ => "file",
+        }
+        .to_string();
+        let size: u64 = size_str.parse().unwrap_or(0);
+        let modified_ms = mtime_str
+            .split('.')
+            .next()
+            .and_then(|seconds| seconds.parse::<u64>().ok())
+            .map(|seconds| seconds as u128 * 1000);
+        let full_path = if path.ends_with('/') {
+            format!("{}{}", path, name)
+        } else {
+            format!("{}/{}", path, name)
+        };
+        entries.push(LocalDirectoryEntry {
+            name: name.to_string(),
+            path: full_path,
+            entry_type,
+            size,
+            modified_ms,
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        left.entry_type
+            .cmp(&right.entry_type)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+
+    Ok(LocalDirectoryListing {
+        path,
+        parent,
+        entries,
     })
 }
