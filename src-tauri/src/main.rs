@@ -9,6 +9,7 @@ mod known_hosts;
 mod local_fs;
 mod mcp;
 mod shell_text;
+mod sse;
 mod storage;
 mod system_monitor;
 mod xshell;
@@ -53,6 +54,7 @@ use storage::{
     ai_conversations_path, atomic_write_bytes, atomic_write_text, pandaterm_data_dir,
     session_store_path,
 };
+use sse::{sse_data, take_sse_events};
 use system_monitor::{ProcessInfo, SystemMonitorData};
 use xshell::load_xshell_sessions;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -5205,40 +5207,6 @@ async fn finish_ai_generation(state: &AppState, request_id: &str, signal: &Arc<A
     {
         generations.remove(request_id);
     }
-}
-
-fn take_sse_events(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
-    let mut events = Vec::new();
-    loop {
-        let separator = buffer
-            .windows(2)
-            .position(|window| window == b"\n\n")
-            .map(|index| (index, 2))
-            .or_else(|| {
-                buffer
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .map(|index| (index, 4))
-            });
-        let Some((index, length)) = separator else {
-            break;
-        };
-        let event = buffer.drain(..index).collect::<Vec<_>>();
-        buffer.drain(..length);
-        events.push(event);
-    }
-    events
-}
-
-fn sse_data(event: &[u8]) -> Result<Option<String>, String> {
-    let text = std::str::from_utf8(event).map_err(|_| "AI 流式响应不是有效 UTF-8".to_string())?;
-    let data = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok((!data.is_empty()).then_some(data))
 }
 
 #[tauri::command]
