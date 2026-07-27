@@ -23,11 +23,38 @@ import {
   setCredentialProtection,
   writeClipboardText,
 } from './api';
-import type { CredentialStatus, Session, AuthType } from './api';
+import type { CredentialStatus, Session, AuthType, Protocol } from './api';
 import { SelectDropdown, type SelectOption } from './SelectDropdown';
 import './styles.css';
 
 type ConnectionAuthMethod = 'password' | 'public_key' | 'keyboard_interactive' | 'gssapi';
+
+const PROTOCOL_OPTIONS: readonly SelectOption<Protocol>[] = [
+  { value: 'ssh', label: 'SSH', description: '安全终端 (Linux/Unix)' },
+  { value: 'rdp', label: 'RDP', description: '远程桌面 (Windows)' },
+];
+
+const DEFAULT_PORT_BY_PROTOCOL: Record<Protocol, string> = {
+  ssh: '22',
+  rdp: '3389',
+};
+
+// 端口与协议只是"约定"而非强绑定：同一端口可跑任意服务（如 2222 跑 SSH）。
+// 所以这里只做"软提示"——仅当端口恰好是另一协议的标准端口、且与当前协议不符时，
+// 才建议切换协议；绝不强制拦截，避免误伤非标准端口的合法用法。
+function suggestProtocolByPort(protocol: Protocol, port: string): Protocol | null {
+  const trimmed = port.trim();
+  if (!trimmed) return null;
+  const matched = (Object.entries(DEFAULT_PORT_BY_PROTOCOL) as [Protocol, string][])
+    .find(([, defaultPort]) => defaultPort === trimmed);
+  if (!matched) return null;
+  const [suggested] = matched;
+  return suggested === protocol ? null : suggested;
+}
+
+function protocolLabel(protocol: Protocol): string {
+  return PROTOCOL_OPTIONS.find((option) => option.value === protocol)?.label ?? protocol.toUpperCase();
+}
 
 const AUTH_METHOD_OPTIONS: readonly SelectOption<ConnectionAuthMethod>[] = [
   { value: 'password', label: 'Password', description: '密码登录' },
@@ -37,6 +64,7 @@ const AUTH_METHOD_OPTIONS: readonly SelectOption<ConnectionAuthMethod>[] = [
 ];
 
 type ConnectionFormState = {
+  protocol: Protocol;
   name: string;
   host: string;
   username: string;
@@ -49,6 +77,7 @@ type ConnectionFormState = {
 };
 
 const initialConnectionForm: ConnectionFormState = {
+  protocol: 'ssh',
   name: '',
   host: '',
   username: '',
@@ -292,6 +321,7 @@ export function ConnectionWindow() {
   function loadSessionToForm(session: Session) {
     setEditingId(session.id);
     setConnectionForm({
+      protocol: session.protocol ?? 'ssh',
       name: session.name,
       host: session.host,
       username: session.username,
@@ -316,6 +346,21 @@ export function ConnectionWindow() {
     if (connectionFormError) setConnectionFormError('');
   }
 
+  function handleProtocolChange(nextProtocol: Protocol) {
+    setConnectionForm((current) => {
+      const portWasDefault = current.port.trim() === '' || current.port.trim() === DEFAULT_PORT_BY_PROTOCOL[current.protocol];
+      return {
+        ...current,
+        protocol: nextProtocol,
+        port: portWasDefault ? DEFAULT_PORT_BY_PROTOCOL[nextProtocol] : current.port,
+      };
+    });
+    if (nextProtocol === 'rdp') {
+      setConnectionAuthMethod('password');
+    }
+    if (connectionFormError) setConnectionFormError('');
+  }
+
   function buildConnectionAuth(): AuthType {
     if (connectionAuthMethod === 'password') {
       return { type: 'password', secret_id: connectionForm.password.trim() };
@@ -337,7 +382,7 @@ export function ConnectionWindow() {
     const name = connectionForm.name.trim();
     const host = connectionForm.host.trim();
     const username = connectionForm.username.trim();
-    const port = Number(connectionForm.port.trim() || '22');
+    const port = Number(connectionForm.port.trim() || DEFAULT_PORT_BY_PROTOCOL[connectionForm.protocol]);
 
     if (!name) return '连接名称不能为空';
     if (!host) return '主机地址不能为空';
@@ -367,9 +412,11 @@ export function ConnectionWindow() {
       id: editingId ?? crypto.randomUUID(),
       name: connectionForm.name.trim(),
       group: original?.group ?? 'Custom',
+      protocol: connectionForm.protocol,
       host: connectionForm.host.trim(),
-      port: Number(connectionForm.port.trim() || '22'),
+      port: Number(connectionForm.port.trim() || DEFAULT_PORT_BY_PROTOCOL[connectionForm.protocol]),
       username: connectionForm.username.trim(),
+      domain: original?.domain ?? null,
       auth: buildConnectionAuth(),
       tags: original?.tags ?? ['custom', connectionAuthMethod],
       last_connected_at: original?.last_connected_at ?? null,
@@ -703,7 +750,7 @@ export function ConnectionWindow() {
                         <td className="conn-td-name">{session.name}</td>
                         <td className="conn-td-host">{session.host}</td>
                         <td className="conn-td-user">{session.username}</td>
-                        <td className="conn-td-protocol">SSH</td>
+                        <td className="conn-td-protocol">{(session.protocol ?? 'ssh').toUpperCase()}</td>
                         <td className="conn-td-port">{session.port}</td>
                       </tr>
                     ))}
@@ -746,11 +793,17 @@ export function ConnectionWindow() {
           </div>
         ) : (
           <div className="connection-panel-body">
-            <div className="connection-panel-description">
-              这里会把表单写入连接配置，并立即打开对应终端。
-            </div>
             {connectionFormError && <div className="connection-form-error">{connectionFormError}</div>}
             <div className="connection-form-grid">
+              <label className="connection-form-wide">
+                <span>协议</span>
+                <SelectDropdown
+                  value={connectionForm.protocol}
+                  options={PROTOCOL_OPTIONS}
+                  aria-label="协议"
+                  onChange={handleProtocolChange}
+                />
+              </label>
               <label>
                 <span>连接名称</span>
                 <input
@@ -783,7 +836,23 @@ export function ConnectionWindow() {
                   inputMode="numeric"
                   onChange={(event) => updateConnectionForm('port', event.target.value)}
                 />
+                {(() => {
+                  const suggested = suggestProtocolByPort(connectionForm.protocol, connectionForm.port);
+                  if (!suggested) return null;
+                  return (
+                    <div className="connection-form-port-hint">
+                      <span>
+                        端口 {connectionForm.port.trim()} 通常用于 {protocolLabel(suggested)}，
+                        当前协议是 {protocolLabel(connectionForm.protocol)}
+                      </span>
+                      <button type="button" onClick={() => handleProtocolChange(suggested)}>
+                        切换为 {protocolLabel(suggested)}
+                      </button>
+                    </div>
+                  );
+                })()}
               </label>
+              {connectionForm.protocol === 'ssh' && (
               <label className="connection-form-wide">
                 <span>认证方式</span>
                 <SelectDropdown
@@ -796,6 +865,7 @@ export function ConnectionWindow() {
                   }}
                 />
               </label>
+              )}
 
               {connectionAuthMethod === 'password' && (
                 <label className="connection-form-wide">
@@ -803,7 +873,7 @@ export function ConnectionWindow() {
                   <input
                     type="password"
                     value={connectionForm.password}
-                    placeholder={editingId ? '留空则保留已保存密码' : '输入 SSH 登录密码'}
+                    placeholder={editingId ? '留空则保留已保存密码' : (connectionForm.protocol === 'rdp' ? '输入 Windows 登录密码' : '输入 SSH 登录密码')}
                     onChange={(event) => updateConnectionForm('password', event.target.value)}
                   />
                 </label>

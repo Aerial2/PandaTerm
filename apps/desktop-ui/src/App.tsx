@@ -178,7 +178,6 @@ import { useSystemMonitor } from './useSystemMonitor';
 import { useMediaViewer } from './useMediaViewer';
 import { useUploadConflict } from './useUploadConflict';
 import { RdpView } from './RdpView';
-import { RdpQuickConnect } from './RdpQuickConnect';
 import {
   applyTerminalLifecycleState,
   shouldApplyTerminalStatus,
@@ -7437,7 +7436,6 @@ export function App() {
                   <Plus size={17} />
                   <span>新建连接</span>
                 </button>
-                <RdpQuickConnect onConnect={openRdpTab} />
               </div>
             ) : activeTab.kind === 'terminal' ? (
               <div

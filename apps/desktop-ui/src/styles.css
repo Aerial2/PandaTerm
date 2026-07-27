@@ -4712,6 +4712,44 @@ body.connection-reordering {
   font-weight: 500;
 }
 
+/* 协议-端口错配软提示（非阻塞，可一键切换） */
+.connection-form-port-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 6px 10px;
+  border: 1px solid rgba(229, 192, 123, 0.28);
+  border-radius: 6px;
+  background: rgba(229, 192, 123, 0.08);
+  color: var(--accent-yellow, #e5c07b);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.connection-form-port-hint span {
+  flex: 1;
+  min-width: 0;
+}
+
+.connection-form-port-hint button {
+  flex-shrink: 0;
+  padding: 3px 10px;
+  border: 1px solid rgba(229, 192, 123, 0.5);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--accent-yellow, #e5c07b);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.connection-form-port-hint button:hover {
+  background: rgba(229, 192, 123, 0.16);
+  border-color: rgba(229, 192, 123, 0.7);
+}
+
 /* Connection list */
 
 .connection-list {
@@ -7730,6 +7768,65 @@ body.has-ai-settings-window .ssh-workbench > :not(.ai-settings-backdrop):not(.di
   align-items: center;
   justify-content: center;
   background: #000;
+}
+
+.rdp-toolbar {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: 6px;
+  opacity: 0.35;
+  transition: opacity 0.15s ease;
+}
+
+.rdp-toolbar:hover {
+  opacity: 1;
+}
+
+.rdp-toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rdp-toolbar select {
+  padding: 2px 6px;
+  font-size: 12px;
+  color: var(--text-primary, #fff);
+  background: var(--bg-secondary, #222);
+  border: 1px solid var(--border, #444);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.rdp-disconnect {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  pointer-events: auto;
+}
+
+.rdp-disconnect button {
+  padding: 6px 18px;
+  font-size: 13px;
+  color: var(--text-primary, #fff);
+  background: var(--accent, #2d7ff9);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.rdp-disconnect button:hover {
+  opacity: 0.85;
 }
 
 .rdp-overlay {

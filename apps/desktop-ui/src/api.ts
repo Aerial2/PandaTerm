@@ -877,14 +877,17 @@ export type RdpConnectResult = {
   height: number;
 };
 
+export type RdpQuality = 'standard' | 'hd' | 'uhd';
+
 export async function rdpConnect(
   sessionId: string,
   terminalId: string,
   width: number,
   height: number,
+  quality: RdpQuality,
   channel: Channel<ArrayBuffer>,
 ): Promise<RdpConnectResult> {
-  return await invoke<RdpConnectResult>('rdp_connect', { sessionId, terminalId, width, height, channel });
+  return await invoke<RdpConnectResult>('rdp_connect', { sessionId, terminalId, width, height, quality, channel });
 }
 
 export async function rdpDisconnect(terminalId: string): Promise<void> {

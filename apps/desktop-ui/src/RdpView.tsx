@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Channel } from '@tauri-apps/api/core';
 import { rdpConnect, rdpDisconnect, rdpInput } from './api';
-import type { RdpInputEvent } from './api';
+import type { RdpInputEvent, RdpQuality } from './api';
 import { codeToScancode } from './scancode';
 
 // 帧二进制协议常量：必须与后端 src-tauri/src/rdp.rs 完全一致（多字节小端）。
@@ -178,14 +178,42 @@ type RdpViewProps = {
   onError?: (message: string) => void;
 };
 
-// 把面板 CSS 尺寸换算成请求给服务器的桌面像素：乘 devicePixelRatio 取物理像素以求最清晰，
-// 再按后端 clamp_desktop_size 同样的约束（200..=8192，宽度偶数）预规整，避免无谓往返。
-function panelToDesktopSize(el: HTMLElement): { width: number; height: number } {
-  const dpr = window.devicePixelRatio || 1;
+// 分辨率维度：决定请求给服务器的 desktop_size。'adaptive' 跟随面板物理像素（吸收原 supersampling），
+// 固定档直接用档位像素（canvas objectFit:contain 缩放，非 16:9 面板会有黑边）。
+type RdpResolution = 'adaptive' | '1k' | '2k' | '3k' | '4k';
+
+const RESOLUTION_OPTIONS: { value: RdpResolution; label: string }[] = [
+  { value: 'adaptive', label: '自适应屏幕' },
+  { value: '1k', label: '1K (1280×720)' },
+  { value: '2k', label: '2K (1920×1080)' },
+  { value: '3k', label: '3K (2560×1440)' },
+  { value: '4k', label: '4K (3840×2160)' },
+];
+
+const FIXED_RESOLUTIONS: Record<Exclude<RdpResolution, 'adaptive'>, { width: number; height: number }> = {
+  '1k': { width: 1280, height: 720 },
+  '2k': { width: 1920, height: 1080 },
+  '3k': { width: 2560, height: 1440 },
+  '4k': { width: 3840, height: 2160 },
+};
+
+// 画质维度：决定 codec/位深/视觉效果，纯后端职责，value 与后端 RdpQuality 一一对应。
+const QUALITY_OPTIONS: { value: RdpQuality; label: string }[] = [
+  { value: 'standard', label: '标准' },
+  { value: 'hd', label: '高清' },
+  { value: 'uhd', label: '超清' },
+];
+
+// 按分辨率档位算请求尺寸：adaptive=面板 CSS 尺寸×dpr（物理像素，最清晰）；固定档=档位像素。
+// 两者都按后端 clamp_desktop_size 同步约束（200..=8192、宽取偶数）预处理，避免无谓往返。
+function resolutionToDesktopSize(el: HTMLElement, resolution: RdpResolution): { width: number; height: number } {
   const clamp = (v: number) => Math.max(200, Math.min(8192, Math.round(v)));
-  const width = clamp(el.clientWidth * dpr) & ~1;
-  const height = clamp(el.clientHeight * dpr);
-  return { width, height };
+  if (resolution === 'adaptive') {
+    const dpr = window.devicePixelRatio || 1;
+    return { width: clamp(el.clientWidth * dpr) & ~1, height: clamp(el.clientHeight * dpr) };
+  }
+  const fixed = FIXED_RESOLUTIONS[resolution];
+  return { width: clamp(fixed.width) & ~1, height: clamp(fixed.height) };
 }
 
 export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
@@ -194,6 +222,8 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
   const [status, setStatus] = useState<RdpStatus>('connecting');
   const [errorMsg, setErrorMsg] = useState('');
   const [reconnectNonce, setReconnectNonce] = useState(0);
+  const [resolution, setResolution] = useState<RdpResolution>('adaptive');
+  const [quality, setQuality] = useState<RdpQuality>('hd');
 
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
@@ -202,6 +232,9 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
     const canvas = canvasRef.current;
     const container = containerRef.current;
     if (!canvas || !container) return;
+
+    setStatus('connecting');
+    setErrorMsg('');
 
     let renderer: Renderer;
     try {
@@ -245,12 +278,20 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
       if (disposed) return;
       const buf = toArrayBuffer(msg);
       if (!buf) return;
-      if (new DataView(buf).getUint8(0) === FRAME_ERROR) {
+      const frameType = new DataView(buf).getUint8(0);
+      if (frameType === FRAME_ERROR) {
         const text = new TextDecoder().decode(new Uint8Array(buf, 1));
         connected = false;
         setStatus('error');
         setErrorMsg(text);
         onErrorRef.current?.(text);
+        return;
+      }
+      if (frameType === FRAME_DISCONNECT) {
+        const text = new TextDecoder().decode(new Uint8Array(buf, 1));
+        connected = false;
+        setStatus('disconnected');
+        setErrorMsg(text);
         return;
       }
       if (applyFrame(renderer, buf)) dirty = true;
@@ -336,7 +377,7 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
     let lastH = 0;
     const observer = new ResizeObserver(() => {
       if (disposed || !connected) return;
-      const { width, height } = panelToDesktopSize(container);
+      const { width, height } = resolutionToDesktopSize(container, resolution);
       if (width === lastW && height === lastH) return;
       window.clearTimeout(resizeTimer);
       resizeTimer = window.setTimeout(() => {
@@ -347,8 +388,8 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
       }, 300);
     });
 
-    const initial = panelToDesktopSize(container);
-    rdpConnect(sessionId, terminalId, initial.width, initial.height, channel)
+    const initial = resolutionToDesktopSize(container, resolution);
+    rdpConnect(sessionId, terminalId, initial.width, initial.height, quality, channel)
       .then((result) => {
         if (disposed) return;
         renderer.resize(result.width, result.height);
@@ -383,7 +424,7 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
       void rdpDisconnect(terminalId).catch(() => undefined);
       renderer.dispose();
     };
-  }, [sessionId, terminalId]);
+  }, [sessionId, terminalId, reconnectNonce, resolution, quality]);
 
   return (
     <div className="rdp-view" ref={containerRef}>
@@ -393,10 +434,34 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
         tabIndex={0}
         style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block', outline: 'none' }}
       />
+      <div className="rdp-toolbar">
+        <label>
+          分辨率
+          <select value={resolution} onChange={(e) => setResolution(e.target.value as RdpResolution)}>
+            {RESOLUTION_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          画质
+          <select value={quality} onChange={(e) => setQuality(e.target.value as RdpQuality)}>
+            {QUALITY_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </label>
+      </div>
       {status !== 'connected' && (
         <div className="rdp-overlay">
           {status === 'connecting' && <span>正在连接远程桌面…</span>}
           {status === 'error' && <span>远程桌面已停止：{errorMsg}</span>}
+          {status === 'disconnected' && (
+            <div className="rdp-disconnect">
+              <span>远程桌面会话已断开{errorMsg ? '：' + errorMsg : ''}</span>
+              <button type="button" onClick={() => setReconnectNonce((n) => n + 1)}>重新连接</button>
+            </div>
+          )}
         </div>
       )}
     </div>

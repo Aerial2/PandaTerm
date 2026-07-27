@@ -5535,6 +5535,7 @@ async fn rdp_connect(
     terminal_id: Uuid,
     width: u16,
     height: u16,
+    quality: rdp::RdpQuality,
     channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<rdp::RdpConnectResult, String> {
@@ -5568,6 +5569,7 @@ async fn rdp_connect(
         session.username.clone(),
         password,
         session.domain.clone(),
+        quality,
         width,
         height,
     );

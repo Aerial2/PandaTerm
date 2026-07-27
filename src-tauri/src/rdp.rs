@@ -15,12 +15,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ironrdp::connector::{
-    self, ClientConnector, Credentials, DesktopSize,
+    self, BitmapConfig, ClientConnector, Credentials, DesktopSize,
 };
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::PerformanceFlags;
+use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{
@@ -69,6 +70,63 @@ const TILE_HEADER_LEN: usize = 9;
 const DESKTOP_INIT_LEN: usize = 5;
 const BYTES_PER_PIXEL: usize = 4;
 
+/// 画质档位（前端下拉传入）。三档共享 remotefx 编解码路径，差异只体现在
+/// 色深、有损位图压缩、视觉效果三个真旋钮上，与分辨率维度正交。
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RdpQuality {
+    /// 标准：16bpp + 有损压缩 + 关闭壁纸/主题/动画等视效，最省带宽。
+    Standard,
+    /// 高清：32bpp + 无损 + 默认视效（禁用窗口拖动内容与菜单动画）。
+    Hd,
+    /// 超清：32bpp + 无损 + 开启桌面合成与字体平滑，不禁用任何视效。
+    Uhd,
+}
+
+impl Default for RdpQuality {
+    fn default() -> Self {
+        RdpQuality::Hd
+    }
+}
+
+/// 把画质档位翻译成 IronRDP 的 bitmap 配置与性能标志。
+/// codecs 统一取 client_codecs_capabilities(&[])（remotefx 默认开），保持已验证的解码路径。
+fn quality_profile(quality: RdpQuality) -> (BitmapConfig, PerformanceFlags) {
+    let codecs = client_codecs_capabilities(&[]).unwrap_or_else(|_| {
+        client_codecs_capabilities(&["remotefx:off"]).expect("empty codec list never panics")
+    });
+    match quality {
+        RdpQuality::Standard => (
+            BitmapConfig {
+                lossy_compression: true,
+                color_depth: 16,
+                codecs,
+            },
+            PerformanceFlags::DISABLE_WALLPAPER
+                | PerformanceFlags::DISABLE_FULLWINDOWDRAG
+                | PerformanceFlags::DISABLE_MENUANIMATIONS
+                | PerformanceFlags::DISABLE_THEMING
+                | PerformanceFlags::DISABLE_CURSOR_SHADOW,
+        ),
+        RdpQuality::Hd => (
+            BitmapConfig {
+                lossy_compression: false,
+                color_depth: 32,
+                codecs,
+            },
+            PerformanceFlags::default(),
+        ),
+        RdpQuality::Uhd => (
+            BitmapConfig {
+                lossy_compression: false,
+                color_depth: 32,
+                codecs,
+            },
+            PerformanceFlags::ENABLE_DESKTOP_COMPOSITION | PerformanceFlags::ENABLE_FONT_SMOOTHING,
+        ),
+    }
+}
+
 /// RDP 建连参数（凭据已由 resolved_session 解出明文）。
 pub struct RdpConnectParams {
     pub host: String,
@@ -78,6 +136,7 @@ pub struct RdpConnectParams {
     pub domain: Option<String>,
     pub width: u16,
     pub height: u16,
+    pub quality: RdpQuality,
 }
 
 impl RdpConnectParams {
@@ -89,6 +148,7 @@ impl RdpConnectParams {
         username: String,
         password: String,
         domain: Option<String>,
+        quality: RdpQuality,
         width: u16,
         height: u16,
     ) -> Self {
@@ -104,6 +164,7 @@ impl RdpConnectParams {
             domain,
             width,
             height,
+            quality,
         }
     }
 }
@@ -149,6 +210,7 @@ type UpgradedFramed = ironrdp_blocking::Framed<UpgradedStream>;
 /// 构造 IronRDP 连接配置：仅本地账户 NLA（enable_tls=false + enable_credssp=true）。
 /// 服务器据此走 CredSSP/NLA，其底层仍是 TLS，故 connect_begin 后需 TLS 升级。
 fn build_config(params: &RdpConnectParams) -> connector::Config {
+    let (bitmap, performance_flags) = quality_profile(params.quality);
     connector::Config {
         credentials: Credentials::UsernamePassword {
             username: params.username.clone(),
@@ -167,7 +229,7 @@ fn build_config(params: &RdpConnectParams) -> connector::Config {
             width: params.width,
             height: params.height,
         },
-        bitmap: None,
+        bitmap: Some(bitmap),
         client_build: 0,
         client_name: "pandaterm".to_owned(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
@@ -179,7 +241,7 @@ fn build_config(params: &RdpConnectParams) -> connector::Config {
         compression_type: None,
         pointer_software_rendering: true,
         multitransport_flags: None,
-        performance_flags: PerformanceFlags::default(),
+        performance_flags,
         desktop_scale_factor: 0,
         hardware_id: None,
         license_cache: None,
