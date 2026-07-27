@@ -2,14 +2,29 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// 连接协议类型：区分文本终端（SSH）与图形桌面（RDP）两条通路。
+/// 旧会话数据没有该字段，`#[serde(default)]` 保证反序列化时回落到 `Ssh`。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    #[default]
+    Ssh,
+    Rdp,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Session {
     pub id: Uuid,
     pub name: String,
     pub group: String,
+    #[serde(default)]
+    pub protocol: Protocol,
     pub host: String,
     pub port: u16,
     pub username: String,
+    /// RDP 域账户预留位（DOMAIN\user）。SSH 及本地账户 RDP 恒为 None。
+    #[serde(default)]
+    pub domain: Option<String>,
     pub auth: AuthType,
     pub tags: Vec<String>,
     pub last_connected_at: Option<String>,
@@ -172,9 +187,11 @@ pub fn demo_sessions() -> Vec<Session> {
             id: Uuid::new_v4(),
             name: "Production Gateway".into(),
             group: "Prod".into(),
+            protocol: Protocol::Ssh,
             host: "prod.example.internal".into(),
             port: 22,
             username: "admin".into(),
+            domain: None,
             auth: AuthType::Agent,
             tags: vec!["gateway".into(), "critical".into()],
             last_connected_at: None,
@@ -184,9 +201,11 @@ pub fn demo_sessions() -> Vec<Session> {
             id: Uuid::new_v4(),
             name: "Test Node".into(),
             group: "Test".into(),
+            protocol: Protocol::Ssh,
             host: "test.example.internal".into(),
             port: 22,
             username: "dev".into(),
+            domain: None,
             auth: AuthType::Password {
                 secret_id: "demo-password".into(),
             },

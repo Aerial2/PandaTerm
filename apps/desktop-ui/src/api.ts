@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, Channel } from '@tauri-apps/api/core';
 import {
   readText as readNativeClipboardText,
   writeText as writeNativeClipboardText,
@@ -305,13 +305,17 @@ export type AuthType =
   | { type: 'gssapi'; principal?: string | null }
   | { type: 'agent' };
 
+export type Protocol = 'ssh' | 'rdp';
+
 export type Session = {
   id: string;
   name: string;
   group: string;
+  protocol?: Protocol;
   host: string;
   port: number;
   username: string;
+  domain?: string | null;
   auth: AuthType;
   tags: string[];
   last_connected_at?: string | null;
@@ -866,6 +870,38 @@ export async function connectSession(sessionId: string, terminalId: string): Pro
 
 export async function disconnectSession(terminalId: string): Promise<TerminalEvent> {
   return await invoke<TerminalEvent>('disconnect_session', { terminalId });
+}
+
+export type RdpConnectResult = {
+  width: number;
+  height: number;
+};
+
+export async function rdpConnect(
+  sessionId: string,
+  terminalId: string,
+  width: number,
+  height: number,
+  channel: Channel<ArrayBuffer>,
+): Promise<RdpConnectResult> {
+  return await invoke<RdpConnectResult>('rdp_connect', { sessionId, terminalId, width, height, channel });
+}
+
+export async function rdpDisconnect(terminalId: string): Promise<void> {
+  await invoke('rdp_disconnect', { terminalId });
+}
+
+export type RdpInputEvent =
+  | { kind: 'mouseMove'; x: number; y: number }
+  | { kind: 'mouseButton'; button: number; pressed: boolean }
+  | { kind: 'wheel'; vertical: boolean; delta: number }
+  | { kind: 'key'; scancode: number; pressed: boolean }
+  | { kind: 'unicode'; ch: string; pressed: boolean }
+  | { kind: 'releaseAll' }
+  | { kind: 'resize'; width: number; height: number };
+
+export async function rdpInput(terminalId: string, event: RdpInputEvent): Promise<void> {
+  await invoke('rdp_input', { terminalId, event });
 }
 
 export async function terminalWrite(terminalId: string, data: string): Promise<TerminalEvent> {

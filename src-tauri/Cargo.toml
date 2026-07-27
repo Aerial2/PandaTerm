@@ -30,6 +30,12 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 zeroize = "1.9.0"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-opener = "2.5.4"
+ironrdp = { version = "0.17", features = ["connector", "session", "graphics", "input", "pdu", "dvc", "displaycontrol"] }
+ironrdp-blocking = "0.10"
+sspi = { version = "0.21", features = ["network_client"] }
+tokio-rustls = "0.26"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+native-tls = "0.2.18"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

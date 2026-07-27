@@ -10,6 +10,7 @@ mod legacy_secret;
 mod local_fs;
 mod local_shell;
 mod mcp;
+mod rdp;
 mod session_store;
 mod shell_text;
 mod sse;
@@ -110,6 +111,8 @@ struct AppState {
     mcp_runtime: Arc<mcp::McpRuntime>,
     local_terminals: Mutex<HashMap<Uuid, LocalTerminalSession>>,
     remote_terminals: Mutex<HashMap<Uuid, RemoteTerminalSession>>,
+    /// RDP 图形会话（keyed by 前端 terminal id），持关闭标志用于优雅断开。
+    rdp_terminals: Mutex<HashMap<Uuid, rdp::RdpSession>>,
     /// Reused SSH handles for file transfer (keyed by interactive terminal id).
     transfer_handles: Mutex<HashMap<Uuid, SharedRemoteHandle>>,
     /// Transfer cancellation state keyed by the frontend transfer id.
@@ -5527,6 +5530,114 @@ async fn disconnect_session(
 }
 
 #[tauri::command]
+async fn rdp_connect(
+    session_id: Uuid,
+    terminal_id: Uuid,
+    width: u16,
+    height: u16,
+    channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<rdp::RdpConnectResult, String> {
+    let session = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .all()
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+            .ok_or_else(|| format!("session not found: {session_id}"))?
+    };
+
+    if session.protocol != panda_session::Protocol::Rdp {
+        return Err("该会话不是 RDP 协议".to_string());
+    }
+
+    let session = {
+        let credentials = state.credentials.lock().await;
+        resolved_session(&session, &credentials)?
+    };
+
+    let password = match &session.auth {
+        AuthType::Password { secret_id } => secret_id.clone(),
+        _ => return Err("RDP 当前仅支持密码认证".to_string()),
+    };
+
+    let params = rdp::RdpConnectParams::new(
+        session.host.clone(),
+        session.port,
+        session.username.clone(),
+        password,
+        session.domain.clone(),
+        width,
+        height,
+    );
+
+    let closed = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let thread_closed = Arc::clone(&closed);
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<rdp::RdpInputEvent>();
+
+    // 先登记会话句柄再建连：握手需数秒，若期间标签被关闭（含 React StrictMode 双触发），
+    // rdp_disconnect 能立即拿到 closed 句柄取消，避免服务器上残留无法关闭的孤儿会话。
+    // 若同一 terminal_id 已有会话，先置位旧会话的 closed 关掉它，防止句柄被覆盖丢失。
+    {
+        let mut terminals = state.rdp_terminals.lock().await;
+        if let Some(prev) = terminals.insert(
+            terminal_id,
+            rdp::RdpSession {
+                closed: Arc::clone(&closed),
+                input_tx,
+            },
+        ) {
+            prev.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    thread::spawn(move || {
+        rdp::run_session(params, channel, thread_closed, ready_tx, input_rx);
+    });
+
+    let result = ready_rx
+        .await
+        .map_err(|_| "RDP 连接线程提前退出".to_string())??;
+
+    Ok(result)
+}
+
+#[tauri::command]
+async fn rdp_disconnect(
+    terminal_id: Uuid,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let session = {
+        let mut terminals = state.rdp_terminals.lock().await;
+        terminals.remove(&terminal_id)
+    };
+    if let Some(session) = session {
+        session.closed.store(true, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn rdp_input(
+    terminal_id: Uuid,
+    event: rdp::RdpInputEvent,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let input_tx = {
+        let terminals = state.rdp_terminals.lock().await;
+        terminals
+            .get(&terminal_id)
+            .map(|session| session.input_tx.clone())
+            .ok_or_else(|| format!("RDP 会话未连接: {terminal_id}"))?
+    };
+    input_tx
+        .send(event)
+        .map_err(|_| "RDP 会话线程已退出".to_string())
+}
+
+#[tauri::command]
 async fn terminal_write(
     request: TerminalWriteRequest,
     state: State<'_, Arc<AppState>>,
@@ -5636,6 +5747,7 @@ fn main() {
         mcp_runtime: Arc::clone(&mcp_runtime),
         local_terminals: Mutex::new(HashMap::new()),
         remote_terminals: Mutex::new(HashMap::new()),
+        rdp_terminals: Mutex::new(HashMap::new()),
         transfer_handles: Mutex::new(HashMap::new()),
         transfer_cancellations: Mutex::new(HashMap::new()),
         local_sys_monitor: std::sync::Mutex::new(None),
@@ -5735,6 +5847,9 @@ fn main() {
             run_ai_terminal_command,
             connect_session,
             disconnect_session,
+            rdp_connect,
+            rdp_disconnect,
+            rdp_input,
             terminal_write,
             terminal_resize,
             list_remote_directory,

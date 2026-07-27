@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use panda_session::{AuthType, ReconnectPolicy, Session};
+use panda_session::{AuthType, Protocol, ReconnectPolicy, Session};
 
 fn xshell_sessions_path() -> Option<PathBuf> {
     if !cfg!(target_os = "windows") {
@@ -44,9 +44,11 @@ fn parse_xshell_session(path: &Path) -> Option<Session> {
         id: Uuid::new_v4(),
         name,
         group: "Xshell".to_string(),
+        protocol: Protocol::Ssh,
         host,
         port,
         username,
+        domain: None,
         auth: AuthType::Agent,
         tags: vec!["xshell".to_string(), protocol.to_lowercase()],
         last_connected_at: None,

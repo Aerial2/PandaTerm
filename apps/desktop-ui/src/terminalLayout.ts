@@ -4,7 +4,7 @@
  */
 import type { Session } from './api';
 
-export type TabKind = 'terminal' | 'sftp';
+export type TabKind = 'terminal' | 'sftp' | 'rdp';
 
 export type TerminalStatus =
   | 'idle'

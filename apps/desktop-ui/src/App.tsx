@@ -177,6 +177,8 @@ import type { AiChatStreamEvent, AiProviderConfig, LocalDirectoryListing, LocalT
 import { useSystemMonitor } from './useSystemMonitor';
 import { useMediaViewer } from './useMediaViewer';
 import { useUploadConflict } from './useUploadConflict';
+import { RdpView } from './RdpView';
+import { RdpQuickConnect } from './RdpQuickConnect';
 import {
   applyTerminalLifecycleState,
   shouldApplyTerminalStatus,
@@ -914,6 +916,33 @@ export function App() {
     };
   }
 
+  function createRdpTab(session: Session): WorkspaceTab {
+    const tabId = `rdp:${session.id}-${crypto.randomUUID()}`;
+    return {
+      id: tabId,
+      kind: 'rdp',
+      session,
+      title: session.name,
+      terminalId: crypto.randomUUID(),
+      status: 'connecting',
+      output: [],
+      statusMessage: '正在连接远程桌面...',
+      closedByUser: false,
+      reconnectAttempts: 0,
+      activityLog: [createActivity('info', '正在连接远程桌面...')],
+    };
+  }
+
+  function openRdpTab(session: Session) {
+    const nextTab = createRdpTab(session);
+    activeTabRef.current = nextTab;
+    activeTabIdRef.current = nextTab.id;
+    setShowEditor(false);
+    setTabs((current) => [...current, nextTab]);
+    setActiveTabId(nextTab.id);
+    setStatusMessage(`正在连接远程桌面 ${session.username}@${session.host}:${session.port}`);
+  }
+
   async function loadTerminalDirectory(path?: string | null): Promise<LocalDirectoryListing | null> {
     try {
       const listing = await listLocalDirectory(path);
@@ -1502,6 +1531,10 @@ export function App() {
       openLocalTerminalInBottomPanel();
       return;
     }
+    if (session.protocol === 'rdp') {
+      openRdpTab(session);
+      return;
+    }
 
     const targetPaneId = getConnectionPanelTargetPaneId();
     if (targetPaneId) {
@@ -1529,6 +1562,10 @@ export function App() {
       const session = event.payload;
       if (session.id === localSession.id) {
         openLocalTerminalInBottomPanel();
+        return;
+      }
+      if (session.protocol === 'rdp') {
+        openRdpTab(session);
         return;
       }
       if (pendingPaneTabIdRef.current) {
@@ -7400,6 +7437,7 @@ export function App() {
                   <Plus size={17} />
                   <span>新建连接</span>
                 </button>
+                <RdpQuickConnect onConnect={openRdpTab} />
               </div>
             ) : activeTab.kind === 'terminal' ? (
               <div
@@ -7410,6 +7448,14 @@ export function App() {
                 {getWorkspaceDropPreview()}
                 {getGhostTab()}
                 {renderTerminalLayoutNode(activeTab.layout ?? createDefaultTerminalLayout(activeTab.id), activeTab.id)}
+              </div>
+            ) : activeTab.kind === 'rdp' ? (
+              <div className="rdp-focus-card">
+                <RdpView
+                  key={activeTab.id}
+                  sessionId={activeTab.session.id}
+                  terminalId={activeTab.terminalId}
+                />
               </div>
             ) : (
               <div className="resource-focus-card">

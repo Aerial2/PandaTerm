@@ -161,8 +161,7 @@ fn protect_with_master_password(
     let mut key = derive_master_key(password, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|error| SecretError::Protection(error.to_string()))?;
-    let nonce = Nonce::try_from(nonce_bytes.as_slice())
-        .map_err(|_| SecretError::Protection("invalid AES-GCM nonce".into()))?;
+    let nonce = *Nonce::from_slice(nonce_bytes.as_slice());
     let encrypted = cipher
         .encrypt(
             &nonce,
@@ -200,8 +199,7 @@ fn unprotect_with_master_password(
     let mut key = derive_master_key(password, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|error| SecretError::Protection(error.to_string()))?;
-    let aes_nonce = Nonce::try_from(nonce.as_slice())
-        .map_err(|_| SecretError::InvalidData("invalid AES-GCM nonce".into()))?;
+    let aes_nonce = *Nonce::from_slice(nonce.as_slice());
     let plaintext = cipher
         .decrypt(
             &aes_nonce,
