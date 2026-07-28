@@ -5788,6 +5788,15 @@ export function App() {
       );
     }
 
+    return renderPaneLeaf(node, ownerTabId);
+  }
+
+  // Pane 叶子渲染：从 renderTerminalLayoutNode 拆出的接缝，未来按 tab.kind 分发
+  // （terminal→xterm-host / rdp→RdpView），是 RDP 进分屏体系的落点。
+  function renderPaneLeaf(
+    node: Extract<TerminalLayoutNode, { type: 'leaf' }>,
+    ownerTabId: string,
+  ): ReactNode {
     const paneTabIds = getLeafTabIds(node);
     const paneTabs = paneTabIds
       .map((tabId) => tabs.find((tab) => tab.id === tabId && tab.kind === 'terminal'))
