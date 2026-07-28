@@ -901,10 +901,15 @@ export type RdpInputEvent =
   | { kind: 'key'; scancode: number; pressed: boolean }
   | { kind: 'unicode'; ch: string; pressed: boolean }
   | { kind: 'releaseAll' }
-  | { kind: 'resize'; width: number; height: number };
+  | { kind: 'resize'; width: number; height: number }
+  | { kind: 'clipboard'; text: string };
 
 export async function rdpInput(terminalId: string, event: RdpInputEvent): Promise<void> {
   await invoke('rdp_input', { terminalId, event });
+}
+
+export async function rdpInputBatch(terminalId: string, events: RdpInputEvent[]): Promise<void> {
+  await invoke('rdp_input_batch', { terminalId, events });
 }
 
 export async function terminalWrite(terminalId: string, data: string): Promise<TerminalEvent> {

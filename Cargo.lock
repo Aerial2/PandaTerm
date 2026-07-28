@@ -2932,6 +2932,7 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f910b8dc8e7b8e001c61fd742be442e8604fb2499ded713cadf911e7645ade4"
 dependencies = [
+ "ironrdp-cliprdr",
  "ironrdp-connector",
  "ironrdp-core",
  "ironrdp-displaycontrol",
@@ -2939,7 +2940,9 @@ dependencies = [
  "ironrdp-graphics",
  "ironrdp-input",
  "ironrdp-pdu",
+ "ironrdp-rdpsnd",
  "ironrdp-session",
+ "ironrdp-svc",
 ]
 
 [[package]]
@@ -2960,6 +2963,19 @@ name = "ironrdp-bulk"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e548d9fd162558a5a8aaed72e528556ce88e77773634e3722b8d01d6f170388"
+
+[[package]]
+name = "ironrdp-cliprdr"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb9050999a1e032f4313788ac5a6d06e897a4f672f1de2ed98683001fc1abf56"
+dependencies = [
+ "bitflags 2.13.1",
+ "ironrdp-core",
+ "ironrdp-pdu",
+ "ironrdp-svc",
+ "tracing",
+]
 
 [[package]]
 name = "ironrdp-connector"
@@ -3069,6 +3085,19 @@ dependencies = [
  "sha1 0.10.7",
  "tap",
  "x509-cert",
+]
+
+[[package]]
+name = "ironrdp-rdpsnd"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d1a4f7092ae8fdc0a2f61be8e100277dc6f4ad51b85455dc9e8157979993ea2"
+dependencies = [
+ "bitflags 2.13.1",
+ "ironrdp-core",
+ "ironrdp-pdu",
+ "ironrdp-svc",
+ "tracing",
 ]
 
 [[package]]
@@ -3429,6 +3458,12 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 
 [[package]]
 name = "markup5ever"
@@ -4196,6 +4231,7 @@ dependencies = [
  "encoding_rs",
  "ironrdp",
  "ironrdp-blocking",
+ "lz4_flex",
  "native-tls",
  "panda-core",
  "panda-crypto",
@@ -4205,6 +4241,7 @@ dependencies = [
  "russh",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sspi",
  "sysinfo",
  "tauri",

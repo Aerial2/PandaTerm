@@ -1,17 +1,105 @@
 import { useEffect, useRef, useState } from 'react';
 import { Channel } from '@tauri-apps/api/core';
-import { rdpConnect, rdpDisconnect, rdpInput } from './api';
+import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
+import { rdpConnect, rdpDisconnect, rdpInputBatch } from './api';
 import type { RdpInputEvent, RdpQuality } from './api';
+import { Volume2, VolumeX } from 'lucide-react';
 import { codeToScancode } from './scancode';
 
 // 帧二进制协议常量：必须与后端 src-tauri/src/rdp.rs 完全一致（多字节小端）。
 //   DesktopInit(type=0): [0]=0 [1..3]=width [3..5]=height
-//   Tile(type=1):        [0]=1 [1..3]=x [3..5]=y [5..7]=w [7..9]=h [9..]=RGBA
+//   Batch(type=5):       [0]=5 [1]=flags [2..4]=tileCount [4..8]=rawLen [8..]=payload
+//     payload = flags&1 ? LZ4_block(tiles) : tiles
+//     tile 子记录: [0..2]=x [2..4]=y [4..6]=w [6..8]=h [8..]=RGBA(w*h*4)
 const FRAME_DESKTOP_INIT = 0;
-const FRAME_TILE = 1;
 const FRAME_ERROR = 3;
 const FRAME_DISCONNECT = 4;
-const TILE_HEADER_LEN = 9;
+const FRAME_BATCH = 5;
+const FRAME_CLIPBOARD = 6;
+const FRAME_AUDIO = 7;
+const MAX_CLIPBOARD_BYTES = 4 * 1024 * 1024;
+// FRAME_AUDIO 定长头：type(1) + 声道(2) + 采样率(4) + 位深(2)，与后端 rdp.rs 严格一致。
+const AUDIO_HEADER_LEN = 9;
+
+type AudioPlayer = {
+  push: (channels: number, sampleRate: number, bitsPerSample: number, pcm: Uint8Array) => void;
+  setVolume: (value: number) => void;
+  close: () => void;
+};
+
+// 基于 Web Audio 的 PCM 播放器：把后端推来的交织 16bit 小端样本去交织为 planar float32，
+// 按 AudioContext 时间线无缝排队。欠载（长时间无音频后又来）时把起播点贴到 now+prebuffer
+// 重新对齐，避免与陈旧的 nextStartTime 之间产生静音撕裂或抢跑爆音。
+function createAudioPlayer(initialGain: number): AudioPlayer {
+  let ctx: AudioContext | null = null;
+  let gain: GainNode | null = null;
+  // 期望增益缓存在闭包：ctx 尚未建立（首个音频块到达前）时也能记住，建立后即时套用，
+  // 避免「先拖动音量条、后来音频」时设置丢失。
+  let desiredGain = Math.max(0, initialGain);
+  let nextStartTime = 0;
+  const PREBUFFER = 0.03;
+
+  const ensureCtx = (): AudioContext => {
+    if (!ctx) {
+      ctx = new AudioContext();
+      gain = ctx.createGain();
+      gain.gain.value = desiredGain;
+      gain.connect(ctx.destination);
+      nextStartTime = 0;
+    }
+    if (ctx.state === 'suspended') void ctx.resume();
+    return ctx;
+  };
+
+  const push = (channels: number, sampleRate: number, bitsPerSample: number, pcm: Uint8Array) => {
+    if (bitsPerSample !== 16 || channels < 1 || sampleRate <= 0) return;
+    const bytesPerSample = 2;
+    const stride = channels * bytesPerSample;
+    const frameCount = Math.floor(pcm.byteLength / stride);
+    if (frameCount === 0) return;
+
+    const c = ensureCtx();
+    const buffer = c.createBuffer(channels, frameCount, sampleRate);
+    const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    for (let ch = 0; ch < channels; ch++) {
+      const out = buffer.getChannelData(ch);
+      let off = ch * bytesPerSample;
+      for (let i = 0; i < frameCount; i++) {
+        out[i] = view.getInt16(off, true) / 32768;
+        off += stride;
+      }
+    }
+
+    const src = c.createBufferSource();
+    src.buffer = buffer;
+    src.connect(gain ?? c.destination);
+    const startAt = Math.max(c.currentTime + PREBUFFER, nextStartTime);
+    src.start(startAt);
+    nextStartTime = startAt + buffer.duration;
+  };
+
+  const setVolume = (value: number) => {
+    desiredGain = Math.max(0, value);
+    if (gain && ctx) {
+      // 短坡道过渡，避免增益突变产生咔哒声。
+      gain.gain.setTargetAtTime(desiredGain, ctx.currentTime, 0.015);
+    }
+  };
+
+  const close = () => {
+    if (ctx) {
+      void ctx.close();
+      ctx = null;
+      gain = null;
+    }
+    nextStartTime = 0;
+  };
+
+  return { push, setVolume, close };
+}
+const BATCH_HEADER_LEN = 8;
+const BATCH_TILE_HEADER_LEN = 8;
+const BATCH_FLAG_LZ4 = 0x01;
 
 // WebGL2 全屏四边形着色器。用数组 join 拼接（本文件规避反引号模板串）。
 const VERTEX_SHADER_SRC = [
@@ -150,6 +238,59 @@ function toArrayBuffer(msg: unknown): ArrayBuffer | null {
   return null;
 }
 
+// LZ4 block 格式解码（与后端 lz4_flex block API 产出一致）。src 为压缩数据，
+// rawLen 为解压后字节数（后端在帧头给出，用于精确预分配）。返回填满的 dst。
+// 标准布局：token(高4=literal长/低4=match长) → [扩展字节] → literals → offset(u16 LE)
+//   → [扩展字节]，match 长需 +4（最小匹配）。match 拷贝允许与输出重叠，故逐字节拷。
+function lz4DecompressBlock(src: Uint8Array, rawLen: number): Uint8Array {
+  const dst = new Uint8Array(rawLen);
+  let sp = 0;
+  let dp = 0;
+  const sn = src.length;
+
+  while (sp < sn) {
+    const token = src[sp++];
+
+    let litLen = token >>> 4;
+    if (litLen === 15) {
+      let b = 255;
+      while (b === 255 && sp < sn) {
+        b = src[sp++];
+        litLen += b;
+      }
+    }
+
+    if (litLen > 0) {
+      dst.set(src.subarray(sp, sp + litLen), dp);
+      sp += litLen;
+      dp += litLen;
+    }
+
+    // 末段 sequence 可能只有 literals、无 match（offset 读不满即结束）。
+    if (sp >= sn) break;
+
+    const offset = src[sp] | (src[sp + 1] << 8);
+    sp += 2;
+
+    let matchLen = token & 0x0f;
+    if (matchLen === 15) {
+      let b = 255;
+      while (b === 255 && sp < sn) {
+        b = src[sp++];
+        matchLen += b;
+      }
+    }
+    matchLen += 4;
+
+    let mp = dp - offset;
+    for (let i = 0; i < matchLen; i++) {
+      dst[dp++] = dst[mp++];
+    }
+  }
+
+  return dst;
+}
+
 // 解析单帧并驱动渲染器。返回 true 表示画面有变化、需要重绘。
 function applyFrame(renderer: Renderer, buf: ArrayBuffer): boolean {
   const view = new DataView(buf);
@@ -158,14 +299,30 @@ function applyFrame(renderer: Renderer, buf: ArrayBuffer): boolean {
     renderer.resize(view.getUint16(1, true), view.getUint16(3, true));
     return true;
   }
-  if (frameType === FRAME_TILE) {
-    const x = view.getUint16(1, true);
-    const y = view.getUint16(3, true);
-    const w = view.getUint16(5, true);
-    const h = view.getUint16(7, true);
-    const px = new Uint8Array(buf, TILE_HEADER_LEN, w * h * 4);
-    renderer.uploadTile(x, y, w, h, px);
-    return true;
+  if (frameType === FRAME_BATCH) {
+    const flags = view.getUint8(1);
+    const tileCount = view.getUint16(2, true);
+    const rawLen = view.getUint32(4, true);
+
+    const body = new Uint8Array(buf, BATCH_HEADER_LEN);
+    const tiles =
+      (flags & BATCH_FLAG_LZ4) !== 0 ? lz4DecompressBlock(body, rawLen) : body;
+
+    // 顺序读取 tileCount 个 tile 子记录：8 字节头 + 紧密 RGBA。
+    const td = new DataView(tiles.buffer, tiles.byteOffset, tiles.byteLength);
+    let off = 0;
+    for (let i = 0; i < tileCount; i++) {
+      const x = td.getUint16(off, true);
+      const y = td.getUint16(off + 2, true);
+      const w = td.getUint16(off + 4, true);
+      const h = td.getUint16(off + 6, true);
+      off += BATCH_TILE_HEADER_LEN;
+      const byteLen = w * h * 4;
+      const px = tiles.subarray(off, off + byteLen);
+      off += byteLen;
+      renderer.uploadTile(x, y, w, h, px);
+    }
+    return tileCount > 0;
   }
   return false;
 }
@@ -224,9 +381,31 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
   const [reconnectNonce, setReconnectNonce] = useState(0);
   const [resolution, setResolution] = useState<RdpResolution>('adaptive');
   const [quality, setQuality] = useState<RdpQuality>('hd');
+  const [volume, setVolume] = useState<number>(() => {
+    const raw = Number(localStorage.getItem('pandaterm.rdpVolume'));
+    return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : 1;
+  });
+  const [muted, setMuted] = useState<boolean>(() => localStorage.getItem('pandaterm.rdpMuted') === '1');
+
+  // 活动播放器句柄与「期望增益」都放 ref：音量/静音变化只经独立 effect 施加到现有播放器，
+  // 绝不进入连接 effect 的依赖，否则拖动音量会误触发整条 RDP 会话重建。
+  const audioPlayerRef = useRef<AudioPlayer | null>(null);
+  const effectiveGainRef = useRef(muted ? 0 : volume);
 
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
+
+  useEffect(() => {
+    const gain = muted ? 0 : volume;
+    effectiveGainRef.current = gain;
+    audioPlayerRef.current?.setVolume(gain);
+    try {
+      localStorage.setItem('pandaterm.rdpVolume', String(volume));
+      localStorage.setItem('pandaterm.rdpMuted', muted ? '1' : '0');
+    } catch {
+      // 隐私模式等存储失败可忽略，音量仍在本会话内生效。
+    }
+  }, [volume, muted]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -251,20 +430,59 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
     let dirty = false;
     let connected = false;
     let rafId = 0;
-    let pendingMove: { x: number; y: number } | null = null;
+    let pendingInputs: RdpInputEvent[] = [];
+    let clipboardPollTimer = 0;
+    let clipboardEpoch = 0;
+    let lastClipboardText: string | null = null;
+    const audioPlayer = createAudioPlayer(effectiveGainRef.current);
+    audioPlayerRef.current = audioPlayer;
 
-    const sendInput = (event: RdpInputEvent) => {
+    // 输入入队而非逐事件 invoke：事件按发生顺序进队，连续 mouseMove 做队尾合并只留最新一条，
+    // 整队在 rAF 里一次性批量上行。与下行画面的 Channel 批量对称，把 N 次 invoke 压成 1 次。
+    const queueInput = (event: RdpInputEvent) => {
       if (disposed || !connected) return;
-      void rdpInput(terminalId, event).catch(() => undefined);
+      if (event.kind === 'mouseMove') {
+        const tail = pendingInputs[pendingInputs.length - 1];
+        if (tail && tail.kind === 'mouseMove') {
+          pendingInputs[pendingInputs.length - 1] = event;
+          return;
+        }
+      }
+      pendingInputs.push(event);
+    };
+
+    const flushInputs = () => {
+      if (pendingInputs.length === 0) return;
+      const batch = pendingInputs;
+      pendingInputs = [];
+      void rdpInputBatch(terminalId, batch).catch(() => undefined);
+    };
+
+    const pollLocalClipboard = async () => {
+      if (disposed || !connected) return;
+      const startedAtEpoch = clipboardEpoch;
+      try {
+        const text = await readText();
+        if (disposed || !connected || startedAtEpoch !== clipboardEpoch) return;
+        if (text === lastClipboardText || text.length * 2 + 2 > MAX_CLIPBOARD_BYTES) return;
+        lastClipboardText = text;
+        queueInput({ kind: 'clipboard', text });
+      } catch {
+        // 系统剪贴板可能被其他进程短暂占用，下个轮询周期自动重试。
+      }
+    };
+
+    const applyRemoteClipboard = (text: string) => {
+      if (text === lastClipboardText) return;
+      // 使已在途的本地 readText 结果失效，避免旧内容覆盖刚收到的远端文本。
+      clipboardEpoch += 1;
+      lastClipboardText = text;
+      void writeText(text).catch(() => undefined);
     };
 
     const loop = () => {
       if (disposed) return;
-      if (pendingMove) {
-        const { x, y } = pendingMove;
-        pendingMove = null;
-        sendInput({ kind: 'mouseMove', x, y });
-      }
+      flushInputs();
       if (dirty) {
         dirty = false;
         renderer.draw();
@@ -294,6 +512,20 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
         setErrorMsg(text);
         return;
       }
+      if (frameType === FRAME_CLIPBOARD) {
+        const text = new TextDecoder().decode(new Uint8Array(buf, 1));
+        applyRemoteClipboard(text);
+        return;
+      }
+      if (frameType === FRAME_AUDIO) {
+        if (buf.byteLength <= AUDIO_HEADER_LEN) return;
+        const head = new DataView(buf);
+        const channels = head.getUint16(1, true);
+        const sampleRate = head.getUint32(3, true);
+        const bitsPerSample = head.getUint16(7, true);
+        audioPlayer.push(channels, sampleRate, bitsPerSample, new Uint8Array(buf, AUDIO_HEADER_LEN));
+        return;
+      }
       if (applyFrame(renderer, buf)) dirty = true;
     };
 
@@ -320,17 +552,17 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
     };
 
     const onPointerMove = (e: PointerEvent) => {
-      pendingMove = toDesktop(e.clientX, e.clientY);
+      const pos = toDesktop(e.clientX, e.clientY);
+      queueInput({ kind: 'mouseMove', x: pos.x, y: pos.y });
     };
     const onPointerDown = (e: PointerEvent) => {
       canvas.focus();
       const pos = toDesktop(e.clientX, e.clientY);
-      pendingMove = null;
-      sendInput({ kind: 'mouseMove', x: pos.x, y: pos.y });
-      sendInput({ kind: 'mouseButton', button: e.button, pressed: true });
+      queueInput({ kind: 'mouseMove', x: pos.x, y: pos.y });
+      queueInput({ kind: 'mouseButton', button: e.button, pressed: true });
     };
     const onPointerUp = (e: PointerEvent) => {
-      sendInput({ kind: 'mouseButton', button: e.button, pressed: false });
+      queueInput({ kind: 'mouseButton', button: e.button, pressed: false });
     };
     const onContextMenu = (e: MouseEvent) => {
       e.preventDefault();
@@ -343,22 +575,22 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
       // web 向下/右为正，RDP 相反；一个 notch≈120 单位，clamp 到 i16。
       const units = Math.max(-32768, Math.min(32767, Math.round(-raw / 100) * 120));
       if (units === 0) return;
-      sendInput({ kind: 'wheel', vertical, delta: units });
+      queueInput({ kind: 'wheel', vertical, delta: units });
     };
     const onKeyDown = (e: KeyboardEvent) => {
       const scancode = codeToScancode(e.code);
       if (scancode === undefined) return;
       e.preventDefault();
-      sendInput({ kind: 'key', scancode, pressed: true });
+      queueInput({ kind: 'key', scancode, pressed: true });
     };
     const onKeyUp = (e: KeyboardEvent) => {
       const scancode = codeToScancode(e.code);
       if (scancode === undefined) return;
       e.preventDefault();
-      sendInput({ kind: 'key', scancode, pressed: false });
+      queueInput({ kind: 'key', scancode, pressed: false });
     };
     const onBlur = () => {
-      sendInput({ kind: 'releaseAll' });
+      queueInput({ kind: 'releaseAll' });
     };
 
     canvas.addEventListener('pointermove', onPointerMove);
@@ -384,11 +616,14 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
         if (disposed || !connected) return;
         lastW = width;
         lastH = height;
-        sendInput({ kind: 'resize', width, height });
+        queueInput({ kind: 'resize', width, height });
       }, 300);
     });
 
     const initial = resolutionToDesktopSize(container, resolution);
+    clipboardPollTimer = window.setInterval(() => {
+      void pollLocalClipboard();
+    }, 500);
     rdpConnect(sessionId, terminalId, initial.width, initial.height, quality, channel)
       .then((result) => {
         if (disposed) return;
@@ -399,6 +634,7 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
         lastH = result.height;
         setStatus('connected');
         observer.observe(container);
+        void pollLocalClipboard();
       })
       .catch((e) => {
         if (disposed) return;
@@ -412,6 +648,9 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
       disposed = true;
       observer.disconnect();
       window.clearTimeout(resizeTimer);
+      window.clearInterval(clipboardPollTimer);
+      audioPlayer.close();
+      audioPlayerRef.current = null;
       cancelAnimationFrame(rafId);
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerdown', onPointerDown);
@@ -451,6 +690,30 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
             ))}
           </select>
         </label>
+        <div className="rdp-volume">
+          <button
+            type="button"
+            className="rdp-volume-toggle"
+            title={muted ? '取消静音' : '静音'}
+            aria-label={muted ? '取消静音' : '静音'}
+            onClick={() => setMuted((m) => !m)}
+          >
+            {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
+          </button>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={Math.round((muted ? 0 : volume) * 100)}
+            title="音量"
+            aria-label="音量"
+            onChange={(e) => {
+              const next = Number(e.target.value) / 100;
+              setVolume(next);
+              if (next > 0 && muted) setMuted(false);
+            }}
+          />
+        </div>
       </div>
       {status !== 'connected' && (
         <div className="rdp-overlay">

@@ -5640,6 +5640,27 @@ async fn rdp_input(
 }
 
 #[tauri::command]
+async fn rdp_input_batch(
+    terminal_id: Uuid,
+    events: Vec<rdp::RdpInputEvent>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let input_tx = {
+        let terminals = state.rdp_terminals.lock().await;
+        terminals
+            .get(&terminal_id)
+            .map(|session| session.input_tx.clone())
+            .ok_or_else(|| format!("RDP 会话未连接: {terminal_id}"))?
+    };
+    for event in events {
+        input_tx
+            .send(event)
+            .map_err(|_| "RDP 会话线程已退出".to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn terminal_write(
     request: TerminalWriteRequest,
     state: State<'_, Arc<AppState>>,
@@ -5852,6 +5873,7 @@ fn main() {
             rdp_connect,
             rdp_disconnect,
             rdp_input,
+            rdp_input_batch,
             terminal_write,
             terminal_resize,
             list_remote_directory,

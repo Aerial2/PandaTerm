@@ -14,29 +14,47 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ironrdp::connector::{
-    self, BitmapConfig, ClientConnector, Credentials, DesktopSize,
+use ironrdp::cliprdr::backend::CliprdrBackend;
+use ironrdp::cliprdr::pdu::{
+    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
+    FileContentsResponse, FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId,
+    OwnedFormatDataResponse,
 };
+use ironrdp::cliprdr::CliprdrClient;
+use ironrdp::connector::connection_activation::{
+    ConnectionActivationFactory, ConnectionActivationState,
+};
+use ironrdp::connector::Sequence;
+use ironrdp::connector::{self, BitmapConfig, ClientConnector, Credentials, DesktopSize};
+use ironrdp::core::{IntoOwned as _, WriteBuf};
+use ironrdp::displaycontrol::client::DisplayControlClient;
+use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
+use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
+use ironrdp::pdu::input::fast_path::FastPathInputEvent;
+use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::PerformanceFlags;
-use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
-use ironrdp::pdu::gcc::KeyboardType;
+use ironrdp::rdpsnd::client::{Rdpsnd, RdpsndClientHandler};
+use ironrdp::rdpsnd::pdu::{AudioFormat, PitchPdu, VolumePdu, WaveFormat};
+use ironrdp::session::fast_path;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{
     ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason,
 };
-use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
-use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use serde::{Deserialize, Serialize};
 use sspi::network_client::reqwest_network_client::ReqwestNetworkClient;
 use tauri::ipc::{Channel, InvokeResponseBody};
+use zeroize::Zeroize;
 
 /// 建连握手阶段的 socket 读超时：给 TLS/CredSSP 往返留足余量（与 SSH 15s 对齐）。
 const CONNECT_READ_TIMEOUT: Duration = Duration::from_secs(15);
-/// ActiveStage 常驻阶段的 socket 读超时：短超时以便及时响应关闭信号。
-const ACTIVE_READ_TIMEOUT: Duration = Duration::from_millis(16);
+/// ActiveStage 常驻阶段的 socket 读超时。画面静止时循环节奏由本超时决定：
+/// 每次超时后回到循环顶部再 drain_input，故此值即静止画面下输入拾取的最坏延迟上界。
+/// 取 8ms 在输入响应与空闲唤醒频率间平衡（前端 rAF 本就约 16ms 一批，再低收益递减）。
+const ACTIVE_READ_TIMEOUT: Duration = Duration::from_millis(8);
 
 /// PoC 默认请求分辨率；服务器可能协商出不同尺寸，以 ConnectionResult 为准。
 const DEFAULT_WIDTH: u16 = 1280;
@@ -50,23 +68,65 @@ const DEFAULT_HEIGHT: u16 = 1024;
 //     [1..3]   u16  width
 //     [3..5]   u16  height
 //
-//   Tile (type=1)：一块脏矩形的紧密打包 RGBA（无行间空隙）
-//     [0]      u8   frame_type = 1
-//     [1..3]   u16  x
-//     [3..5]   u16  y
-//     [5..7]   u16  width
-//     [7..9]   u16  height
-//     [9..]    RGBA 像素，长度 = width*height*4
+//   Tile 子记录：批次帧内部一块脏矩形的紧密打包 RGBA（无行间空隙）
+//     [0..2]   u16  x
+//     [2..4]   u16  y
+//     [4..6]   u16  width
+//     [6..8]   u16  height
+//     [8..]    RGBA 像素，长度 = width*height*4
 //
-//   Video (type=2)：预留给后续 H.264/EGFX 直通，本阶段不产生。
+//   Batch (type=5)：把一次 process() 产生的多块脏矩形合并成单条 IPC 消息，
+//   payload 可选 LZ4 block 压缩（flags bit0），减少消息条数与序列化/调度开销。
+//     [0]      u8   frame_type = 5
+//     [1]      u8   flags（bit0=1 表示 payload 经 LZ4 block 压缩）
+//     [2..4]   u16  tile_count
+//     [4..8]   u32  raw_len（解压后 payload 字节数；供前端预分配与解压）
+//     [8..]    payload = flags&1 ? LZ4_block(tiles) : tiles
+//              tiles = 依次 tile_count 个上述 Tile 子记录
 const FRAME_DESKTOP_INIT: u8 = 0;
-const FRAME_TILE: u8 = 1;
+// type=1 曾用于单块 Tile 帧，现已并入 Batch(type=5)；保留编号语义避免与旧协议冲突。
 // type=2 预留给 Video/EGFX 直通；type=3 承载运行期错误/断开原因（UTF-8 文本）。
 const FRAME_ERROR: u8 = 3;
 // type=4 承载优雅断开（用户/服务器主动结束会话），前端切到中性提示并给出重连入口。
 const FRAME_DISCONNECT: u8 = 4;
+// type=5 承载合帧批次（多脏矩形 + 可选 LZ4），是常驻阶段图形下行的唯一热路径帧。
+const FRAME_BATCH: u8 = 5;
+// type=6 承载远端剪贴板 UTF-8 文本，前端收到后写入 OS 剪贴板。
+const FRAME_CLIPBOARD: u8 = 6;
+// type=7 承载远端音频 PCM：定长头(声道/采样率/位深) + 交织小端样本，前端经 Web Audio 播放。
+const FRAME_AUDIO: u8 = 7;
 
-const TILE_HEADER_LEN: usize = 9;
+/// 单次剪贴板文本传输上限，防止不可信远端通过超大 PDU/字符串造成内存峰值。
+const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
+/// 单个音频 wave 块上限，防止不可信远端用超大 PDU 造成内存峰值（正常 wave 仅数 KB）。
+const MAX_AUDIO_CHUNK_BYTES: usize = 1024 * 1024;
+/// FRAME_AUDIO 定长头：type(1) + 声道(2) + 采样率(4) + 位深(2)。
+const AUDIO_HEADER_LEN: usize = 9;
+
+/// 唯一对外通告的音频格式：44.1kHz / 16bit / 立体声 PCM。仅通告一个格式，
+/// 使协商交集至多含此一项，从而 Wave2 的 format_no 无歧义，前端可用固定头解码。
+fn advertised_audio_format() -> AudioFormat {
+    let n_channels: u16 = 2;
+    let n_samples_per_sec: u32 = 44_100;
+    let bits_per_sample: u16 = 16;
+    let n_block_align = n_channels * (bits_per_sample / 8);
+    AudioFormat {
+        format: WaveFormat::PCM,
+        n_channels,
+        n_samples_per_sec,
+        n_avg_bytes_per_sec: n_samples_per_sec * u32::from(n_block_align),
+        n_block_align,
+        bits_per_sample,
+        data: None,
+    }
+}
+
+/// Batch 帧头长度：type(1) + flags(1) + tile_count(2) + raw_len(4)。
+const BATCH_HEADER_LEN: usize = 8;
+/// Batch 内单个 tile 子记录头：x(2) + y(2) + w(2) + h(2)，其后紧跟 RGBA。
+const BATCH_TILE_HEADER_LEN: usize = 8;
+/// flags bit0：payload 经 LZ4 block 压缩。
+const BATCH_FLAG_LZ4: u8 = 0x01;
 const DESKTOP_INIT_LEN: usize = 5;
 const BYTES_PER_PIXEL: usize = 4;
 
@@ -169,6 +229,14 @@ impl RdpConnectParams {
     }
 }
 
+/// 会话线程结束时清零密码明文的堆缓冲，缩小敏感数据在内存中的驻留窗口。
+/// 注：ironrdp 内部另持一份凭据副本不在此掌控内，此处仅负责我方持有的这份。
+impl Drop for RdpConnectParams {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
 /// 把请求分辨率规整到 RDP/DisplayControl 合法范围：两维 clamp 到 200..=8192，
 /// 宽度取偶数（DisplayControl 规范要求宽度为偶数）。建连与动态 resize 统一走此约束。
 fn clamp_desktop_size(width: u16, height: u16) -> (u16, u16) {
@@ -202,10 +270,217 @@ pub enum RdpInputEvent {
     Unicode { ch: String, pressed: bool },
     ReleaseAll,
     Resize { width: u16, height: u16 },
+    Clipboard { text: String },
 }
 
 type UpgradedStream = native_tls::TlsStream<TcpStream>;
 type UpgradedFramed = ironrdp_blocking::Framed<UpgradedStream>;
+
+#[derive(Debug)]
+enum ClipboardAction {
+    AdvertiseLocal,
+    RequestRemote(ClipboardFormatId),
+    Respond(OwnedFormatDataResponse),
+}
+
+/// CLIPRDR 仅维护协议态与待发送动作；系统剪贴板由前端 Tauri 插件负责。
+/// 回调发生在 `ActiveStage::process` 内，不能重入借用 Cliprdr，因此先记录动作，
+/// 待当前 PDU 处理结束后由会话循环统一编码并写回网络。
+struct PandaClipboardBackend {
+    channel: Channel<InvokeResponseBody>,
+    temporary_directory: String,
+    local_text: Option<String>,
+    pending_remote_format: Option<ClipboardFormatId>,
+    actions: std::collections::VecDeque<ClipboardAction>,
+}
+
+impl std::fmt::Debug for PandaClipboardBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PandaClipboardBackend")
+            .field("temporary_directory", &self.temporary_directory)
+            .field("has_local_text", &self.local_text.is_some())
+            .field("pending_remote_format", &self.pending_remote_format)
+            .field("pending_actions", &self.actions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PandaClipboardBackend {
+    fn new(channel: Channel<InvokeResponseBody>) -> Self {
+        Self {
+            channel,
+            temporary_directory: std::env::temp_dir().to_string_lossy().into_owned(),
+            local_text: None,
+            pending_remote_format: None,
+            actions: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn set_local_text(&mut self, text: String) {
+        if text.len() > MAX_CLIPBOARD_BYTES || self.local_text.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        self.local_text = Some(text);
+        self.actions.push_back(ClipboardAction::AdvertiseLocal);
+    }
+
+    fn encode_local_text(&self, format: ClipboardFormatId) -> OwnedFormatDataResponse {
+        let Some(text) = self.local_text.as_deref() else {
+            return FormatDataResponse::new_error().into_owned();
+        };
+        if text
+            .encode_utf16()
+            .count()
+            .saturating_mul(2)
+            .saturating_add(2)
+            > MAX_CLIPBOARD_BYTES
+        {
+            return FormatDataResponse::new_error().into_owned();
+        }
+        if format == ClipboardFormatId::CF_UNICODETEXT {
+            FormatDataResponse::new_unicode_string(text).into_owned()
+        } else if format == ClipboardFormatId::CF_TEXT {
+            FormatDataResponse::new_string(text).into_owned()
+        } else {
+            FormatDataResponse::new_error().into_owned()
+        }
+    }
+
+    fn decode_remote_text(&self, response: &FormatDataResponse<'_>) -> Option<String> {
+        if response.is_error() || response.data().len() > MAX_CLIPBOARD_BYTES {
+            return None;
+        }
+        match self.pending_remote_format {
+            Some(ClipboardFormatId::CF_UNICODETEXT) => response.to_unicode_string().ok(),
+            Some(ClipboardFormatId::CF_TEXT) => response.to_string().ok(),
+            _ => None,
+        }
+    }
+
+    fn publish_remote_text(&self, text: &str) {
+        let mut frame = Vec::with_capacity(1 + text.len());
+        frame.push(FRAME_CLIPBOARD);
+        frame.extend_from_slice(text.as_bytes());
+        let _ = send_frame(&self.channel, frame);
+    }
+}
+
+ironrdp::core::impl_as_any!(PandaClipboardBackend);
+
+impl CliprdrBackend for PandaClipboardBackend {
+    fn temporary_directory(&self) -> &str {
+        &self.temporary_directory
+    }
+
+    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+        ClipboardGeneralCapabilityFlags::empty()
+    }
+
+    fn on_ready(&mut self) {}
+
+    fn on_request_format_list(&mut self) {
+        self.actions.push_back(ClipboardAction::AdvertiseLocal);
+    }
+
+    fn on_process_negotiated_capabilities(
+        &mut self,
+        _capabilities: ClipboardGeneralCapabilityFlags,
+    ) {
+    }
+
+    fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
+        let format = available_formats
+            .iter()
+            .map(ClipboardFormat::id)
+            .find(|id| *id == ClipboardFormatId::CF_UNICODETEXT)
+            .or_else(|| {
+                available_formats
+                    .iter()
+                    .map(ClipboardFormat::id)
+                    .find(|id| *id == ClipboardFormatId::CF_TEXT)
+            });
+        if let Some(format) = format {
+            self.pending_remote_format = Some(format);
+            self.actions
+                .push_back(ClipboardAction::RequestRemote(format));
+        }
+    }
+
+    fn on_format_data_request(&mut self, request: FormatDataRequest) {
+        let response = self.encode_local_text(request.format);
+        self.actions.push_back(ClipboardAction::Respond(response));
+    }
+
+    fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+        if let Some(text) = self.decode_remote_text(&response) {
+            self.local_text = Some(text.clone());
+            self.publish_remote_text(&text);
+        }
+        self.pending_remote_format = None;
+    }
+
+    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
+
+    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+
+    fn on_lock(&mut self, _data_id: LockDataId) {}
+
+    fn on_unlock(&mut self, _data_id: LockDataId) {}
+
+    fn on_remote_file_list(&mut self, _files: &[FileDescriptor], _clip_data_id: Option<u32>) {}
+}
+
+/// rdpsnd 音频后端：只处理 RDP 协议侧，把服务器下发的 PCM wave 通过 Channel 直推前端播放。
+/// 单向流，无需回发协议（wave_confirm 由 Rdpsnd::process 自动生成）。
+struct PandaAudioBackend {
+    channel: Channel<InvokeResponseBody>,
+    formats: Vec<AudioFormat>,
+}
+
+impl std::fmt::Debug for PandaAudioBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PandaAudioBackend")
+            .field("formats", &self.formats.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PandaAudioBackend {
+    fn new(channel: Channel<InvokeResponseBody>) -> Self {
+        Self {
+            channel,
+            formats: vec![advertised_audio_format()],
+        }
+    }
+}
+
+impl RdpsndClientHandler for PandaAudioBackend {
+    fn get_formats(&self) -> &[AudioFormat] {
+        &self.formats
+    }
+
+    /// 服务器音频块回调：仅接受唯一通告格式，封 FRAME_AUDIO 定长头 + 交织 PCM 推前端。
+    /// format_no 因单格式协商而无歧义，故用固定通告参数封头，不依赖其索引。
+    fn wave(&mut self, _format_no: usize, _ts: u32, data: std::borrow::Cow<'_, [u8]>) {
+        if data.is_empty() || data.len() > MAX_AUDIO_CHUNK_BYTES {
+            return;
+        }
+        let format = advertised_audio_format();
+        let mut frame = Vec::with_capacity(AUDIO_HEADER_LEN + data.len());
+        frame.push(FRAME_AUDIO);
+        frame.extend_from_slice(&format.n_channels.to_le_bytes());
+        frame.extend_from_slice(&format.n_samples_per_sec.to_le_bytes());
+        frame.extend_from_slice(&format.bits_per_sample.to_le_bytes());
+        frame.extend_from_slice(&data);
+        let _ = send_frame(&self.channel, frame);
+    }
+
+    fn set_volume(&mut self, _volume: VolumePdu) {}
+
+    fn set_pitch(&mut self, _pitch: PitchPdu) {}
+
+    fn close(&mut self) {}
+}
 
 /// 构造 IronRDP 连接配置：仅本地账户 NLA（enable_tls=false + enable_credssp=true）。
 /// 服务器据此走 CredSSP/NLA，其底层仍是 TLS，故 connect_begin 后需 TLS 升级。
@@ -257,6 +532,7 @@ fn connect(
     config: connector::Config,
     server_name: String,
     port: u16,
+    channel: Channel<InvokeResponseBody>,
 ) -> Result<(connector::ConnectionResult, UpgradedFramed), String> {
     use std::net::ToSocketAddrs as _;
 
@@ -278,7 +554,14 @@ fn connect(
         .map_err(|e| format!("获取本地地址失败: {e}"))?;
 
     let mut framed = ironrdp_blocking::Framed::new(tcp_stream);
-    let mut connector = ClientConnector::new(config, client_addr);
+    let drdynvc =
+        DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+    let cliprdr = CliprdrClient::new(Box::new(PandaClipboardBackend::new(channel.clone())));
+    let rdpsnd = Rdpsnd::new(Box::new(PandaAudioBackend::new(channel)));
+    let mut connector = ClientConnector::new(config, client_addr)
+        .with_static_channel(drdynvc)
+        .with_static_channel(cliprdr)
+        .with_static_channel(rdpsnd);
 
     eprintln!("[RDP] TCP 已连接，开始 X.224 协商 (请求 HYBRID/NLA)");
     let should_upgrade = ironrdp_blocking::connect_begin(&mut framed, &mut connector)
@@ -286,8 +569,15 @@ fn connect(
 
     eprintln!("[RDP] X.224 协商完成，服务器同意升级，开始 TLS 握手");
     let initial_stream = framed.into_inner_no_leftover();
-    let (upgraded_stream, server_public_key) =
-        tls_upgrade(initial_stream, server_name.clone()).map_err(|e| format!("TLS 升级失败: {e}"))?;
+    let (upgraded_stream, server_public_key) = tls_upgrade(initial_stream, server_name.clone())
+        .map_err(|e| format!("TLS 升级失败: {e}"))?;
+
+    // TOFU 证书 pinning：TLS 为兼容自签证书放行了校验，握手后改用服务器公钥指纹在
+    // known_hosts 做首信/防篡改比对，在把凭据交给 CredSSP 之前拦截 MITM。
+    // 键加 "rdp:" 前缀与 SSH 记录分区；公钥变更（含服务器重装）将中止建连。
+    let fingerprint = public_key_fingerprint(&server_public_key);
+    let host_key = format!("rdp:{server_name}:{port}");
+    crate::known_hosts::verify_or_trust_fingerprint(&host_key, &fingerprint, "RDP")?;
 
     eprintln!("[RDP] TLS 握手成功，开始 CredSSP/NLA 认证");
     let upgraded = ironrdp_blocking::mark_as_upgraded(should_upgrade, &mut connector);
@@ -343,6 +633,19 @@ fn tls_upgrade(
     Ok((tls_stream, server_public_key))
 }
 
+/// 对服务器公钥（SPKI 的 subject_public_key 字节）算 SHA-256，格式化为 sha256:hex 指纹。
+/// 公钥 pinning 比证书 pinning 更稳定：证书轮换而密钥不变时指纹不变，减少误报。
+fn public_key_fingerprint(public_key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(public_key);
+    use std::fmt::Write as _;
+    let hex = digest.iter().fold(String::with_capacity(64), |mut acc, b| {
+        let _ = write!(acc, "{b:02x}");
+        acc
+    });
+    format!("sha256:{hex}")
+}
+
 fn extract_tls_server_public_key(cert: &[u8]) -> Result<Vec<u8>, String> {
     use x509_cert::der::Decode as _;
 
@@ -357,30 +660,101 @@ fn extract_tls_server_public_key(cert: &[u8]) -> Result<Vec<u8>, String> {
     Ok(key)
 }
 
-/// 把一块脏矩形从 DecodedImage 的带 stride 缓冲中逐行紧密拷出（去掉行间空隙），
-/// 组装成 [9 字节头 + RGBA] 的 Tile 帧字节。
-fn encode_tile_frame(image: &DecodedImage, rect: &InclusiveRectangle) -> Vec<u8> {
-    let x = rect.left;
-    let y = rect.top;
-    let w = rect.width();
-    let h = rect.height();
+/// 合帧累积器：把一次 process()/process_fastpath_input() 产生的多块脏矩形
+/// 收进单个 payload 缓冲，最终编码成一条 FRAME_BATCH。相比逐块 send_frame，
+/// 把 N 条 IPC 消息压成 1 条，省去每条消息的序列化与调度固定开销。
+struct TileBatch {
+    payload: Vec<u8>,
+    tile_count: u16,
+    /// 跨帧复用的 LZ4 压缩输出缓冲：按最大输出上界 resize 后复用，避免每帧 alloc/free。
+    compress_scratch: Vec<u8>,
+}
 
-    let stride = image.stride();
-    let src = image.data();
-    let row_bytes = usize::from(w) * BYTES_PER_PIXEL;
-
-    let mut out = Vec::with_capacity(TILE_HEADER_LEN + usize::from(w) * usize::from(h) * BYTES_PER_PIXEL);
-    out.push(FRAME_TILE);
-    out.extend_from_slice(&x.to_le_bytes());
-    out.extend_from_slice(&y.to_le_bytes());
-    out.extend_from_slice(&w.to_le_bytes());
-    out.extend_from_slice(&h.to_le_bytes());
-
-    for row in 0..usize::from(h) {
-        let src_row_start = (usize::from(y) + row) * stride + usize::from(x) * BYTES_PER_PIXEL;
-        out.extend_from_slice(&src[src_row_start..src_row_start + row_bytes]);
+impl TileBatch {
+    fn new() -> Self {
+        TileBatch {
+            payload: Vec::new(),
+            tile_count: 0,
+            compress_scratch: Vec::new(),
+        }
     }
-    out
+
+    fn is_empty(&self) -> bool {
+        self.tile_count == 0
+    }
+
+    /// 清空累积但保留 payload 已分配容量，供下一帧复用，避免热路径反复扩容。
+    fn clear(&mut self) {
+        self.payload.clear();
+        self.tile_count = 0;
+    }
+
+    /// 追加一块脏矩形：写 8 字节 tile 头，再从带 stride 的源缓冲逐行紧密拷出 RGBA。
+    fn push(&mut self, image: &DecodedImage, rect: &InclusiveRectangle) {
+        let x = rect.left;
+        let y = rect.top;
+        let w = rect.width();
+        let h = rect.height();
+
+        let stride = image.stride();
+        let src = image.data();
+        let row_bytes = usize::from(w) * BYTES_PER_PIXEL;
+
+        self.payload
+            .reserve(BATCH_TILE_HEADER_LEN + usize::from(w) * usize::from(h) * BYTES_PER_PIXEL);
+        self.payload.extend_from_slice(&x.to_le_bytes());
+        self.payload.extend_from_slice(&y.to_le_bytes());
+        self.payload.extend_from_slice(&w.to_le_bytes());
+        self.payload.extend_from_slice(&h.to_le_bytes());
+
+        for row in 0..usize::from(h) {
+            let src_row_start = (usize::from(y) + row) * stride + usize::from(x) * BYTES_PER_PIXEL;
+            self.payload
+                .extend_from_slice(&src[src_row_start..src_row_start + row_bytes]);
+        }
+
+        self.tile_count = self.tile_count.saturating_add(1);
+    }
+
+    /// 组装成 FRAME_BATCH 字节：尝试 LZ4 block 压缩，仅当压缩后确实更小才启用，
+    /// 否则回退明文（flags 清零）。压缩走 compress_scratch 跨帧复用缓冲，不新分配。
+    fn encode_frame(&mut self) -> Vec<u8> {
+        let raw_len = self.payload.len() as u32;
+
+        let mut flags = 0u8;
+        let max = lz4_flex::block::get_maximum_output_size(self.payload.len());
+        if self.compress_scratch.len() < max {
+            self.compress_scratch.resize(max, 0);
+        }
+
+        let body: &[u8] =
+            match lz4_flex::block::compress_into(&self.payload, &mut self.compress_scratch) {
+                Ok(n) if n < self.payload.len() => {
+                    flags |= BATCH_FLAG_LZ4;
+                    &self.compress_scratch[..n]
+                }
+                _ => &self.payload,
+            };
+
+        let mut out = Vec::with_capacity(BATCH_HEADER_LEN + body.len());
+        out.push(FRAME_BATCH);
+        out.push(flags);
+        out.extend_from_slice(&self.tile_count.to_le_bytes());
+        out.extend_from_slice(&raw_len.to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+}
+
+/// 把已拼好的 tiles payload 封成 FRAME_BATCH 帧。独立成函数便于单元测试往返验证；
+/// 内部走 TileBatch 的复用编码路径，与热路径产出字节完全一致。热路径本身直接用
+/// TileBatch::encode_frame，故此包装仅测试使用。
+#[cfg(test)]
+fn encode_batch_frame(payload: &[u8], tile_count: u16) -> Vec<u8> {
+    let mut batch = TileBatch::new();
+    batch.payload.extend_from_slice(payload);
+    batch.tile_count = tile_count;
+    batch.encode_frame()
 }
 
 fn encode_desktop_init_frame(width: u16, height: u16) -> Vec<u8> {
@@ -417,7 +791,9 @@ fn describe_disconnect(reason: &GracefulDisconnectReason) -> String {
         GracefulDisconnectReason::ServerInitiated => "已断开：服务器结束了会话".to_owned(),
         GracefulDisconnectReason::Other(desc) => {
             let lower = desc.to_lowercase();
-            if lower.contains("logging off") || lower.contains("logoff") || lower.contains("log off")
+            if lower.contains("logging off")
+                || lower.contains("logoff")
+                || lower.contains("log off")
             {
                 "已断开：远程用户在服务器上注销了该会话".to_owned()
             } else if lower.contains("idle") {
@@ -438,9 +814,158 @@ fn send_frame(channel: &Channel<InvokeResponseBody>, bytes: Vec<u8>) -> Result<(
 }
 
 /// 把已升级流的读超时改短，用于 ActiveStage 常驻阶段及时响应关闭信号。
+/// 把底层 socket 读超时临时调回连接期的长超时（15s）。重激活是多步握手，
+/// 若沿用 ActiveStage 的 16ms 短超时会在序列中途 TimedOut 打断，导致状态机卡死。
+fn set_connect_timeout(framed: &mut UpgradedFramed) {
+    let (stream, _) = framed.get_inner_mut();
+    let _ = stream
+        .get_ref()
+        .set_read_timeout(Some(CONNECT_READ_TIMEOUT));
+}
+
+/// 处理服务器发起的 Deactivation-Reactivation 序列（DisplayControl 动态 resize 后触发）。
+/// 期间临时恢复长读超时，逐步驱动 ConnectionActivationSequence 到 Finalized：
+/// 据新桌面尺寸重建 image、重建 fast-path 处理器、更新 share_id/指针配置，
+/// 恢复 16ms 短超时后向前端推新的 DesktopInit 帧以重建 WebGL 纹理（免整会话重连）。
+fn reactivate(
+    framed: &mut UpgradedFramed,
+    active_stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    activation_factory: &ConnectionActivationFactory,
+    channel: &Channel<InvokeResponseBody>,
+) -> Result<(), String> {
+    set_connect_timeout(framed);
+
+    let mut activation = activation_factory.create();
+    let mut buf = WriteBuf::new();
+
+    let (width, height) = loop {
+        drive_activation_step(framed, &mut activation, &mut buf)?;
+
+        if let ConnectionActivationState::Finalized {
+            desktop_size,
+            share_id,
+            enable_server_pointer,
+            pointer_software_rendering,
+        } = activation.connection_activation_state()
+        {
+            *image =
+                DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+            active_stage.set_fastpath_processor(
+                fast_path::ProcessorBuilder {
+                    io_channel_id: activation.io_channel_id(),
+                    user_channel_id: activation.user_channel_id(),
+                    share_id,
+                    enable_server_pointer,
+                    pointer_software_rendering,
+                    bulk_decompressor: None,
+                }
+                .build(),
+            );
+            active_stage.set_share_id(share_id);
+            active_stage.set_enable_server_pointer(enable_server_pointer);
+            break (desktop_size.width, desktop_size.height);
+        }
+    };
+
+    set_active_timeout(framed);
+    send_frame(channel, encode_desktop_init_frame(width, height))?;
+    Ok(())
+}
+
+/// blocking 版泛型单步驱动：对标 ironrdp-blocking 的 single_sequence_step，但该官方函数
+/// 对 ClientConnector 写死，这里泛型到任意 Sequence（用于驱动 ConnectionActivationSequence）。
+fn drive_activation_step<S: Sequence>(
+    framed: &mut UpgradedFramed,
+    sequence: &mut S,
+    buf: &mut WriteBuf,
+) -> Result<(), String> {
+    buf.clear();
+
+    let written = if let Some(next_pdu_hint) = sequence.next_pdu_hint() {
+        let pdu = framed
+            .read_by_hint(next_pdu_hint)
+            .map_err(|e| format!("读取重激活 PDU 失败: {e}"))?;
+        sequence
+            .step(&pdu, buf)
+            .map_err(|e| format!("重激活步进失败: {e}"))?
+    } else {
+        sequence
+            .step_no_input(buf)
+            .map_err(|e| format!("重激活步进失败: {e}"))?
+    };
+
+    if let Some(response_len) = written.size() {
+        framed
+            .write_all(&buf[..response_len])
+            .map_err(|e| format!("回写重激活帧失败: {e}"))?;
+    }
+    Ok(())
+}
+
 fn set_active_timeout(framed: &mut UpgradedFramed) {
     let (stream, _) = framed.get_inner_mut();
     let _ = stream.get_ref().set_read_timeout(Some(ACTIVE_READ_TIMEOUT));
+}
+
+fn queue_local_clipboard(active_stage: &mut ActiveStage, text: String) {
+    if let Some(cliprdr) = active_stage.get_svc_processor_mut::<CliprdrClient>() {
+        if let Some(backend) = cliprdr.downcast_backend_mut::<PandaClipboardBackend>() {
+            backend.set_local_text(text);
+        }
+    }
+}
+
+/// 排空 CLIPRDR backend 回调记录的动作。动作编码必须在 `ActiveStage::process`
+/// 返回后执行，避免 backend 回调期间对同一个 Cliprdr 处理器发生可变借用重入。
+fn flush_clipboard_actions(
+    active_stage: &mut ActiveStage,
+    framed: &mut UpgradedFramed,
+) -> Result<(), String> {
+    loop {
+        let action = active_stage
+            .get_svc_processor_mut::<CliprdrClient>()
+            .and_then(|cliprdr| cliprdr.downcast_backend_mut::<PandaClipboardBackend>())
+            .and_then(|backend| backend.actions.pop_front());
+        let Some(action) = action else {
+            return Ok(());
+        };
+
+        let messages = {
+            let cliprdr = active_stage
+                .get_svc_processor_mut::<CliprdrClient>()
+                .ok_or_else(|| "CLIPRDR 通道处理器不可用".to_string())?;
+            match action {
+                ClipboardAction::AdvertiseLocal => {
+                    let has_text = cliprdr
+                        .downcast_backend::<PandaClipboardBackend>()
+                        .and_then(|backend| backend.local_text.as_ref())
+                        .is_some();
+                    let formats = if has_text {
+                        vec![
+                            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+                            ClipboardFormat::new(ClipboardFormatId::CF_TEXT),
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    cliprdr.initiate_copy(&formats)
+                }
+                ClipboardAction::RequestRemote(format) => cliprdr.initiate_paste(format),
+                ClipboardAction::Respond(response) => cliprdr.submit_format_data(response),
+            }
+            .map_err(|e| format!("生成 CLIPRDR 消息失败: {e}"))?
+        };
+
+        let frame = active_stage
+            .process_svc_processor_messages::<CliprdrClient>(messages)
+            .map_err(|e| format!("编码 CLIPRDR 消息失败: {e}"))?;
+        if !frame.is_empty() {
+            framed
+                .write_all(&frame)
+                .map_err(|e| format!("回写 CLIPRDR 消息失败: {e}"))?;
+        }
+    }
 }
 
 /// ActiveStage 常驻循环：处理图形 PDU，脏矩形逐块编码经 Channel 推给前端；
@@ -458,6 +983,8 @@ fn active_stage_loop(
         connection_result.desktop_size.height,
     );
 
+    let activation_factory = connection_result.activation_factory;
+
     let mut active_stage = ActiveStageBuilder {
         static_channels: connection_result.static_channels,
         user_channel_id: connection_result.user_channel_id,
@@ -473,9 +1000,21 @@ fn active_stage_loop(
     set_active_timeout(&mut framed);
 
     let mut input_db = Database::new();
+    // 合帧累积器提到循环外：图形与输入两条产帧路径共用同一 TileBatch，
+    // 跨帧复用 payload/compress 缓冲。两路时序不重叠（drain_input 结束即 flush 清空）。
+    let mut batch = TileBatch::new();
 
     while !closed.load(Ordering::SeqCst) {
-        drain_input(&input_rx, &mut input_db, &mut active_stage, &mut image, &mut framed, &channel)?;
+        drain_input(
+            &input_rx,
+            &mut input_db,
+            &mut active_stage,
+            &mut image,
+            &mut framed,
+            &channel,
+            &mut batch,
+        )?;
+        flush_clipboard_actions(&mut active_stage, &mut framed)?;
 
         let (action, payload) = match framed.read_pdu() {
             Ok(frame) => frame,
@@ -492,23 +1031,51 @@ fn active_stage_loop(
             .process(&mut image, action, &payload)
             .map_err(|e| format!("处理 PDU 失败: {e}"))?;
 
+        // 把本批 outputs 里的多块 GraphicsUpdate 合并成一条 FRAME_BATCH（复用外层 batch）。
+        // DeactivateAll/Terminate 同为下行 IPC，必须在其之前 flush 已累积批次以保序。
         for out in outputs {
             match out {
                 ActiveStageOutput::ResponseFrame(frame) => framed
                     .write_all(&frame)
                     .map_err(|e| format!("回写响应帧失败: {e}"))?,
                 ActiveStageOutput::GraphicsUpdate(region) => {
-                    send_frame(&channel, encode_tile_frame(&image, &region))?;
+                    batch.push(&image, &region);
+                }
+                ActiveStageOutput::DeactivateAll => {
+                    flush_batch(&channel, &mut batch)?;
+                    reactivate(
+                        &mut framed,
+                        &mut active_stage,
+                        &mut image,
+                        &activation_factory,
+                        &channel,
+                    )?;
                 }
                 ActiveStageOutput::Terminate(reason) => {
-                    let _ = send_frame(&channel, encode_disconnect_frame(&describe_disconnect(&reason)));
+                    flush_batch(&channel, &mut batch)?;
+                    let _ = send_frame(
+                        &channel,
+                        encode_disconnect_frame(&describe_disconnect(&reason)),
+                    );
                     return Ok(());
                 }
                 _ => {}
             }
         }
+        flush_clipboard_actions(&mut active_stage, &mut framed)?;
+        flush_batch(&channel, &mut batch)?;
     }
     Ok(())
+}
+
+/// 若批次非空则编码成 FRAME_BATCH 推给前端，并清空累积器（保留容量复用）；空批次直接跳过。
+fn flush_batch(channel: &Channel<InvokeResponseBody>, batch: &mut TileBatch) -> Result<(), String> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let frame = batch.encode_frame();
+    batch.clear();
+    send_frame(channel, frame)
 }
 
 /// 线程入口：先建连，成功后经 oneshot 回传结果并进入常驻循环。
@@ -520,13 +1087,14 @@ pub fn run_session(
     input_rx: mpsc::Receiver<RdpInputEvent>,
 ) {
     let config = build_config(&params);
-    let (connection_result, framed) = match connect(config, params.host.clone(), params.port) {
-        Ok(result) => result,
-        Err(error) => {
-            let _ = ready.send(Err(error));
-            return;
-        }
-    };
+    let (connection_result, framed) =
+        match connect(config, params.host.clone(), params.port, channel.clone()) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return;
+            }
+        };
 
     // 握手期间标签可能已被关闭（StrictMode 双触发 / 用户提前关标签）。
     // 此时立刻丢弃 framed 关闭 TCP，让服务器尽快回收会话，避免残留。
@@ -566,10 +1134,12 @@ fn to_operation(event: RdpInputEvent) -> Option<Operation> {
                 Operation::MouseButtonReleased(button)
             })
         }
-        RdpInputEvent::Wheel { vertical, delta } => Some(Operation::WheelRotations(WheelRotations {
-            is_vertical: vertical,
-            rotation_units: delta,
-        })),
+        RdpInputEvent::Wheel { vertical, delta } => {
+            Some(Operation::WheelRotations(WheelRotations {
+                is_vertical: vertical,
+                rotation_units: delta,
+            }))
+        }
         RdpInputEvent::Key { scancode, pressed } => {
             let scancode = Scancode::from_u16(scancode);
             Some(if pressed {
@@ -586,7 +1156,9 @@ fn to_operation(event: RdpInputEvent) -> Option<Operation> {
                 Operation::UnicodeKeyReleased(c)
             })
         }
-        RdpInputEvent::ReleaseAll | RdpInputEvent::Resize { .. } => None,
+        RdpInputEvent::ReleaseAll
+        | RdpInputEvent::Resize { .. }
+        | RdpInputEvent::Clipboard { .. } => None,
     }
 }
 
@@ -598,6 +1170,7 @@ fn write_input_outputs(
     framed: &mut UpgradedFramed,
     channel: &Channel<InvokeResponseBody>,
     events: &[FastPathInputEvent],
+    batch: &mut TileBatch,
 ) -> Result<(), String> {
     if events.is_empty() {
         return Ok(());
@@ -611,11 +1184,12 @@ fn write_input_outputs(
                 .write_all(&frame)
                 .map_err(|e| format!("回写输入响应帧失败: {e}"))?,
             ActiveStageOutput::GraphicsUpdate(region) => {
-                send_frame(channel, encode_tile_frame(image, &region))?;
+                batch.push(image, &region);
             }
             _ => {}
         }
     }
+    flush_batch(channel, batch)?;
     Ok(())
 }
 
@@ -628,6 +1202,7 @@ fn drain_input(
     image: &mut DecodedImage,
     framed: &mut UpgradedFramed,
     channel: &Channel<InvokeResponseBody>,
+    batch: &mut TileBatch,
 ) -> Result<(), String> {
     let mut pending: Vec<Operation> = Vec::new();
 
@@ -635,13 +1210,13 @@ fn drain_input(
         match input_rx.try_recv() {
             Ok(RdpInputEvent::ReleaseAll) => {
                 let events = input_db.apply(pending.drain(..));
-                write_input_outputs(active_stage, image, framed, channel, &events)?;
+                write_input_outputs(active_stage, image, framed, channel, &events, batch)?;
                 let events = input_db.release_all();
-                write_input_outputs(active_stage, image, framed, channel, &events)?;
+                write_input_outputs(active_stage, image, framed, channel, &events, batch)?;
             }
             Ok(RdpInputEvent::Resize { width, height }) => {
                 let events = input_db.apply(pending.drain(..));
-                write_input_outputs(active_stage, image, framed, channel, &events)?;
+                write_input_outputs(active_stage, image, framed, channel, &events, batch)?;
                 let (w, h) = clamp_desktop_size(width, height);
                 if let Some(result) =
                     active_stage.encode_resize(u32::from(w), u32::from(h), None, None)
@@ -651,6 +1226,12 @@ fn drain_input(
                         .write_all(&frame)
                         .map_err(|e| format!("回写 resize 帧失败: {e}"))?;
                 }
+            }
+            Ok(RdpInputEvent::Clipboard { text }) => {
+                let events = input_db.apply(pending.drain(..));
+                write_input_outputs(active_stage, image, framed, channel, &events, batch)?;
+                queue_local_clipboard(active_stage, text);
+                flush_clipboard_actions(active_stage, framed)?;
             }
             Ok(event) => {
                 if let Some(op) = to_operation(event) {
@@ -663,7 +1244,55 @@ fn drain_input(
     }
 
     let events = input_db.apply(pending);
-    write_input_outputs(active_stage, image, framed, channel, &events)?;
+    write_input_outputs(active_stage, image, framed, channel, &events, batch)?;
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 校验 FRAME_BATCH 头部布局，并对压缩路径做 LZ4 往返（模拟前端解码），
+    // 确认后端产出的是可被标准 LZ4 block 解码器还原的字节。
+    #[test]
+    fn batch_frame_compresses_and_roundtrips() {
+        // 高度可压缩的 payload（重复字节），必然走 LZ4 分支。
+        let payload = vec![7u8; 8192];
+        let frame = encode_batch_frame(&payload, 3);
+
+        assert_eq!(frame[0], FRAME_BATCH);
+        let flags = frame[1];
+        assert_eq!(
+            flags & BATCH_FLAG_LZ4,
+            BATCH_FLAG_LZ4,
+            "大重复 payload 应被压缩"
+        );
+        let tile_count = u16::from_le_bytes([frame[2], frame[3]]);
+        assert_eq!(tile_count, 3);
+        let raw_len = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
+        assert_eq!(raw_len, payload.len());
+
+        let body = &frame[BATCH_HEADER_LEN..];
+        let mut restored = vec![0u8; raw_len];
+        let n = lz4_flex::block::decompress_into(body, &mut restored).expect("解压失败");
+        assert_eq!(n, raw_len);
+        assert_eq!(restored, payload);
+    }
+
+    // 难压缩的小 payload 应回退明文（flags 清零，body 原样），前端据此直接读取。
+    #[test]
+    fn batch_frame_falls_back_to_plain() {
+        let payload = vec![1u8, 2, 3, 4, 5];
+        let frame = encode_batch_frame(&payload, 1);
+
+        assert_eq!(frame[0], FRAME_BATCH);
+        assert_eq!(
+            frame[1] & BATCH_FLAG_LZ4,
+            0,
+            "小 payload 压缩无收益应回退明文"
+        );
+        let raw_len = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
+        assert_eq!(raw_len, payload.len());
+        assert_eq!(&frame[BATCH_HEADER_LEN..], &payload[..]);
+    }
+}
