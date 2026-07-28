@@ -3198,7 +3198,6 @@ button:disabled {
   background: var(--bg-terminal);
 }
 
-.terminal-panel-terminal-only .workspace-tabs,
 .terminal-panel-no-tabs .workspace-tabs {
   display: none;
 }

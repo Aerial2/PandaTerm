@@ -1555,9 +1555,11 @@ export function App() {
 
   // Global terminal-output listener — registered once, routes by terminal_id
   useEffect(() => {
-    // Listen for session connection events from the connection window
     let connUnlisten: (() => void) | null = null;
+    let isActive = true;
+
     void listen<Session>('connection-window-connect-session', (event) => {
+      if (!isActive) return;
       const session = event.payload;
       if (session.id === localSession.id) {
         openLocalTerminalInBottomPanel();
@@ -1570,14 +1572,20 @@ export function App() {
       if (pendingPaneTabIdRef.current) {
         void addTerminalTabToCurrentPane(session);
       } else {
-        // Append the new connection as a terminal tab inside the active terminal
-        // (same behavior as double-clicking an existing tab) instead of spawning
-        // a separate workspace tab — otherwise the workspace tab bar is hidden for
-        // terminal-only sessions and the previous session looks "overwritten".
         void openConnectionPanelSession(session);
       }
-    }).then(fn => { connUnlisten = fn; });
-    return () => { connUnlisten?.(); };
+    }).then((unlisten) => {
+      if (!isActive) {
+        unlisten();
+      } else {
+        connUnlisten = unlisten;
+      }
+    });
+
+    return () => {
+      isActive = false;
+      connUnlisten?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -7330,21 +7338,18 @@ export function App() {
           onPointerDown={startResourceResize}
         />
 
-        <section
-          className={`terminal-panel${activeTab?.kind === 'terminal' ? ' terminal-panel-terminal-only' : ''}`}
-        >
-          {/* 非终端工作区顶栏：会话 + 编辑器共用；双击空白建编辑，+ 开连接 */}
-          {activeTab?.kind !== 'terminal' && (
-            <div
-              className="workspace-tabs"
-              ref={workspaceTabsRef}
-              title="双击空白处新建空白编辑器"
-              onWheel={scrollHorizontallyOnWheel}
-              onDoubleClick={(event) => {
-                if ((event.target as HTMLElement).closest('.workspace-tab, .workspace-tab-add')) return;
-                createUntitledEditorTab();
-              }}
-            >
+        <section className="terminal-panel">
+          {/* 全局工作区顶栏始终可见：负责在 SSH workspace、RDP、资源视图与编辑器之间切换。 */}
+          <div
+            className="workspace-tabs"
+            ref={workspaceTabsRef}
+            title="双击空白处新建空白编辑器"
+            onWheel={scrollHorizontallyOnWheel}
+            onDoubleClick={(event) => {
+              if ((event.target as HTMLElement).closest('.workspace-tab, .workspace-tab-add')) return;
+              createUntitledEditorTab();
+            }}
+          >
               {tabs.filter((tab) => !tab.parentTabId && tab.session.id !== localSession.id).map((tab) => (
                 <div
                   key={tab.id}
@@ -7412,7 +7417,6 @@ export function App() {
                 <Plus size={16} />
               </button>
             </div>
-          )}
 
           <div className="workspace-body">
             {/* 无终端会话时：编辑器占满主区；有终端时编辑嵌在 pane 内 */}
@@ -7924,6 +7928,7 @@ export function App() {
                                     className={`ai-settings-account-chip${active ? ' active' : ''}`}
                                     title={label}
                                     disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || isAiProviderTesting || Boolean(aiProviderConfig?.error)}
+                                    onMouseDown={(event) => event.preventDefault()}
                                     onClick={() => void switchAiAccount(account.id)}
                                   >
                                     {label}

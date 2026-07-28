@@ -1118,6 +1118,7 @@ export function AiSettingsWindow() {
                                     className={`ai-settings-account-chip${active ? ' active' : ''}`}
                                     title={label}
                                     disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || isAiProviderTesting || Boolean(aiProviderConfig?.error)}
+                                    onMouseDown={(event) => event.preventDefault()}
                                     onClick={() => void switchAiAccount(account.id)}
                                   >
                                     {label}
