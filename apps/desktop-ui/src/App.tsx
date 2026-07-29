@@ -83,6 +83,7 @@ import {
   RefreshCw,
   Search,
   Server,
+  Monitor,
   Settings,
   TerminalSquare,
   Trash2,
@@ -5648,7 +5649,7 @@ export function App() {
         className="workspace-tab-ghost"
         style={{ left: terminalDragState.ghostX + 12, top: terminalDragState.ghostY + 12 }}
       >
-        {tab.kind === 'terminal' ? <TerminalSquare size={15} /> : <FolderOpen size={15} />}
+        {tab.kind === 'terminal' ? <TerminalSquare size={15} /> : tab.kind === 'rdp' ? <Monitor size={15} /> : <FolderOpen size={15} />}
         <span>{tab.title || tab.session.name}</span>
       </div>
     );
@@ -5861,7 +5862,7 @@ export function App() {
                   void addTerminalTabToCurrentPane(tab.session);
                 }}
               >
-                <TerminalSquare size={13} />
+                {tab.kind === 'rdp' ? <Monitor size={13} /> : <TerminalSquare size={13} />}
                 <span className={`workspace-tab-state ${tab.status}`} />
                 <span className="terminal-pane-tab-title">{tab.title || tab.session.name}</span>
                 <button
@@ -7389,7 +7390,7 @@ export function App() {
                   onClick={() => selectSessionWorkspaceTab(tab.id)}
                   className={`${!showEditor && activeTabId === tab.id ? 'workspace-tab active' : 'workspace-tab'}${getWorkspaceTabDropClass(tab.id)}`}
                 >
-                  {tab.kind === 'terminal' ? <TerminalSquare size={15} /> : <FolderOpen size={15} />}
+                  {tab.kind === 'terminal' ? <TerminalSquare size={15} /> : tab.kind === 'rdp' ? <Monitor size={15} /> : <FolderOpen size={15} />}
                   <span className={`workspace-tab-state ${tab.status}`} />
                   <span>{tab.title || tab.session.name}</span>
                   <button
