@@ -285,7 +285,7 @@ export function findTerminalWorkspaceOwner(tabs: WorkspaceTab[], paneTabId: stri
   return (
     tabs.find(
       (tab) =>
-        tab.kind === 'terminal'
+        (tab.kind === 'terminal' || tab.kind === 'rdp')
         && !tab.parentTabId
         && collectTerminalLayoutTabIds(tab.layout ?? createDefaultTerminalLayout(tab.id)).includes(paneTabId),
     ) ?? null

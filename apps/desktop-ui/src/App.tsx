@@ -929,6 +929,8 @@ export function App() {
       closedByUser: false,
       reconnectAttempts: 0,
       activityLog: [createActivity('info', '正在连接远程桌面...')],
+      layout: createDefaultTerminalLayout(tabId),
+      activePaneId: tabId,
     };
   }
 
@@ -1113,7 +1115,7 @@ export function App() {
   const visibleTerminalPaneIds = activeTab?.kind === 'terminal'
     ? collectTerminalLayoutTabIds(activeTab.layout ?? createDefaultTerminalLayout(activeTab.id))
     : [];
-  const activePaneId = activeTab?.kind === 'terminal'
+  const activePaneId = (activeTab?.kind === 'terminal' || activeTab?.kind === 'rdp')
     ? activeTab.activePaneId ?? activeTab.id
     : null;
 
@@ -5799,9 +5801,9 @@ export function App() {
   ): ReactNode {
     const paneTabIds = getLeafTabIds(node);
     const paneTabs = paneTabIds
-      .map((tabId) => tabs.find((tab) => tab.id === tabId && tab.kind === 'terminal'))
+      .map((tabId) => tabs.find((tab) => tab.id === tabId && (tab.kind === 'terminal' || tab.kind === 'rdp')))
       .filter((tab): tab is WorkspaceTab => Boolean(tab));
-    const paneTab = tabs.find((tab) => tab.id === node.tabId && tab.kind === 'terminal') ?? paneTabs[0];
+    const paneTab = tabs.find((tab) => tab.id === node.tabId && (tab.kind === 'terminal' || tab.kind === 'rdp')) ?? paneTabs[0];
     if (!paneTab) return null;
     const isActivePane = node.tabId === activePaneId;
 
@@ -5913,7 +5915,15 @@ export function App() {
             </button>
           </div>
         </div>
-        {paneTab.status === 'failed' && !showEditor ? (
+        {paneTab.kind === 'rdp' ? (
+          <div className="rdp-focus-card">
+            <RdpView
+              key={paneTab.id}
+              sessionId={paneTab.session.id}
+              terminalId={paneTab.terminalId}
+            />
+          </div>
+        ) : paneTab.status === 'failed' && !showEditor ? (
           <div className="terminal-connection-state is-error">
             <Server size={24} />
             <h2>连接失败</h2>
@@ -7450,7 +7460,7 @@ export function App() {
                   <span>新建连接</span>
                 </button>
               </div>
-            ) : activeTab.kind === 'terminal' ? (
+            ) : (activeTab.kind === 'terminal' || activeTab.kind === 'rdp') ? (
               <div
                 ref={terminalWorkspaceRef}
                 className="terminal-pane"
@@ -7459,14 +7469,6 @@ export function App() {
                 {getWorkspaceDropPreview()}
                 {getGhostTab()}
                 {renderTerminalLayoutNode(activeTab.layout ?? createDefaultTerminalLayout(activeTab.id), activeTab.id)}
-              </div>
-            ) : activeTab.kind === 'rdp' ? (
-              <div className="rdp-focus-card">
-                <RdpView
-                  key={activeTab.id}
-                  sessionId={activeTab.session.id}
-                  terminalId={activeTab.terminalId}
-                />
               </div>
             ) : (
               <div className="resource-focus-card">
