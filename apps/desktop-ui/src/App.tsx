@@ -43,6 +43,7 @@ import {
   clampSplitRatio,
   collectTerminalLayoutTabIds,
   createDefaultTerminalLayout,
+  findLeafTabGroup,
   findTerminalWorkspaceOwner,
   getLeafTabIds,
   insertTerminalPane,
@@ -1113,7 +1114,7 @@ export function App() {
   }, []);
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? null;
-  const visibleTerminalPaneIds = activeTab?.kind === 'terminal'
+  const visibleTerminalPaneIds = activeTab && (activeTab.kind === 'terminal' || activeTab.kind === 'rdp')
     ? collectTerminalLayoutTabIds(activeTab.layout ?? createDefaultTerminalLayout(activeTab.id))
     : [];
   const activePaneId = (activeTab?.kind === 'terminal' || activeTab?.kind === 'rdp')
@@ -1362,13 +1363,6 @@ export function App() {
     focusTerminal(tabId);
   }
 
-  function openConnectionManagerForPane(paneTabId: string) {
-    pendingPaneTabIdRef.current = paneTabId;
-    setPendingPaneTabId(paneTabId);
-    setStatusMessage('请选择要添加到当前 pane 的连接');
-    void openConnectionWindow('manage');
-  }
-
   async function addTerminalTabToCurrentPane(session: Session) {
     // 本地终端固定在底部面板，不再进入工作区 pane
     if (session.id === localSession.id) {
@@ -1522,7 +1516,7 @@ export function App() {
 
   function getConnectionPanelTargetPaneId() {
     if (pendingPaneTabIdRef.current) return pendingPaneTabIdRef.current;
-    if (activeTabRef.current?.kind === 'terminal') {
+    if (activeTabRef.current?.kind === 'terminal' || activeTabRef.current?.kind === 'rdp') {
       return activePaneIdRef.current ?? activeTabRef.current.id;
     }
     return null;
@@ -5221,8 +5215,14 @@ export function App() {
       return null;
     }
 
+    let rightmostTabId: string | null = null;
+    let rightmostEdge = Number.NEGATIVE_INFINITY;
     for (const [tabId, tabEl] of workspaceTabRefs.current) {
       const rect = tabEl.getBoundingClientRect();
+      if (rect.right > rightmostEdge) {
+        rightmostEdge = rect.right;
+        rightmostTabId = tabId;
+      }
       if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) continue;
       return {
         targetTabId: tabId,
@@ -5230,10 +5230,7 @@ export function App() {
       };
     }
 
-    const rootTabs = tabsRef.current.filter((tab) => !tab.parentTabId);
-    const lastTab = rootTabs[rootTabs.length - 1];
-    if (!lastTab) return null;
-    return { targetTabId: lastTab.id, reorderPlacement: 'after' as const };
+    return rightmostTabId ? { targetTabId: rightmostTabId, reorderPlacement: 'after' as const } : null;
   }
 
   function getDropSideFromRect(rect: DOMRect, clientX: number, clientY: number): TerminalDropSide | null {
@@ -5256,8 +5253,8 @@ export function App() {
     return inEdge[0].side;
   }
 
-  function updatePointerDragPreview(tabId: string, clientX: number, clientY: number) {
-    const reorderHit = getTabReorderHit(clientX, clientY);
+  function updatePointerDragPreview(tabId: string, clientX: number, clientY: number, allowRootReorder = true) {
+    const reorderHit = allowRootReorder ? getTabReorderHit(clientX, clientY) : null;
     if (reorderHit) {
       applyTerminalDragState({
         tabId,
@@ -5272,6 +5269,9 @@ export function App() {
       });
       return;
     }
+
+    // 顶层标签在标签栏内只做排序；拖出标签栏后继续进入 pane 命中，
+    // 否则根工作区永远无法与另一个工作区建立分屏。
 
     const workspace = terminalWorkspaceRef.current;
     if (!workspace) {
@@ -5290,7 +5290,13 @@ export function App() {
       return;
     }
 
-    for (const [paneId, paneEl] of terminalPaneRefs.current) {
+    const visitedPaneElements = new Set<HTMLElement>();
+    for (const paneEl of terminalPaneRefs.current.values()) {
+      if (visitedPaneElements.has(paneEl)) continue;
+      visitedPaneElements.add(paneEl);
+
+      const paneId = paneEl.dataset.paneId;
+      if (!paneId) continue;
       const rect = paneEl.getBoundingClientRect();
       if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) continue;
       const side = getDropSideFromRect(rect, clientX, clientY);
@@ -5365,7 +5371,7 @@ export function App() {
   function replacePaneWithTab(draggingTabId: string, targetPaneId: string) {
     if (draggingTabId === targetPaneId) return;
 
-    const sourceTab = tabsRef.current.find((tab) => tab.id === draggingTabId && tab.kind === 'terminal');
+    const sourceTab = tabsRef.current.find((tab) => tab.id === draggingTabId && (tab.kind === 'terminal' || tab.kind === 'rdp'));
     const targetOwner = findTerminalWorkspaceOwner(tabsRef.current, targetPaneId);
     const sourceOwner = findTerminalWorkspaceOwner(tabsRef.current, draggingTabId);
     if (!sourceTab || !targetOwner || !sourceOwner) return;
@@ -5402,7 +5408,7 @@ export function App() {
   }
 
   function moveTabIntoPane(draggingTabId: string, targetPaneId: string, side: TerminalDropSide) {
-    const sourceTab = tabsRef.current.find((tab) => tab.id === draggingTabId && tab.kind === 'terminal');
+    const sourceTab = tabsRef.current.find((tab) => tab.id === draggingTabId && (tab.kind === 'terminal' || tab.kind === 'rdp'));
     const targetOwner = findTerminalWorkspaceOwner(tabsRef.current, targetPaneId);
     const sourceOwner = findTerminalWorkspaceOwner(tabsRef.current, draggingTabId);
     if (!sourceTab || !targetOwner || !sourceOwner) return;
@@ -5496,7 +5502,7 @@ export function App() {
         : (moveEvent.clientY - candidate.startY) / candidate.containerHeight;
       const nextRatio = clampSplitRatio(candidate.startRatio + delta);
       const ownerTab = tabsRef.current.find((tab) =>
-        tab.kind === 'terminal'
+        (tab.kind === 'terminal' || tab.kind === 'rdp')
         && !tab.parentTabId
         && terminalLayoutContainsSplit(tab.layout ?? createDefaultTerminalLayout(tab.id), splitId),
       );
@@ -5655,7 +5661,7 @@ export function App() {
     );
   }
 
-  function startPaneTabPointerDrag(tabId: string, paneId: string, ownerTabId: string, event: PointerEvent<HTMLDivElement>) {
+  function startPaneTabPointerDrag(tabId: string, paneId: string, event: PointerEvent<HTMLDivElement>) {
     if (event.button !== 0) return;
     if ((event.target as HTMLElement).closest('button')) return;
 
@@ -5668,7 +5674,14 @@ export function App() {
     const startY = event.clientY;
     let activated = false;
 
-    const paneEl = terminalPaneRefs.current.get(paneId);
+    // pane 内 tab 的拖拽作用域就是该 pane 自身：pane 内互拖=重排，
+    // 拖到 pane 边缘=自我分屏，拖出 pane=跨 pane 的 split/replace/新窗口。
+    const ownerTab = findTerminalWorkspaceOwner(tabsRef.current, paneId);
+    const ownerTabId = ownerTab?.id ?? paneId;
+    const samePaneTabIds = ownerTab
+      ? findLeafTabGroup(ownerTab.layout ?? createDefaultTerminalLayout(ownerTab.id), paneId)
+      : [paneId];
+    const localDragScopeEl = terminalPaneRefs.current.get(paneId);
 
     const handlePointerMove = (moveEvent: globalThis.PointerEvent) => {
       const dx = moveEvent.clientX - startX;
@@ -5678,13 +5691,14 @@ export function App() {
       activated = true;
       paneTabDragActivated.current = true;
 
-      if (paneEl) {
-        const paneRect = paneEl.getBoundingClientRect();
-        const outside = moveEvent.clientX < paneRect.left || moveEvent.clientX > paneRect.right
-          || moveEvent.clientY < paneRect.top || moveEvent.clientY > paneRect.bottom;
+      if (localDragScopeEl) {
+        const localDragScopeRect = localDragScopeEl.getBoundingClientRect();
+        const outside = moveEvent.clientX < localDragScopeRect.left || moveEvent.clientX > localDragScopeRect.right
+          || moveEvent.clientY < localDragScopeRect.top || moveEvent.clientY > localDragScopeRect.bottom;
 
-        // Check if pointer is in the edge zone of the current pane (for same-pane split)
-        const inSplitEdge = !outside && getDropSideFromRect(paneRect, moveEvent.clientX, moveEvent.clientY) !== null;
+        // pane 内部命中边缘=自我分屏；拖出 pane=进入全局 split/replace 判定。
+        const inSplitEdge = !outside
+          && getDropSideFromRect(localDragScopeRect, moveEvent.clientX, moveEvent.clientY) !== null;
 
         if (outside || inSplitEdge) {
           cleanup();
@@ -5696,13 +5710,13 @@ export function App() {
             previousActiveTabId: activeTabIdRef.current,
           };
           document.body.classList.add('terminal-tab-dragging');
-          updatePointerDragPreview(tabId, moveEvent.clientX, moveEvent.clientY);
+          updatePointerDragPreview(tabId, moveEvent.clientX, moveEvent.clientY, false);
 
           const globalMove = (ev: globalThis.PointerEvent) => {
             const c = terminalPointerDragRef.current;
             if (!c || c.tabId !== tabId) return;
             ev.preventDefault();
-            updatePointerDragPreview(tabId, ev.clientX, ev.clientY);
+            updatePointerDragPreview(tabId, ev.clientX, ev.clientY, false);
           };
           const globalUp = (ev?: globalThis.PointerEvent) => {
             const c = terminalPointerDragRef.current;
@@ -5738,6 +5752,7 @@ export function App() {
 
       for (const [refTabId, el] of paneTabElRefs.current) {
         if (refTabId === tabId) continue;
+        if (!samePaneTabIds.includes(refTabId)) continue;
         const rect = el.getBoundingClientRect();
         if (moveEvent.clientX < rect.left || moveEvent.clientX > rect.right || moveEvent.clientY < rect.top || moveEvent.clientY > rect.bottom) continue;
         const placement = moveEvent.clientX < rect.left + rect.width / 2 ? 'before' as const : 'after' as const;
@@ -5773,32 +5788,76 @@ export function App() {
   }
 
 
-  function renderTerminalLayoutNode(node: TerminalLayoutNode, ownerTabId: string): ReactNode {
+  function renderTerminalLayoutNode(node: TerminalLayoutNode): ReactNode {
     if (node.type === 'split') {
       return (
         <div className={`terminal-split terminal-split-${node.direction}`}>
           <div className="terminal-split-child" style={{ flexBasis: `${node.ratio * 100}%` }}>
-            {renderTerminalLayoutNode(node.first, ownerTabId)}
+            {renderTerminalLayoutNode(node.first)}
           </div>
           <div
             className="terminal-split-divider"
             onPointerDown={(event) => startSplitDividerDrag(node.id, node.direction, node.ratio, event)}
           />
           <div className="terminal-split-child" style={{ flexBasis: `${(1 - node.ratio) * 100}%` }}>
-            {renderTerminalLayoutNode(node.second, ownerTabId)}
+            {renderTerminalLayoutNode(node.second)}
           </div>
         </div>
       );
     }
 
-    return renderPaneLeaf(node, ownerTabId);
+    return renderPaneLeaf(node);
+  }
+
+  // 渲染 body 内 pane tabbar 的单个 terminal/RDP tab。
+  // paneTabId 是该 pane 当前激活 tab，同时作为拖拽时的 pane 身份。
+  function renderPaneTab(tab: WorkspaceTab, paneTabId: string): ReactNode {
+    return (
+      <div
+        key={tab.id}
+        ref={(el) => {
+          if (el) paneTabElRefs.current.set(tab.id, el);
+          else paneTabElRefs.current.delete(tab.id);
+        }}
+        role="tab"
+        aria-selected={!showEditor && tab.id === paneTabId}
+        tabIndex={0}
+        draggable={false}
+        className={(!showEditor && tab.id === paneTabId) ? 'terminal-pane-tab active' : 'terminal-pane-tab'}
+        onDragStart={(event) => event.preventDefault()}
+        onPointerDown={(event) => {
+          event.stopPropagation();
+          startPaneTabPointerDrag(tab.id, paneTabId, event);
+        }}
+        onClick={(event) => {
+          event.stopPropagation();
+          setShowEditor(false);
+          focusTerminalPane(tab.id);
+        }}
+        onDoubleClick={(event) => {
+          event.stopPropagation();
+          if (paneTabDragActivated.current) { paneTabDragActivated.current = false; return; }
+          void addTerminalTabToCurrentPane(tab.session);
+        }}
+      >
+        {tab.kind === 'rdp' ? <Monitor size={15} /> : <TerminalSquare size={15} />}
+        <span className={`workspace-tab-state ${tab.status}`} />
+        <span className="terminal-pane-tab-title">{tab.title || tab.session.name}</span>
+        <button
+          className="terminal-pane-tab-close"
+          title="关闭 tab"
+          onClick={(event) => { event.stopPropagation(); closeTerminalPaneTab(tab.id); }}
+        >
+          ×
+        </button>
+      </div>
+    );
   }
 
   // Pane 叶子渲染：从 renderTerminalLayoutNode 拆出的接缝，未来按 tab.kind 分发
   // （terminal→xterm-host / rdp→RdpView），是 RDP 进分屏体系的落点。
   function renderPaneLeaf(
     node: Extract<TerminalLayoutNode, { type: 'leaf' }>,
-    ownerTabId: string,
   ): ReactNode {
     const paneTabIds = getLeafTabIds(node);
     const paneTabs = paneTabIds
@@ -5807,9 +5866,12 @@ export function App() {
     const paneTab = tabs.find((tab) => tab.id === node.tabId && (tab.kind === 'terminal' || tab.kind === 'rdp')) ?? paneTabs[0];
     if (!paneTab) return null;
     const isActivePane = node.tabId === activePaneId;
+    // 去重：pane 只有单个 tab 时不显示 tabbar，避免与顶栏 workspace chip 重复。
+    const showPaneTabbar = paneTabs.length > 1;
 
     return (
       <section
+        data-pane-id={node.tabId}
         ref={(el) => {
           if (el) {
             terminalPaneRefs.current.set(node.tabId, el);
@@ -5818,104 +5880,20 @@ export function App() {
             for (const tabId of paneTabIds) terminalPaneRefs.current.delete(tabId);
           }
         }}
-        className={`${isActivePane ? 'terminal-split-pane active' : 'terminal-split-pane'}${showEditor && isActivePane ? ' is-editor' : ''}${getPaneDropClass(node.tabId)}`}
-        onMouseDown={(event) => {
-          if ((event.target as HTMLElement | null)?.closest('.terminal-pane-tabbar')) return;
+        className={`${isActivePane ? 'terminal-split-pane active' : 'terminal-split-pane'}${showPaneTabbar ? ' has-tabbar' : ''}${showEditor && isActivePane ? ' is-editor' : ''}${getPaneDropClass(node.tabId)}`}
+        onMouseDown={() => {
           if (showEditor) return;
           focusTerminalPane(node.tabId);
         }}
       >
         {getPaneDropPreview(node.tabId)}
-        <div className="terminal-pane-tabbar" onDoubleClick={(event) => {
-          if ((event.target as HTMLElement).closest('.terminal-pane-tab, .terminal-pane-tab-add')) return;
-          // 双击空白：新建编辑器；仅 + 打开连接管理
-          createUntitledEditorTab();
-        }}>
-          <div
-            className="terminal-pane-tabs"
-            onWheel={scrollHorizontallyOnWheel}
-          >
-            {paneTabs.map((tab) => (
-              <div
-                key={tab.id}
-                ref={(el) => {
-                  if (el) paneTabElRefs.current.set(tab.id, el);
-                  else paneTabElRefs.current.delete(tab.id);
-                }}
-                role="tab"
-                tabIndex={0}
-                draggable={false}
-                className={(!showEditor && tab.id === node.tabId) ? 'terminal-pane-tab active' : 'terminal-pane-tab'}
-                onDragStart={(event) => event.preventDefault()}
-                onPointerDown={(event) => {
-                  event.stopPropagation();
-                  startPaneTabPointerDrag(tab.id, node.tabId, ownerTabId, event);
-                }}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  setShowEditor(false);
-                  focusTerminalPane(tab.id);
-                }}
-                onDoubleClick={(event) => {
-                  event.stopPropagation();
-                  if (paneTabDragActivated.current) { paneTabDragActivated.current = false; return; }
-                  void addTerminalTabToCurrentPane(tab.session);
-                }}
-              >
-                {tab.kind === 'rdp' ? <Monitor size={13} /> : <TerminalSquare size={13} />}
-                <span className={`workspace-tab-state ${tab.status}`} />
-                <span className="terminal-pane-tab-title">{tab.title || tab.session.name}</span>
-                <button
-                  className="terminal-pane-tab-close"
-                  title="关闭 tab"
-                  onClick={(event) => { event.stopPropagation(); closeTerminalPaneTab(tab.id); }}
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-            {isActivePane && editorTabs.map((tab) => {
-              const dirty = tab.content !== tab.originalContent;
-              const active = showEditor && activeEditorTabId === tab.id;
-              return (
-                <div
-                  key={tab.id}
-                  role="tab"
-                  tabIndex={0}
-                  draggable={false}
-                  className={`terminal-pane-tab is-editor${active ? ' active' : ''}`}
-                  title={tab.isUntitled ? '未保存的空白文件' : tab.path}
-                  onDragStart={(event) => event.preventDefault()}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    selectEditorWorkspaceTab(tab.id);
-                  }}
-                >
-                  <FileText size={13} />
-                  <span className="terminal-pane-tab-title">{editorTabLabel(tab, editorTabs)}</span>
-                  {dirty && <span className="terminal-pane-tab-dirty" aria-hidden>•</span>}
-                  <button
-                    className="terminal-pane-tab-close"
-                    title="关闭"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      closeEditorTab(tab.id);
-                    }}
-                  >
-                    ×
-                  </button>
-                </div>
-              );
-            })}
-            <button
-              className="terminal-pane-tab-add"
-              title="新建连接"
-              onClick={(event) => { event.stopPropagation(); openConnectionManagerForPane(node.tabId); }}
-            >
-              <Plus size={13} />
-            </button>
+        {showPaneTabbar && (
+          <div className="terminal-pane-tabbar">
+            <div className="terminal-pane-tabs">
+              {paneTabs.map((tab) => renderPaneTab(tab, node.tabId))}
+            </div>
           </div>
-        </div>
+        )}
         {paneTab.kind === 'rdp' ? (
           <div className="rdp-focus-card">
             <RdpView
@@ -7363,47 +7341,54 @@ export function App() {
           <div
             className="workspace-tabs"
             ref={workspaceTabsRef}
+            role="tablist"
+            aria-label="工作区标签"
             title="双击空白处新建空白编辑器"
             onWheel={scrollHorizontallyOnWheel}
             onDoubleClick={(event) => {
-              if ((event.target as HTMLElement).closest('.workspace-tab, .workspace-tab-add')) return;
+              if ((event.target as HTMLElement).closest('.workspace-tab, .workspace-tab-add, .workspace-tab-group')) return;
               createUntitledEditorTab();
             }}
           >
-              {tabs.filter((tab) => !tab.parentTabId && tab.session.id !== localSession.id).map((tab) => (
-                <div
-                  key={tab.id}
-                  ref={(el) => {
-                    if (el) {
-                      workspaceTabRefs.current.set(tab.id, el);
-                    } else {
-                      workspaceTabRefs.current.delete(tab.id);
-                    }
-                  }}
-                  role="tab"
-                  tabIndex={0}
-                  draggable={false}
-                  onDragStart={(event) => event.preventDefault()}
-                  onPointerDown={(event) => {
-                    if (tab.kind === 'terminal') startTabPointerDrag(tab.id, event);
-                  }}
-                  onClick={() => selectSessionWorkspaceTab(tab.id)}
-                  className={`${!showEditor && activeTabId === tab.id ? 'workspace-tab active' : 'workspace-tab'}${getWorkspaceTabDropClass(tab.id)}`}
-                >
-                  {tab.kind === 'terminal' ? <TerminalSquare size={15} /> : tab.kind === 'rdp' ? <Monitor size={15} /> : <FolderOpen size={15} />}
-                  <span className={`workspace-tab-state ${tab.status}`} />
-                  <span>{tab.title || tab.session.name}</span>
-                  <button
-                    className="workspace-tab-close"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      closeTab(tab);
+              {tabs.filter((tab) => !tab.parentTabId && tab.session.id !== localSession.id).map((tab) => {
+                // 顶栏只表达顶层 workspace：每个根 workspace 渲染成单个 chip。
+                // 分屏结构与 pane 内 tab 切换全部下沉到 body 的 pane tabbar 处理。
+                return (
+                  <div
+                    key={tab.id}
+                    ref={(el) => {
+                      if (el) {
+                        workspaceTabRefs.current.set(tab.id, el);
+                      } else {
+                        workspaceTabRefs.current.delete(tab.id);
+                      }
                     }}
+                    role="tab"
+                    aria-selected={!showEditor && activeTabId === tab.id}
+                    tabIndex={0}
+                    draggable={false}
+                    onDragStart={(event) => event.preventDefault()}
+                    onPointerDown={(event) => {
+                      if (tab.kind === 'terminal' || tab.kind === 'rdp') startTabPointerDrag(tab.id, event);
+                    }}
+                    onClick={() => selectSessionWorkspaceTab(tab.id)}
+                    className={`${!showEditor && activeTabId === tab.id ? 'workspace-tab active' : 'workspace-tab'}${getWorkspaceTabDropClass(tab.id)}`}
                   >
-                    ×
-                  </button>
-                </div>
-              ))}
+                    {tab.kind === 'terminal' ? <TerminalSquare size={15} /> : tab.kind === 'rdp' ? <Monitor size={15} /> : <FolderOpen size={15} />}
+                    <span className={`workspace-tab-state ${tab.status}`} />
+                    <span>{tab.title || tab.session.name}</span>
+                    <button
+                      className="workspace-tab-close"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        closeTab(tab);
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                );
+              })}
               {editorTabs.map((tab) => {
                 const dirty = tab.content !== tab.originalContent;
                 const active = showEditor && activeEditorTabId === tab.id;
@@ -7411,6 +7396,7 @@ export function App() {
                   <div
                     key={tab.id}
                     role="tab"
+                    aria-selected={active}
                     tabIndex={0}
                     draggable={false}
                     className={`workspace-tab is-editor${active ? ' active' : ''}`}
@@ -7469,7 +7455,7 @@ export function App() {
               >
                 {getWorkspaceDropPreview()}
                 {getGhostTab()}
-                {renderTerminalLayoutNode(activeTab.layout ?? createDefaultTerminalLayout(activeTab.id), activeTab.id)}
+                {renderTerminalLayoutNode(activeTab.layout ?? createDefaultTerminalLayout(activeTab.id))}
               </div>
             ) : (
               <div className="resource-focus-card">

@@ -3198,10 +3198,6 @@ button:disabled {
   background: var(--bg-terminal);
 }
 
-.terminal-panel-no-tabs .workspace-tabs {
-  display: none;
-}
-
 /* 终端 / 编辑器主区占满剩余高度 */
 .terminal-panel > .workspace-body {
   flex: 1;
@@ -3237,6 +3233,15 @@ button:disabled {
 .workspace-tabs-empty {
   color: var(--text-muted);
   font-size: 13px;
+}
+
+.workspace-tab-group {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  min-width: max-content;
+  flex: 0 0 auto;
 }
 
 .workspace-tab {
@@ -3306,9 +3311,12 @@ body.terminal-tab-dragging .workspace-tab {
 }
 
 .workspace-tab.reorder-before::before,
-.workspace-tab.reorder-after::after {
+.workspace-tab.reorder-after::after,
+.workspace-tab-group.reorder-before::before,
+.workspace-tab-group.reorder-after::after {
   content: '';
   position: absolute;
+  z-index: 1;
   top: 5px;
   bottom: 5px;
   width: 2px;
@@ -3317,11 +3325,13 @@ body.terminal-tab-dragging .workspace-tab {
   box-shadow: 0 0 8px rgba(97, 175, 239, 0.75);
 }
 
-.workspace-tab.reorder-before::before {
+.workspace-tab.reorder-before::before,
+.workspace-tab-group.reorder-before::before {
   left: -1px;
 }
 
-.workspace-tab.reorder-after::after {
+.workspace-tab.reorder-after::after,
+.workspace-tab-group.reorder-after::after {
   right: -1px;
 }
 
@@ -3781,11 +3791,6 @@ body.terminal-split-resizing-vertical .terminal-split-horizontal > .terminal-spl
   border-radius: 6px;
 }
 
-.terminal-split-pane.active .terminal-pane-tabbar {
-  border-bottom-color: rgba(97, 175, 239, 0.28);
-  background: rgba(39, 47, 58, 0.96);
-}
-
 .terminal-split-pane.drop-left,
 .terminal-split-pane.drop-right,
 .terminal-split-pane.drop-top,
@@ -3793,6 +3798,118 @@ body.terminal-split-resizing-vertical .terminal-split-horizontal > .terminal-spl
 .terminal-split-pane.drop-replace {
   border-color: rgba(97, 175, 239, 0.95);
   box-shadow: inset 0 0 0 1px rgba(97, 175, 239, 0.45), 0 0 16px rgba(97, 175, 239, 0.18);
+}
+
+/* Pane 内标签栏：仅在该 pane 有多个 tab 时显示（单 tab 由顶栏 chip 表达） */
+.terminal-pane-tabbar {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  height: 32px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
+  font-size: 12px;
+}
+
+.terminal-pane-tabs {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1;
+  height: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0 8px;
+  overscroll-behavior-x: contain;
+}
+
+.terminal-pane-tabs::-webkit-scrollbar {
+  height: 3px;
+}
+
+.terminal-pane-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  height: 30px;
+  min-width: max-content;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 0 12px;
+  color: var(--text-muted);
+  background: transparent;
+  white-space: nowrap;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-drag: none;
+  touch-action: none;
+  transition: color var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
+}
+
+.terminal-pane-tab.active {
+  color: var(--text-primary);
+  border-bottom-color: #c7c7c7;
+  font-weight: 500;
+}
+
+.terminal-pane-tab:hover {
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+}
+
+.terminal-pane-tab svg,
+.terminal-pane-tab span {
+  pointer-events: none;
+}
+
+.terminal-pane-tab-title {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.terminal-pane-tab-close {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 3px;
+  color: var(--text-muted);
+  background: transparent;
+  pointer-events: auto;
+}
+
+.terminal-pane-tab-close:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* 有 pane tabbar 时，内容区整体让出顶部 32px */
+.terminal-split-pane.has-tabbar .xterm-host {
+  inset: 40px 12px 8px;
+}
+
+.terminal-split-pane.has-tabbar .rdp-focus-card {
+  inset: 32px 0 0;
+}
+
+.terminal-split-pane.has-tabbar .terminal-connection-overlay {
+  top: 44px;
+}
+
+.terminal-split-pane.has-tabbar .terminal-connection-state {
+  padding-top: 56px;
+}
+
+.terminal-split-pane.has-tabbar .terminal-pane-editor-host {
+  inset: 32px 0 0;
 }
 
 .terminal-drop-preview {
@@ -3884,145 +4001,9 @@ body.terminal-split-resizing-vertical .terminal-split-horizontal > .terminal-spl
   inset: 50% 0 0 0;
 }
 
-.terminal-pane-tabbar {
-  position: absolute;
-  z-index: 3;
-  top: 0;
-  left: 0;
-  right: 0;
-  display: flex;
-  align-items: center;
-  height: 32px;
-  border-bottom: 1px solid var(--border-subtle);
-  color: var(--text-secondary);
-  background: var(--bg-secondary);
-  font-size: 12px;
-}
-
-.terminal-pane-tabs {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-  flex: 1;
-  height: 100%;
-  overflow-x: auto;
-  overflow-y: hidden;
-  padding: 0 12px;
-  overscroll-behavior-x: contain;
-}
-
-.terminal-pane-tabs::-webkit-scrollbar {
-  height: 3px;
-}
-
-.terminal-pane-tab {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  flex: 0 0 auto;
-  max-width: none;
-  height: 30px;
-  min-width: max-content;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  padding: 0 12px;
-  color: var(--text-muted);
-  background: transparent;
-  white-space: nowrap;
-  cursor: grab;
-  user-select: none;
-  -webkit-user-drag: none;
-  touch-action: none;
-  transition: color var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
-}
-
-.terminal-pane-tab.is-editor {
-  cursor: pointer;
-}
-
-.terminal-pane-tab.is-editor.active {
-  border-bottom-color: var(--accent-blue, #61afef);
-}
-
-.terminal-pane-tab-dirty,
-.workspace-tab-dirty {
-  flex: 0 0 auto;
-  color: var(--accent-blue, #61afef);
-  pointer-events: none;
-}
-
-.terminal-pane-tab.active {
-  color: var(--text-primary);
-  border-bottom-color: #c7c7c7;
-  background: transparent;
-  font-weight: 500;
-}
-
-.terminal-pane-tab:hover {
-  color: var(--text-secondary);
-  background: var(--bg-tertiary);
-}
-
-.terminal-pane-tab svg,
-.terminal-pane-tab span {
-  pointer-events: none;
-}
-
-.terminal-pane-tab-title {
-  flex: 0 0 auto;
-  overflow: visible;
-  text-overflow: clip;
-  white-space: nowrap;
-}
-
-.terminal-pane-tab-close {
-  display: grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
-  flex: 0 0 auto;
-  border: 0;
-  border-radius: 3px;
-  color: var(--text-muted);
-  background: transparent;
-  pointer-events: auto;
-}
-
-.terminal-pane-tab-close:hover {
-  color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.terminal-pane-tab-add {
-  display: grid;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  flex: 0 0 auto;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  color: var(--text-muted);
-  background: transparent;
-  transition: color var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
-}
-
-.terminal-pane-tab-add:hover {
-  color: var(--text-secondary);
-  background: var(--bg-tertiary);
-}
-
-.terminal-split-pane .xterm-host {
-  inset: 38px 12px 8px;
-}
-
-.terminal-split-pane .terminal-connection-state {
-  padding-top: 56px;
-}
-
 .terminal-pane-editor-host {
   position: absolute;
-  inset: 32px 0 0;
+  inset: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -4038,10 +4019,6 @@ body.terminal-split-resizing-vertical .terminal-split-horizontal > .terminal-spl
 
 .terminal-split-pane.is-editor {
   background: #23272e;
-}
-
-.terminal-split-pane .terminal-connection-overlay {
-  top: 40px;
 }
 
 .terminal-connection-overlay {
@@ -5106,7 +5083,6 @@ body.connection-reordering {
 /* Tab bars & small scroll areas — narrower scrollbar */
 .editor-tabs::-webkit-scrollbar,
 .workspace-tabs::-webkit-scrollbar,
-.terminal-pane-tabs::-webkit-scrollbar,
 .side-panel-content::-webkit-scrollbar {
   height: 3px;
   width: 3px;
@@ -7750,8 +7726,9 @@ body.has-ai-settings-window .ssh-workbench > :not(.ai-settings-backdrop):not(.di
 
 /* RDP 嵌入视图 */
 .rdp-focus-card {
-  flex: 1;
-  width: 100%;
+  position: absolute;
+  inset: 0;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
   border: 1px solid var(--border-subtle);

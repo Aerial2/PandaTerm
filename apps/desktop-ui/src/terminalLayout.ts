@@ -110,6 +110,18 @@ export function collectTerminalLayoutTabIds(node?: TerminalLayoutNode): string[]
   return [...collectTerminalLayoutTabIds(node.first), ...collectTerminalLayoutTabIds(node.second)];
 }
 
+/// 返回 paneTabId 所在 leaf 的整个 tab 组（含同 pane 内的多个 tab）。
+/// 顶层栏「就地展开当前激活 pane 的 tab 组」用此定位，找不到返回空数组。
+export function findLeafTabGroup(node: TerminalLayoutNode | undefined, paneTabId: string): string[] {
+  if (!node) return [];
+  if (node.type === 'leaf') {
+    const ids = getLeafTabIds(node);
+    return ids.includes(paneTabId) ? ids : [];
+  }
+  const inFirst = findLeafTabGroup(node.first, paneTabId);
+  return inFirst.length ? inFirst : findLeafTabGroup(node.second, paneTabId);
+}
+
 export function terminalLayoutContainsSplit(node: TerminalLayoutNode, splitId: string): boolean {
   if (node.type === 'leaf') return false;
   return (
