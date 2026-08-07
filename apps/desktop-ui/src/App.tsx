@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import {
   addLogEntry,
@@ -310,6 +310,12 @@ export function App() {
   const activeAiConversation = aiConversations.find((conversation) => conversation.id === aiWorkspace.activeConversationId)
     ?? aiConversations[0];
   const aiMessages = activeAiConversation?.messages ?? [];
+  const aiMessageListRef = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    const messageList = aiMessageListRef.current;
+    if (!messageList) return;
+    messageList.scrollTop = messageList.scrollHeight;
+  }, [activeAiConversation?.id]);
   const [aiInput, setAiInput] = useState('');
   /** AI 主输入框：按内容撑高，上限后内部滚动 */
   const aiInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -646,9 +652,9 @@ export function App() {
   const activePaneIdRef = useRef<string | null>(null);
   const terminalDragStateRef = useRef<TerminalDragState | null>(null);
   const terminalPointerDragRef = useRef<TerminalPointerDragCandidate | null>(null);
-  const paneTabDragActivated = useRef(false);
   const terminalSplitResizeRef = useRef<TerminalSplitResizeCandidate | null>(null);
   const paneTabElRefs = useRef<Map<string, HTMLElement>>(new Map());
+  const lastPaneTabClickRef = useRef<{ tabId: string; at: number } | null>(null);
   const tabsRef = useRef<WorkspaceTab[]>([]);
   const cancelledConnectionTabIdsRef = useRef<Set<string>>(new Set());
   // Track which terminal_ids have been started on the backend to avoid double-start
@@ -917,7 +923,7 @@ export function App() {
     };
   }
 
-  function createRdpTab(session: Session): WorkspaceTab {
+  function createRdpTab(session: Session, parentTabId?: string): WorkspaceTab {
     const tabId = `rdp:${session.id}-${crypto.randomUUID()}`;
     return {
       id: tabId,
@@ -933,6 +939,7 @@ export function App() {
       activityLog: [createActivity('info', '正在连接远程桌面...')],
       layout: createDefaultTerminalLayout(tabId),
       activePaneId: tabId,
+      parentTabId,
     };
   }
 
@@ -1218,11 +1225,6 @@ export function App() {
     resourceFilesRef.current = resourceFiles;
   }, [resourceFiles]);
 
-  // File drag-drop is now handled entirely via HTML5 native events
-  // (onDragOver / onDrop / onDragLeave on the file panel <aside>).
-  // Setting dragDropEnabled: false in tauri.conf.json allows HTML5 events
-  // to work normally — no more forbidden-cursor icon when dragging files.
-
   useEffect(() => {
     if (!openingConnection) return;
 
@@ -1333,19 +1335,66 @@ export function App() {
   }, [fileSearchQuery, resourceFiles, sortDirection, sortKey]);
 
   async function closeTab(tab: WorkspaceTab) {
-    const relatedTabIds = [tab.id, ...tabs.filter((item) => item.parentTabId === tab.id).map((item) => item.id)];
-    for (const relatedTab of tabs.filter((item) => relatedTabIds.includes(item.id))) {
+    const currentTabs = tabsRef.current;
+    const relatedTabIds = new Set<string>([tab.id]);
+    const layout = tab.layout ?? createDefaultTerminalLayout(tab.id);
+    const paneTabIds = (tab.kind === 'terminal' || tab.kind === 'rdp')
+      ? collectTerminalLayoutTabIds(layout)
+      : [];
+    const replacementTab = currentTabs.find(
+      (item) => item.id !== tab.id
+        && paneTabIds.includes(item.id)
+        && item.parentTabId === tab.id,
+    );
+
+    // workspace 根标签不能因为关闭自身而丢掉 pane 内通过双击创建的连接。
+    // 提升第一个子标签为新的根，保留整个分屏布局和其它 pane 标签。
+    if (replacementTab && (tab.kind === 'terminal' || tab.kind === 'rdp')) {
+      const promotedLayout = tab.activePaneId === tab.id
+        ? activateTerminalPaneTab(layout, replacementTab.id)
+        : layout;
+      const promotedTab = {
+        ...replacementTab,
+        layout: promotedLayout,
+        activePaneId: tab.activePaneId && tab.activePaneId !== tab.id && paneTabIds.includes(tab.activePaneId)
+          ? tab.activePaneId
+          : replacementTab.id,
+        parentTabId: undefined,
+      };
+      const nextTabs = currentTabs
+        .filter((item) => item.id !== tab.id && item.id !== replacementTab.id)
+        .map((item) => item.parentTabId === tab.id ? { ...item, parentTabId: promotedTab.id } : item);
+
+      disposeTerminalRuntime({ ...tab, closedByUser: true, status: 'closed' });
+      setTabs([...nextTabs, promotedTab]);
+      setActiveTabId(promotedTab.id);
+      setStatusMessage(`已切换到：${promotedTab.session.name}`);
+      return;
+    }
+
+    let expanded = true;
+    while (expanded) {
+      expanded = false;
+      for (const item of currentTabs) {
+        if (item.parentTabId && relatedTabIds.has(item.parentTabId) && !relatedTabIds.has(item.id)) {
+          relatedTabIds.add(item.id);
+          expanded = true;
+        }
+      }
+    }
+
+    for (const relatedTab of currentTabs.filter((item) => relatedTabIds.has(item.id))) {
       if (relatedTab.kind === 'terminal' && relatedTab.status === 'connecting') {
         cancelledConnectionTabIdsRef.current.add(relatedTab.id);
       }
       disposeTerminalRuntime({ ...relatedTab, closedByUser: true, status: 'closed' });
     }
 
-    setTabs((current) => current.filter((item) => !relatedTabIds.includes(item.id)));
+    const remainingTabs = currentTabs.filter((item) => !relatedTabIds.has(item.id));
+    setTabs(remainingTabs);
     setActiveTabId((current) => {
-      if (current !== tab.id && !relatedTabIds.includes(current || '')) return current;
-      const remaining = tabs.filter((item) => !relatedTabIds.includes(item.id) && !item.parentTabId);
-      return remaining[remaining.length - 1]?.id ?? null;
+      if (current && remainingTabs.some((item) => item.id === current)) return current;
+      return remainingTabs.find((item) => !item.parentTabId)?.id ?? null;
     });
   }
 
@@ -1389,12 +1438,14 @@ export function App() {
     const nextLayout = addTerminalTabToPane(ownerTab.layout ?? createDefaultTerminalLayout(ownerTab.id), targetPaneId, nextTab.id);
 
     setPendingPaneTabId(null);
+    setShowEditor(false);
     setTabs((current) => [
       ...current.map((item) => item.id === ownerTab.id ? { ...item, layout: nextLayout, activePaneId: nextTab.id } : item),
       nextTab,
     ]);
     setActiveTabId(ownerTab.id);
     setStatusMessage(`已添加到当前 pane：${session.name}`);
+    revealPaneTab(nextTab.id);
 
     {
       const terminalId = crypto.randomUUID();
@@ -1434,6 +1485,55 @@ export function App() {
       scheduleTerminalSettledFit(nextTab.id);
       focusTerminal(nextTab.id);
     });
+  }
+
+  function addRdpTabToPane(session: Session, targetPaneId: string) {
+    const ownerTab = findTerminalWorkspaceOwner(tabsRef.current, targetPaneId);
+    if (!ownerTab) {
+      openRdpTab(session);
+      return;
+    }
+
+    const nextTab = createRdpTab(session, ownerTab.id);
+    const nextLayout = addTerminalTabToPane(
+      ownerTab.layout ?? createDefaultTerminalLayout(ownerTab.id),
+      targetPaneId,
+      nextTab.id,
+    );
+
+    setShowEditor(false);
+    setTabs((current) => [
+      ...current.map((item) => item.id === ownerTab.id
+        ? { ...item, layout: nextLayout, activePaneId: nextTab.id }
+        : item),
+      nextTab,
+    ]);
+    setActiveTabId(ownerTab.id);
+    setStatusMessage(`已新建远程桌面连接：${session.name}`);
+    revealPaneTab(nextTab.id);
+  }
+
+  function revealPaneTab(tabId: string) {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        paneTabElRefs.current.get(tabId)?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'nearest',
+          inline: 'nearest',
+        });
+      });
+    });
+  }
+
+  function duplicatePaneConnection(tab: WorkspaceTab, targetPaneId: string) {
+    if (tab.kind === 'rdp') {
+      addRdpTabToPane(tab.session, targetPaneId);
+      return;
+    }
+
+    pendingPaneTabIdRef.current = targetPaneId;
+    setPendingPaneTabId(targetPaneId);
+    void addTerminalTabToCurrentPane(tab.session);
   }
 
   function closeTerminalPaneTab(paneId: string) {
@@ -1546,7 +1646,10 @@ export function App() {
     setStatusMessage('本地终端（底部面板）');
   }
 
-  function openNewConnectionTab() {
+  function openNewConnectionTab(paneId?: string) {
+    const targetPaneId = paneId ?? activePaneIdRef.current;
+    pendingPaneTabIdRef.current = targetPaneId;
+    setPendingPaneTabId(targetPaneId);
     void openConnectionWindow('manage');
   }
 
@@ -1893,6 +1996,12 @@ export function App() {
   }
 
   function selectSessionWorkspaceTab(tabId: string) {
+    const tab = tabsRef.current.find((item) => item.id === tabId);
+    if (tab?.kind === 'terminal' || tab?.kind === 'rdp') {
+      // workspace tab 是 root pane 的入口，不能只切 activeTabId；还要把 root 设为当前显示 pane。
+      focusTerminalPane(tabId);
+      return;
+    }
     setActiveTabId(tabId);
     setShowEditor(false);
   }
@@ -2435,6 +2544,58 @@ export function App() {
     if (related && event.currentTarget.contains(related)) return;
     resourceDragDepthRef.current = Math.max(0, resourceDragDepthRef.current - 1);
     if (resourceDragDepthRef.current === 0) setIsDragOver(false);
+  }
+
+  async function handleNativeResourceDrop(paths: string[]) {
+    const uniquePaths = Array.from(new Set(paths.filter(Boolean)));
+    if (uniquePaths.length === 0) return;
+
+    const tab = activePaneTabRef.current;
+    const local = isLocalResourceTab(tab);
+    const destination = currentPathRef.current;
+    if (local) {
+      if (!destination) {
+        setStatusMessage('请先打开本地目标目录');
+        return;
+      }
+      for (const source of uniquePaths) {
+        try {
+          await copyPath(source, destination);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          addLogEntry('error', `复制失败：${source} - ${message}`);
+        }
+      }
+      await loadResourceDirectory(destination, false);
+      return;
+    }
+
+    if (!tab?.terminalId) {
+      setStatusMessage('请先连接远程终端');
+      return;
+    }
+
+    const directories: string[] = [];
+    const files: string[] = [];
+    for (const path of uniquePaths) {
+      try {
+        await listLocalDirectory(path);
+        directories.push(path);
+      } catch {
+        files.push(path);
+      }
+    }
+
+    for (const directory of directories) {
+      await handleDirectoryUpload(directory, tab.terminalId);
+    }
+    if (files.length > 0) {
+      const placeholders = files.map((path) => {
+        const name = path.split(/[/\\]/).filter(Boolean).pop() || 'file';
+        return new globalThis.File([], name);
+      });
+      await uploadFiles(placeholders, files);
+    }
   }
 
   async function handleDrop(event: React.DragEvent) {
@@ -5190,6 +5351,7 @@ export function App() {
       isOverWorkspace: false,
       targetPaneId: null,
       targetTabId: null,
+      targetRegion: null,
       side: null,
       reorderPlacement: null,
       ghostX: x,
@@ -5233,6 +5395,13 @@ export function App() {
     return rightmostTabId ? { targetTabId: rightmostTabId, reorderPlacement: 'after' as const } : null;
   }
 
+  function getTabbarDropTargetPaneId(clientX: number, clientY: number): string | null {
+    const hit = document.elementFromPoint(clientX, clientY);
+    const tabbar = hit instanceof Element ? hit.closest('.terminal-pane-tabbar') : null;
+    const pane = tabbar?.closest<HTMLElement>('.terminal-split-pane');
+    return pane?.dataset.paneId ?? null;
+  }
+
   function getDropSideFromRect(rect: DOMRect, clientX: number, clientY: number): TerminalDropSide | null {
     const edgeX = rect.width * TERMINAL_PANE_EDGE_DROP_RATIO;
     const edgeY = rect.height * TERMINAL_PANE_EDGE_DROP_RATIO;
@@ -5262,8 +5431,27 @@ export function App() {
         isOverWorkspace: false,
         targetPaneId: null,
         targetTabId: reorderHit.targetTabId,
+        targetRegion: null,
         side: null,
         reorderPlacement: reorderHit.reorderPlacement,
+        ghostX: clientX,
+        ghostY: clientY,
+      });
+      return;
+    }
+
+    const tabbarTargetPaneId = getTabbarDropTargetPaneId(clientX, clientY);
+    if (tabbarTargetPaneId) {
+      // Tabbar 是合并区；只有 pane 内容区域的边缘才产生 split。
+      applyTerminalDragState({
+        tabId,
+        operation: 'replace',
+        isOverWorkspace: true,
+        targetPaneId: tabbarTargetPaneId,
+        targetTabId: null,
+        targetRegion: 'tabbar',
+        side: null,
+        reorderPlacement: null,
         ghostX: clientX,
         ghostY: clientY,
       });
@@ -5309,6 +5497,7 @@ export function App() {
           isOverWorkspace: true,
           targetPaneId: paneId,
           targetTabId: null,
+          targetRegion: 'pane',
           side,
           reorderPlacement: null,
           ghostX: clientX,
@@ -5322,6 +5511,7 @@ export function App() {
         isOverWorkspace: true,
         targetPaneId: paneId,
         targetTabId: null,
+        targetRegion: 'pane',
         side,
         reorderPlacement: null,
         ghostX: clientX,
@@ -5336,6 +5526,7 @@ export function App() {
       isOverWorkspace: true,
       targetPaneId: null,
       targetTabId: null,
+      targetRegion: null,
       side: null,
       reorderPlacement: null,
       ghostX: clientX,
@@ -5581,8 +5772,18 @@ export function App() {
           setStatusMessage('新窗口拖放语义已识别，多窗口承载稍后接入');
         }
       } else if (candidate && !candidate.active) {
-        setActiveTabId(tabId);
-        setShowEditor(false);
+        selectSessionWorkspaceTab(tabId);
+        const now = performance.now();
+        const previousClick = lastPaneTabClickRef.current;
+        if (previousClick?.tabId === tabId && now - previousClick.at <= 350) {
+          lastPaneTabClickRef.current = null;
+          const sourceTab = tabsRef.current.find((item) => item.id === tabId);
+          if (sourceTab && (sourceTab.kind === 'terminal' || sourceTab.kind === 'rdp')) {
+            duplicatePaneConnection(sourceTab, sourceTab.activePaneId ?? sourceTab.id);
+          }
+        } else {
+          lastPaneTabClickRef.current = { tabId, at: now };
+        }
       }
       terminalPointerDragRef.current = null;
       document.body.classList.remove('terminal-tab-dragging');
@@ -5603,7 +5804,9 @@ export function App() {
 
   function getPaneDropClass(paneId: string) {
     if (terminalDragState?.targetPaneId !== paneId) return '';
-    if (terminalDragState.operation === 'replace') return ' drop-replace';
+    if (terminalDragState.operation === 'replace') {
+      return terminalDragState.targetRegion === 'tabbar' ? '' : ' drop-replace';
+    }
     if (terminalDragState.operation !== 'split' || !terminalDragState.side) return '';
     return ` drop-${terminalDragState.side}`;
   }
@@ -5611,16 +5814,35 @@ export function App() {
   function getPaneDropPreview(paneId: string) {
     if (terminalDragState?.targetPaneId !== paneId) return null;
     if (terminalDragState.operation === 'replace') {
-      return <div className="terminal-drop-preview replace" />;
+      return terminalDragState.targetRegion === 'tabbar'
+        ? null
+        : <div className="terminal-drop-preview replace" />;
     }
     if (terminalDragState.operation !== 'split' || !terminalDragState.side) return null;
     return <div className={`terminal-drop-preview ${terminalDragState.side}`} />;
   }
 
+  function getPaneTabbarDropPreview(paneId: string) {
+    if (
+      terminalDragState?.targetPaneId !== paneId
+      || terminalDragState.operation !== 'replace'
+      || terminalDragState.targetRegion !== 'tabbar'
+    ) {
+      return null;
+    }
+    return <div className="terminal-drop-preview replace tabbar" />;
+  }
+
   function clearTerminalDragPreview() {
     const current = terminalDragStateRef.current;
     if (!current) return;
-    const next: TerminalDragState = { ...current, isOverWorkspace: false, targetPaneId: null, side: null };
+    const next: TerminalDragState = {
+      ...current,
+      isOverWorkspace: false,
+      targetPaneId: null,
+      targetRegion: null,
+      side: null,
+    };
     terminalDragStateRef.current = next;
     setTerminalDragState(next);
   }
@@ -5665,17 +5887,14 @@ export function App() {
     if (event.button !== 0) return;
     if ((event.target as HTMLElement).closest('button')) return;
 
-    paneTabDragActivated.current = false;
-    event.preventDefault();
     event.stopPropagation();
-    event.currentTarget.setPointerCapture?.(event.pointerId);
 
     const startX = event.clientX;
     const startY = event.clientY;
     let activated = false;
 
     // pane 内 tab 的拖拽作用域就是该 pane 自身：pane 内互拖=重排，
-    // 拖到 pane 边缘=自我分屏，拖出 pane=跨 pane 的 split/replace/新窗口。
+    // 拖到 tabs 区域=合并，拖到 pane 内容边缘=自我分屏，拖出 pane=跨 pane 判定。
     const ownerTab = findTerminalWorkspaceOwner(tabsRef.current, paneId);
     const ownerTabId = ownerTab?.id ?? paneId;
     const samePaneTabIds = ownerTab
@@ -5689,7 +5908,6 @@ export function App() {
       const distance = Math.hypot(dx, dy);
       if (!activated && distance < TERMINAL_TAB_DRAG_THRESHOLD) return;
       activated = true;
-      paneTabDragActivated.current = true;
 
       if (localDragScopeEl) {
         const localDragScopeRect = localDragScopeEl.getBoundingClientRect();
@@ -5697,7 +5915,9 @@ export function App() {
           || moveEvent.clientY < localDragScopeRect.top || moveEvent.clientY > localDragScopeRect.bottom;
 
         // pane 内部命中边缘=自我分屏；拖出 pane=进入全局 split/replace 判定。
+        const tabbarTargetPaneId = getTabbarDropTargetPaneId(moveEvent.clientX, moveEvent.clientY);
         const inSplitEdge = !outside
+          && !tabbarTargetPaneId
           && getDropSideFromRect(localDragScopeRect, moveEvent.clientX, moveEvent.clientY) !== null;
 
         if (outside || inSplitEdge) {
@@ -5774,9 +5994,21 @@ export function App() {
 
     const handlePointerUp = () => {
       cleanup();
-      if (!activated) {
-        focusTerminalPane(tabId);
+      if (activated) {
+        lastPaneTabClickRef.current = null;
+        return;
       }
+
+      focusTerminalPane(tabId);
+      const now = performance.now();
+      const previousClick = lastPaneTabClickRef.current;
+      if (previousClick?.tabId === tabId && now - previousClick.at <= 350) {
+        lastPaneTabClickRef.current = null;
+        const sourceTab = tabsRef.current.find((item) => item.id === tabId);
+        if (sourceTab) duplicatePaneConnection(sourceTab, tabId);
+        return;
+      }
+      lastPaneTabClickRef.current = { tabId, at: now };
     };
 
     const handleBlur = () => handlePointerUp();
@@ -5809,9 +6041,20 @@ export function App() {
     return renderPaneLeaf(node);
   }
 
-  // 渲染 body 内 pane tabbar 的单个 terminal/RDP tab。
+  function isWorkspaceChipActive(tabId: string): boolean {
+    // Workspace root 只有在它本身是当前显示 pane，且编辑器未覆盖终端时才选中。
+    return !showEditor && activeTabId === tabId && activePaneId === tabId;
+  }
+
+  function isPaneTabActive(tabId: string, paneTabId: string): boolean {
+    // pane tab 只代表当前实际显示的终端；编辑器打开时不保留终端 active。
+    return !showEditor && activeTabId !== null && activePaneId === paneTabId && tabId === paneTabId;
+  }
+
+  // 渲染 pane tabbar 的单个 terminal/RDP tab。
   // paneTabId 是该 pane 当前激活 tab，同时作为拖拽时的 pane 身份。
   function renderPaneTab(tab: WorkspaceTab, paneTabId: string): ReactNode {
+    const active = isPaneTabActive(tab.id, paneTabId);
     return (
       <div
         key={tab.id}
@@ -5820,24 +6063,14 @@ export function App() {
           else paneTabElRefs.current.delete(tab.id);
         }}
         role="tab"
-        aria-selected={!showEditor && tab.id === paneTabId}
+        aria-selected={active}
         tabIndex={0}
         draggable={false}
-        className={(!showEditor && tab.id === paneTabId) ? 'terminal-pane-tab active' : 'terminal-pane-tab'}
+        className={active ? 'terminal-pane-tab active' : 'terminal-pane-tab'}
         onDragStart={(event) => event.preventDefault()}
         onPointerDown={(event) => {
           event.stopPropagation();
           startPaneTabPointerDrag(tab.id, paneTabId, event);
-        }}
-        onClick={(event) => {
-          event.stopPropagation();
-          setShowEditor(false);
-          focusTerminalPane(tab.id);
-        }}
-        onDoubleClick={(event) => {
-          event.stopPropagation();
-          if (paneTabDragActivated.current) { paneTabDragActivated.current = false; return; }
-          void addTerminalTabToCurrentPane(tab.session);
         }}
       >
         {tab.kind === 'rdp' ? <Monitor size={15} /> : <TerminalSquare size={15} />}
@@ -5854,20 +6087,152 @@ export function App() {
     );
   }
 
+  // 渲染 pane tabbar 的单个 workspace chip（来自原顶栏：跨 workspace 切换 + 顶层拖拽排序）。
+  function renderWorkspaceChip(tab: WorkspaceTab): ReactNode {
+    return (
+      <div
+        key={tab.id}
+        ref={(el) => {
+          if (el) {
+            workspaceTabRefs.current.set(tab.id, el);
+          } else {
+            workspaceTabRefs.current.delete(tab.id);
+          }
+        }}
+        role="tab"
+        aria-selected={isWorkspaceChipActive(tab.id)}
+        tabIndex={0}
+        draggable={false}
+        onDragStart={(event) => event.preventDefault()}
+        onPointerDown={(event) => {
+          if (tab.kind === 'terminal' || tab.kind === 'rdp') startTabPointerDrag(tab.id, event);
+        }}
+        onClick={() => {
+          if (tab.kind !== 'terminal' && tab.kind !== 'rdp') selectSessionWorkspaceTab(tab.id);
+        }}
+        className={`${isWorkspaceChipActive(tab.id) ? 'workspace-tab active' : 'workspace-tab'}${getWorkspaceTabDropClass(tab.id)}`}
+      >
+        {tab.kind === 'terminal' ? <TerminalSquare size={15} /> : tab.kind === 'rdp' ? <Monitor size={15} /> : <FolderOpen size={15} />}
+        <span className={`workspace-tab-state ${tab.status}`} />
+        <span>{tab.title || tab.session.name}</span>
+        <button
+          className="workspace-tab-close"
+          title="关闭 workspace"
+          onClick={(event) => {
+            event.stopPropagation();
+            closeTab(tab);
+          }}
+        >
+          ×
+        </button>
+      </div>
+    );
+  }
+
+  // 渲染 pane tabbar 的单个编辑器 tab（来自原顶栏，未保存标记保留）。
+  function renderEditorPaneTab(tab: EditorTab): ReactNode {
+    const dirty = tab.content !== tab.originalContent;
+    const active = showEditor && activeEditorTabId === tab.id;
+    return (
+      <div
+        key={tab.id}
+        role="tab"
+        aria-selected={active}
+        tabIndex={0}
+        draggable={false}
+        className={`workspace-tab is-editor${active ? ' active' : ''}`}
+        title={tab.isUntitled ? '未保存的空白文件' : tab.path}
+        onDragStart={(event) => event.preventDefault()}
+        onClick={() => selectEditorWorkspaceTab(tab.id)}
+      >
+        <FileText size={15} />
+        <span>{editorTabLabel(tab, editorTabs)}</span>
+        {dirty && <span className="workspace-tab-dirty" aria-hidden>•</span>}
+        <button
+          className="workspace-tab-close"
+          onClick={(event) => {
+            event.stopPropagation();
+            closeEditorTab(tab.id);
+          }}
+        >
+          ×
+        </button>
+      </div>
+    );
+  }
+
+  // 所有 tab 类型在同一个 tablist 中平铺；只保留一个 tab 容器和一个新建入口。
+  function renderWorkspaceTabItems(): ReactNode {
+    return tabs
+      .filter((tab) => !tab.parentTabId && tab.session.id !== localSession.id)
+      .map(renderWorkspaceChip);
+  }
+
+  function renderEditorTabItems(): ReactNode {
+    return editorTabs.map(renderEditorPaneTab);
+  }
+
+  function renderPaneTabItems(paneTabId: string, paneTabs: WorkspaceTab[]): ReactNode {
+    return paneTabs.map((tab) => renderPaneTab(tab, paneTabId));
+  }
+
+  function renderUnifiedPaneTabbar(
+    paneTabId: string | undefined,
+    paneTabs: WorkspaceTab[],
+    showWorkspaceTabs: boolean,
+    targetPaneId?: string,
+  ): ReactNode {
+    return (
+      <div className="terminal-pane-tabs" onWheel={scrollHorizontallyOnWheel}>
+        <div
+          ref={showWorkspaceTabs ? workspaceTabsRef : undefined}
+          className="terminal-pane-tab-group terminal-pane-tab-group-unified"
+          role="tablist"
+          aria-label="标签"
+        >
+          {showWorkspaceTabs && renderWorkspaceTabItems()}
+          {showWorkspaceTabs && renderEditorTabItems()}
+          {paneTabId && renderPaneTabItems(paneTabId, paneTabs)}
+        </div>
+        {renderPaneAddButton(targetPaneId)}
+      </div>
+    );
+  }
+
+  function renderPaneAddButton(targetPaneId?: string): ReactNode {
+    return (
+      <button
+        className="workspace-tab-add"
+        title="新建连接"
+        onClick={(event) => {
+          event.stopPropagation();
+          openNewConnectionTab(targetPaneId);
+        }}
+      >
+        <Plus size={16} />
+      </button>
+    );
+  }
+
   // Pane 叶子渲染：从 renderTerminalLayoutNode 拆出的接缝，未来按 tab.kind 分发
   // （terminal→xterm-host / rdp→RdpView），是 RDP 进分屏体系的落点。
   function renderPaneLeaf(
     node: Extract<TerminalLayoutNode, { type: 'leaf' }>,
   ): ReactNode {
     const paneTabIds = getLeafTabIds(node);
-    const paneTabs = paneTabIds
+    const workspaceOwnerId = findTerminalWorkspaceOwner(tabs, node.tabId)?.id ?? null;
+    // 内容区必须包含 leaf 内的全部终端实例；只有标签栏排除 workspace root，避免视觉重复。
+    const paneContentTabs = paneTabIds
       .map((tabId) => tabs.find((tab) => tab.id === tabId && (tab.kind === 'terminal' || tab.kind === 'rdp')))
       .filter((tab): tab is WorkspaceTab => Boolean(tab));
-    const paneTab = tabs.find((tab) => tab.id === node.tabId && (tab.kind === 'terminal' || tab.kind === 'rdp')) ?? paneTabs[0];
+    const paneTabs = paneContentTabs.filter((tab) => tab.id !== workspaceOwnerId);
+    const paneTab = tabs.find((tab) => tab.id === node.tabId && (tab.kind === 'terminal' || tab.kind === 'rdp')) ?? paneContentTabs[0];
     if (!paneTab) return null;
     const isActivePane = node.tabId === activePaneId;
-    // 去重：pane 只有单个 tab 时不显示 tabbar，避免与顶栏 workspace chip 重复。
-    const showPaneTabbar = paneTabs.length > 1;
+    const isWorkspacePane = activeTab ? paneTabIds.includes(activeTab.id) : false;
+    // pane tabbar 始终显示；workspace chips 固定在 workspace root 所在 pane，避免切换分屏焦点时整组标签跟着移动。
+    // 每个 pane 都保留自己的 leaf tabs 和新建按钮；编辑器内容也与 workspace root 保持同一 pane。
+    const showWorkspaceChips = isWorkspacePane;
 
     return (
       <section
@@ -5880,20 +6245,17 @@ export function App() {
             for (const tabId of paneTabIds) terminalPaneRefs.current.delete(tabId);
           }
         }}
-        className={`${isActivePane ? 'terminal-split-pane active' : 'terminal-split-pane'}${showPaneTabbar ? ' has-tabbar' : ''}${showEditor && isActivePane ? ' is-editor' : ''}${getPaneDropClass(node.tabId)}`}
+        className={`${isActivePane ? 'terminal-split-pane active' : 'terminal-split-pane'} has-tabbar${showEditor && isWorkspacePane ? ' is-editor' : ''}${getPaneDropClass(node.tabId)}`}
         onMouseDown={() => {
           if (showEditor) return;
           focusTerminalPane(node.tabId);
         }}
       >
         {getPaneDropPreview(node.tabId)}
-        {showPaneTabbar && (
-          <div className="terminal-pane-tabbar">
-            <div className="terminal-pane-tabs">
-              {paneTabs.map((tab) => renderPaneTab(tab, node.tabId))}
-            </div>
-          </div>
-        )}
+        <div className="terminal-pane-tabbar">
+          {getPaneTabbarDropPreview(node.tabId)}
+          {renderUnifiedPaneTabbar(node.tabId, paneTabs, showWorkspaceChips, node.tabId)}
+        </div>
         {paneTab.kind === 'rdp' ? (
           <div className="rdp-focus-card">
             <RdpView
@@ -5911,7 +6273,7 @@ export function App() {
           </div>
         ) : (
           <>
-            {paneTabs.map((tab) => (
+            {paneContentTabs.map((tab) => (
               <div
                 key={tab.id}
                 className={tab.id === node.tabId ? 'xterm-host active' : 'xterm-host inactive'}
@@ -5932,7 +6294,7 @@ export function App() {
                 <span>{paneTab.statusMessage || '等待终端就绪...'}</span>
               </div>
             )}
-            {isActivePane && (
+            {isWorkspacePane && (
               <div className={`terminal-pane-editor-host${showEditor ? '' : ' is-hidden'}`}>
                 <EditorPanel
                   tabs={editorTabs}
@@ -6422,7 +6784,7 @@ export function App() {
 
             {aiConversationError && <div className="ai-conversation-error">{aiConversationError}</div>}
 
-            <div className="ai-message-list">
+            <div ref={aiMessageListRef} className="ai-message-list">
               {aiMessages.length === 0 ? (
                 <div className="ai-empty-state">
                   <div className="ai-empty-icon"><Bot size={24} /></div>
@@ -6639,8 +7001,6 @@ export function App() {
                           {action.status === 'running' && <span>正在隔离执行…</span>}
                           {action.status === 'completed' && (
                             <>
-                              <span className={action.exitCode === 0 ? 'success' : ''}>退出码 {action.exitCode ?? '未知'}{action.truncated ? ' · 输出已截断' : ''}</span>
-                              <button type="button" onClick={() => addAiTerminalOutputContext(action)}>加入下一次提问</button>
                               {activeAiConversation?.mode === 'agent' && !action.continued && canContinueAiAgent(activeAiConversation) && !isAiGenerating && (
                                 <button
                                   type="button"
@@ -7337,94 +7697,13 @@ export function App() {
         />
 
         <section className="terminal-panel">
-          {/* 全局工作区顶栏始终可见：负责在 SSH workspace、RDP、资源视图与编辑器之间切换。 */}
-          <div
-            className="workspace-tabs"
-            ref={workspaceTabsRef}
-            role="tablist"
-            aria-label="工作区标签"
-            title="双击空白处新建空白编辑器"
-            onWheel={scrollHorizontallyOnWheel}
-            onDoubleClick={(event) => {
-              if ((event.target as HTMLElement).closest('.workspace-tab, .workspace-tab-add, .workspace-tab-group')) return;
-              createUntitledEditorTab();
-            }}
-          >
-              {tabs.filter((tab) => !tab.parentTabId && tab.session.id !== localSession.id).map((tab) => {
-                // 顶栏只表达顶层 workspace：每个根 workspace 渲染成单个 chip。
-                // 分屏结构与 pane 内 tab 切换全部下沉到 body 的 pane tabbar 处理。
-                return (
-                  <div
-                    key={tab.id}
-                    ref={(el) => {
-                      if (el) {
-                        workspaceTabRefs.current.set(tab.id, el);
-                      } else {
-                        workspaceTabRefs.current.delete(tab.id);
-                      }
-                    }}
-                    role="tab"
-                    aria-selected={!showEditor && activeTabId === tab.id}
-                    tabIndex={0}
-                    draggable={false}
-                    onDragStart={(event) => event.preventDefault()}
-                    onPointerDown={(event) => {
-                      if (tab.kind === 'terminal' || tab.kind === 'rdp') startTabPointerDrag(tab.id, event);
-                    }}
-                    onClick={() => selectSessionWorkspaceTab(tab.id)}
-                    className={`${!showEditor && activeTabId === tab.id ? 'workspace-tab active' : 'workspace-tab'}${getWorkspaceTabDropClass(tab.id)}`}
-                  >
-                    {tab.kind === 'terminal' ? <TerminalSquare size={15} /> : tab.kind === 'rdp' ? <Monitor size={15} /> : <FolderOpen size={15} />}
-                    <span className={`workspace-tab-state ${tab.status}`} />
-                    <span>{tab.title || tab.session.name}</span>
-                    <button
-                      className="workspace-tab-close"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        closeTab(tab);
-                      }}
-                    >
-                      ×
-                    </button>
-                  </div>
-                );
-              })}
-              {editorTabs.map((tab) => {
-                const dirty = tab.content !== tab.originalContent;
-                const active = showEditor && activeEditorTabId === tab.id;
-                return (
-                  <div
-                    key={tab.id}
-                    role="tab"
-                    aria-selected={active}
-                    tabIndex={0}
-                    draggable={false}
-                    className={`workspace-tab is-editor${active ? ' active' : ''}`}
-                    title={tab.isUntitled ? '未保存的空白文件' : tab.path}
-                    onDragStart={(event) => event.preventDefault()}
-                    onClick={() => selectEditorWorkspaceTab(tab.id)}
-                  >
-                    <FileText size={15} />
-                    <span>{editorTabLabel(tab, editorTabs)}</span>
-                    {dirty && <span className="workspace-tab-dirty" aria-hidden>•</span>}
-                    <button
-                      className="workspace-tab-close"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        closeEditorTab(tab.id);
-                      }}
-                    >
-                      ×
-                    </button>
-                  </div>
-                );
-              })}
-              <button className="workspace-tab-add" title="新建连接" onClick={openNewConnectionTab}>
-                <Plus size={16} />
-              </button>
-            </div>
-
           <div className="workspace-body">
+            {/* 无终端 workspace 时，统一标签栏独立成栏（编辑器/sftp/空态都依赖它做切换与新建入口） */}
+            {activeTab && activeTab.kind !== 'terminal' && activeTab.kind !== 'rdp' && (
+              <div className="terminal-pane-tabbar standalone">
+                {renderUnifiedPaneTabbar(undefined, [], true)}
+              </div>
+            )}
             {/* 无终端会话时：编辑器占满主区；有终端时编辑嵌在 pane 内 */}
             {showEditor && (!activeTab || activeTab.kind !== 'terminal') ? (
               <EditorPanel
@@ -7441,8 +7720,8 @@ export function App() {
             ) : !activeTab ? (
               <div className="empty-workspace">
                 <h2>没有活动标签页</h2>
-                <p>双击标签栏空白新建编辑器，或点 + 打开连接管理。</p>
-                <button className="empty-primary-action" onClick={openNewConnectionTab}>
+                <p>点 + 打开连接管理，或从侧边栏发起连接。</p>
+                <button className="empty-primary-action" onClick={() => openNewConnectionTab()}>
                   <Plus size={17} />
                   <span>新建连接</span>
                 </button>

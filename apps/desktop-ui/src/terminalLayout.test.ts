@@ -7,6 +7,7 @@ import {
   createDefaultTerminalLayout,
   findLeafTabGroup,
   findTerminalWorkspaceOwner,
+  insertTerminalPane,
   removeTerminalTabFromPane,
   reorderPaneTabIds,
   type TerminalLayoutNode,
@@ -74,6 +75,15 @@ describe('terminal pane tab groups', () => {
     expect(findLeafTabGroup(reordered, 'ssh-1')).toEqual(['rdp-1', 'ssh-1']);
     expect(findLeafTabGroup(reordered, 'ssh-2')).toEqual(['ssh-2']);
     expect(collectTerminalLayoutTabIds(reordered)).toEqual(['rdp-1', 'ssh-1', 'ssh-2']);
+  });
+
+  it('splits only the dragged tab and keeps sibling tabs in their original panes', () => {
+    const split = insertTerminalPane(splitLayout, 'ssh-1', 'rdp-1', 'right');
+
+    expect(findLeafTabGroup(split, 'ssh-1')).toEqual(['ssh-1']);
+    expect(findLeafTabGroup(split, 'rdp-1')).toEqual(['rdp-1']);
+    expect(findLeafTabGroup(split, 'ssh-2')).toEqual(['ssh-2']);
+    expect(collectTerminalLayoutTabIds(split)).toEqual(['ssh-1', 'rdp-1', 'ssh-2']);
   });
 
   it('keeps the active tab and tab list consistent when activating and removing', () => {

@@ -8,7 +8,9 @@
 //! 是常驻会话，读超时（Windows 上是 `TimedOut`、Unix 上是 `WouldBlock`）时检查
 //! 关闭标志再决定继续轮询，从而既能常驻收帧又能优雅关闭。
 
+use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -16,9 +18,9 @@ use std::time::Duration;
 
 use ironrdp::cliprdr::backend::CliprdrBackend;
 use ironrdp::cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
-    FileContentsResponse, FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId,
-    OwnedFormatDataResponse,
+    ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags,
+    FileContentsFlags, FileContentsRequest, FileContentsResponse, FileDescriptor,
+    FormatDataRequest, FormatDataResponse, LockDataId, OwnedFormatDataResponse,
 };
 use ironrdp::cliprdr::CliprdrClient;
 use ironrdp::connector::connection_activation::{
@@ -98,6 +100,8 @@ const FRAME_AUDIO: u8 = 7;
 
 /// 单次剪贴板文本传输上限，防止不可信远端通过超大 PDU/字符串造成内存峰值。
 const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CLIPBOARD_FILES: usize = 256;
+const MAX_FILE_CONTENTS_CHUNK: usize = 16 * 1024 * 1024;
 /// 单个音频 wave 块上限，防止不可信远端用超大 PDU 造成内存峰值（正常 wave 仅数 KB）。
 const MAX_AUDIO_CHUNK_BYTES: usize = 1024 * 1024;
 /// FRAME_AUDIO 定长头：type(1) + 声道(2) + 采样率(4) + 位深(2)。
@@ -271,16 +275,99 @@ pub enum RdpInputEvent {
     ReleaseAll,
     Resize { width: u16, height: u16 },
     Clipboard { text: String },
+    FileDrop { paths: Vec<String> },
 }
 
 type UpgradedStream = native_tls::TlsStream<TcpStream>;
 type UpgradedFramed = ironrdp_blocking::Framed<UpgradedStream>;
+
+#[derive(Debug, Clone)]
+struct LocalClipboardFile {
+    path: PathBuf,
+    descriptor: FileDescriptor,
+    is_directory: bool,
+}
+
+fn clipboard_descriptor_name(path: &Path) -> Option<String> {
+    let name = path.to_string_lossy().replace('/', "\\");
+    (!name.is_empty() && name.encode_utf16().count() <= 259).then_some(name)
+}
+
+fn collect_clipboard_path(
+    local_path: PathBuf,
+    descriptor_path: PathBuf,
+    files: &mut Vec<LocalClipboardFile>,
+) {
+    if files.len() >= MAX_CLIPBOARD_FILES {
+        return;
+    }
+
+    let Ok(metadata) = std::fs::symlink_metadata(&local_path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    let Some(name) = clipboard_descriptor_name(&descriptor_path) else {
+        return;
+    };
+
+    if metadata.is_dir() {
+        files.push(LocalClipboardFile {
+            path: local_path.clone(),
+            descriptor: FileDescriptor::new(name)
+                .with_attributes(ClipboardFileAttributes::DIRECTORY),
+            is_directory: true,
+        });
+
+        let Ok(read_dir) = std::fs::read_dir(&local_path) else {
+            return;
+        };
+        let mut children = read_dir.filter_map(Result::ok).collect::<Vec<_>>();
+        children.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
+        for child in children {
+            if files.len() >= MAX_CLIPBOARD_FILES {
+                break;
+            }
+            collect_clipboard_path(child.path(), descriptor_path.join(child.file_name()), files);
+        }
+        return;
+    }
+
+    if metadata.is_file() {
+        files.push(LocalClipboardFile {
+            path: local_path,
+            descriptor: FileDescriptor::new(name)
+                .with_attributes(ClipboardFileAttributes::NORMAL)
+                .with_file_size(metadata.len()),
+            is_directory: false,
+        });
+    }
+}
+
+fn collect_local_clipboard_files(paths: Vec<String>) -> Vec<LocalClipboardFile> {
+    let mut files = Vec::new();
+    for raw_path in paths {
+        if files.len() >= MAX_CLIPBOARD_FILES {
+            break;
+        }
+        let Ok(path) = PathBuf::from(raw_path).canonicalize() else {
+            continue;
+        };
+        let Some(root_name) = path.file_name().map(PathBuf::from) else {
+            continue;
+        };
+        collect_clipboard_path(path, root_name, &mut files);
+    }
+    files
+}
 
 #[derive(Debug)]
 enum ClipboardAction {
     AdvertiseLocal,
     RequestRemote(ClipboardFormatId),
     Respond(OwnedFormatDataResponse),
+    RespondFile(FileContentsResponse<'static>),
 }
 
 /// CLIPRDR 仅维护协议态与待发送动作；系统剪贴板由前端 Tauri 插件负责。
@@ -290,6 +377,8 @@ struct PandaClipboardBackend {
     channel: Channel<InvokeResponseBody>,
     temporary_directory: String,
     local_text: Option<String>,
+    local_files: Vec<LocalClipboardFile>,
+    file_transfer_enabled: bool,
     pending_remote_format: Option<ClipboardFormatId>,
     actions: std::collections::VecDeque<ClipboardAction>,
 }
@@ -299,6 +388,8 @@ impl std::fmt::Debug for PandaClipboardBackend {
         f.debug_struct("PandaClipboardBackend")
             .field("temporary_directory", &self.temporary_directory)
             .field("has_local_text", &self.local_text.is_some())
+            .field("local_files", &self.local_files.len())
+            .field("file_transfer_enabled", &self.file_transfer_enabled)
             .field("pending_remote_format", &self.pending_remote_format)
             .field("pending_actions", &self.actions.len())
             .finish_non_exhaustive()
@@ -311,6 +402,8 @@ impl PandaClipboardBackend {
             channel,
             temporary_directory: std::env::temp_dir().to_string_lossy().into_owned(),
             local_text: None,
+            local_files: Vec::new(),
+            file_transfer_enabled: false,
             pending_remote_format: None,
             actions: std::collections::VecDeque::new(),
         }
@@ -320,8 +413,66 @@ impl PandaClipboardBackend {
         if text.len() > MAX_CLIPBOARD_BYTES || self.local_text.as_deref() == Some(text.as_str()) {
             return;
         }
+        self.local_files.clear();
         self.local_text = Some(text);
         self.actions.push_back(ClipboardAction::AdvertiseLocal);
+    }
+
+    fn set_local_files(&mut self, paths: Vec<String>) {
+        let files = collect_local_clipboard_files(paths);
+        if files.is_empty() {
+            return;
+        }
+        self.local_text = None;
+        self.local_files = files;
+        self.actions.push_back(ClipboardAction::AdvertiseLocal);
+    }
+
+    fn read_local_file_contents(
+        &self,
+        request: &FileContentsRequest,
+    ) -> FileContentsResponse<'static> {
+        let Ok(index) = usize::try_from(request.index) else {
+            return FileContentsResponse::new_error(request.stream_id);
+        };
+        let Some(local_file) = self.local_files.get(index) else {
+            return FileContentsResponse::new_error(request.stream_id);
+        };
+        if local_file.is_directory {
+            return FileContentsResponse::new_error(request.stream_id);
+        }
+        if request.flags.validate().is_err() {
+            return FileContentsResponse::new_error(request.stream_id);
+        }
+        let Ok(metadata) = std::fs::metadata(&local_file.path) else {
+            return FileContentsResponse::new_error(request.stream_id);
+        };
+        if request.flags.contains(FileContentsFlags::SIZE) {
+            if request.position != 0 || request.requested_size != 8 {
+                return FileContentsResponse::new_error(request.stream_id);
+            }
+            return FileContentsResponse::new_size_response(request.stream_id, metadata.len());
+        }
+
+        if request.position > metadata.len() {
+            return FileContentsResponse::new_error(request.stream_id);
+        }
+        let requested = usize::try_from(request.requested_size)
+            .unwrap_or(MAX_FILE_CONTENTS_CHUNK)
+            .min(MAX_FILE_CONTENTS_CHUNK);
+        let remaining = metadata.len() - request.position;
+        let read_len = requested.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let Ok(mut file) = std::fs::File::open(&local_file.path) else {
+            return FileContentsResponse::new_error(request.stream_id);
+        };
+        if file.seek(SeekFrom::Start(request.position)).is_err() {
+            return FileContentsResponse::new_error(request.stream_id);
+        }
+        let mut data = vec![0u8; read_len];
+        if file.read_exact(&mut data).is_err() {
+            return FileContentsResponse::new_error(request.stream_id);
+        }
+        FileContentsResponse::new_data_response(request.stream_id, data)
     }
 
     fn encode_local_text(&self, format: ClipboardFormatId) -> OwnedFormatDataResponse {
@@ -373,7 +524,10 @@ impl CliprdrBackend for PandaClipboardBackend {
     }
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
-        ClipboardGeneralCapabilityFlags::empty()
+        ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+            | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
+            | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
+            | ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED
     }
 
     fn on_ready(&mut self) {}
@@ -384,8 +538,10 @@ impl CliprdrBackend for PandaClipboardBackend {
 
     fn on_process_negotiated_capabilities(
         &mut self,
-        _capabilities: ClipboardGeneralCapabilityFlags,
+        capabilities: ClipboardGeneralCapabilityFlags,
     ) {
+        self.file_transfer_enabled =
+            capabilities.contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED);
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
@@ -419,7 +575,11 @@ impl CliprdrBackend for PandaClipboardBackend {
         self.pending_remote_format = None;
     }
 
-    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
+    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        let response = self.read_local_file_contents(&request);
+        self.actions
+            .push_back(ClipboardAction::RespondFile(response));
+    }
 
     fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
 
@@ -916,6 +1076,14 @@ fn queue_local_clipboard(active_stage: &mut ActiveStage, text: String) {
     }
 }
 
+fn queue_local_files(active_stage: &mut ActiveStage, paths: Vec<String>) {
+    if let Some(cliprdr) = active_stage.get_svc_processor_mut::<CliprdrClient>() {
+        if let Some(backend) = cliprdr.downcast_backend_mut::<PandaClipboardBackend>() {
+            backend.set_local_files(paths);
+        }
+    }
+}
+
 /// 排空 CLIPRDR backend 回调记录的动作。动作编码必须在 `ActiveStage::process`
 /// 返回后执行，避免 backend 回调期间对同一个 Cliprdr 处理器发生可变借用重入。
 fn flush_clipboard_actions(
@@ -937,22 +1105,32 @@ fn flush_clipboard_actions(
                 .ok_or_else(|| "CLIPRDR 通道处理器不可用".to_string())?;
             match action {
                 ClipboardAction::AdvertiseLocal => {
-                    let has_text = cliprdr
+                    let backend = cliprdr
                         .downcast_backend::<PandaClipboardBackend>()
-                        .and_then(|backend| backend.local_text.as_ref())
-                        .is_some();
-                    let formats = if has_text {
-                        vec![
-                            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
-                            ClipboardFormat::new(ClipboardFormatId::CF_TEXT),
-                        ]
+                        .ok_or_else(|| "CLIPRDR 剪贴板后端不可用".to_string())?;
+                    if !backend.local_files.is_empty() && backend.file_transfer_enabled {
+                        let files = backend
+                            .local_files
+                            .iter()
+                            .map(|file| file.descriptor.clone())
+                            .collect();
+                        cliprdr.initiate_file_copy(files)
                     } else {
-                        Vec::new()
-                    };
-                    cliprdr.initiate_copy(&formats)
+                        let formats =
+                            if backend.local_files.is_empty() && backend.local_text.is_some() {
+                                vec![
+                                    ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+                                    ClipboardFormat::new(ClipboardFormatId::CF_TEXT),
+                                ]
+                            } else {
+                                Vec::new()
+                            };
+                        cliprdr.initiate_copy(&formats)
+                    }
                 }
                 ClipboardAction::RequestRemote(format) => cliprdr.initiate_paste(format),
                 ClipboardAction::Respond(response) => cliprdr.submit_format_data(response),
+                ClipboardAction::RespondFile(response) => cliprdr.submit_file_contents(response),
             }
             .map_err(|e| format!("生成 CLIPRDR 消息失败: {e}"))?
         };
@@ -1158,7 +1336,8 @@ fn to_operation(event: RdpInputEvent) -> Option<Operation> {
         }
         RdpInputEvent::ReleaseAll
         | RdpInputEvent::Resize { .. }
-        | RdpInputEvent::Clipboard { .. } => None,
+        | RdpInputEvent::Clipboard { .. }
+        | RdpInputEvent::FileDrop { .. } => None,
     }
 }
 
@@ -1231,6 +1410,12 @@ fn drain_input(
                 let events = input_db.apply(pending.drain(..));
                 write_input_outputs(active_stage, image, framed, channel, &events, batch)?;
                 queue_local_clipboard(active_stage, text);
+                flush_clipboard_actions(active_stage, framed)?;
+            }
+            Ok(RdpInputEvent::FileDrop { paths }) => {
+                let events = input_db.apply(pending.drain(..));
+                write_input_outputs(active_stage, image, framed, channel, &events, batch)?;
+                queue_local_files(active_stage, paths);
                 flush_clipboard_actions(active_stage, framed)?;
             }
             Ok(event) => {

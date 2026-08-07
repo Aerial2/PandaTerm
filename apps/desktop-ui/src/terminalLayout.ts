@@ -26,6 +26,7 @@ export type TerminalDragState = {
   isOverWorkspace: boolean;
   targetPaneId: string | null;
   targetTabId: string | null;
+  targetRegion: 'pane' | 'tabbar' | null;
   side: TerminalDropSide | null;
   reorderPlacement: TerminalReorderPlacement | null;
   ghostX: number;

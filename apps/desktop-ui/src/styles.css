@@ -1292,12 +1292,12 @@ button:disabled {
 
 .ai-terminal-action-header strong {
   color: var(--text-primary);
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .ai-terminal-action-header span {
   color: var(--text-muted);
-  font-size: 9px;
+  font-size: 11px;
 }
 
 .ai-terminal-action-header em {
@@ -1322,8 +1322,8 @@ button:disabled {
   padding: 7px 8px;
   overflow: auto;
   font-family: var(--font-mono);
-  font-size: 9px;
-  line-height: 1.5;
+  font-size: 11px;
+  line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -1342,7 +1342,7 @@ button:disabled {
 .ai-terminal-error {
   padding: 7px 8px 0;
   color: #eaa0a6;
-  font-size: 9px;
+  font-size: 11px;
 }
 
 .ai-terminal-actions {
@@ -1359,7 +1359,7 @@ button:disabled {
   border-radius: 4px;
   color: var(--text-secondary);
   background: rgba(255, 255, 255, 0.03);
-  font-size: 9px;
+  font-size: 11px;
   cursor: pointer;
 }
 
@@ -1382,7 +1382,7 @@ button:disabled {
 
 .ai-terminal-actions span {
   color: var(--text-muted);
-  font-size: 9px;
+  font-size: 11px;
 }
 
 .ai-terminal-actions span.success {
@@ -3216,34 +3216,6 @@ button:disabled {
 
 /* Tabs — One Dark style: no border, bottom accent line */
 
-.workspace-tabs {
-  display: flex;
-  align-items: center;
-  gap: 0;
-  min-width: 0;
-  overflow-x: auto;
-  overflow-y: hidden;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--border-subtle);
-  background: var(--bg-secondary);
-  /* 滚轮横向滑动时更顺滑，避免把滚动链传给外层 */
-  overscroll-behavior-x: contain;
-}
-
-.workspace-tabs-empty {
-  color: var(--text-muted);
-  font-size: 13px;
-}
-
-.workspace-tab-group {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  height: 32px;
-  min-width: max-content;
-  flex: 0 0 auto;
-}
-
 .workspace-tab {
   position: relative;
   display: inline-flex;
@@ -3292,7 +3264,8 @@ body.terminal-tab-dragging .workspace-tab {
 
 .workspace-tab.active {
   color: var(--text-primary);
-  border-bottom-color: #c7c7c7;
+  border-bottom-color: var(--accent-blue, #61afef);
+  background: rgba(97, 175, 239, 0.1);
   font-weight: 500;
 }
 
@@ -3311,9 +3284,7 @@ body.terminal-tab-dragging .workspace-tab {
 }
 
 .workspace-tab.reorder-before::before,
-.workspace-tab.reorder-after::after,
-.workspace-tab-group.reorder-before::before,
-.workspace-tab-group.reorder-after::after {
+.workspace-tab.reorder-after::after {
   content: '';
   position: absolute;
   z-index: 1;
@@ -3325,13 +3296,11 @@ body.terminal-tab-dragging .workspace-tab {
   box-shadow: 0 0 8px rgba(97, 175, 239, 0.75);
 }
 
-.workspace-tab.reorder-before::before,
-.workspace-tab-group.reorder-before::before {
+.workspace-tab.reorder-before::before {
   left: -1px;
 }
 
-.workspace-tab.reorder-after::after,
-.workspace-tab-group.reorder-after::after {
+.workspace-tab.reorder-after::after {
   right: -1px;
 }
 
@@ -3800,7 +3769,8 @@ body.terminal-split-resizing-vertical .terminal-split-horizontal > .terminal-spl
   box-shadow: inset 0 0 0 1px rgba(97, 175, 239, 0.45), 0 0 16px rgba(97, 175, 239, 0.18);
 }
 
-/* Pane 内标签栏：仅在该 pane 有多个 tab 时显示（单 tab 由顶栏 chip 表达） */
+/* Pane 内标签栏：每个 pane 都有自己的 tabbar 和新建入口。
+   workspace root 所在 pane 将 workspace chips（workspace+编辑器）与自身 leaf tabs 平铺成一条连续 tab 流。 */
 .terminal-pane-tabbar {
   position: absolute;
   z-index: 3;
@@ -3823,12 +3793,47 @@ body.terminal-split-resizing-vertical .terminal-split-horizontal > .terminal-spl
   height: 100%;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 0 8px;
+  padding: 0 0 4px 8px;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
   overscroll-behavior-x: contain;
 }
 
+.terminal-pane-tab-group {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  min-width: 0;
+  height: 28px;
+}
+
+.terminal-pane-tabs .workspace-tab,
+.terminal-pane-tabs .terminal-pane-tab,
+.terminal-pane-tab-group-unified + .workspace-tab-add {
+  height: 28px;
+}
+
 .terminal-pane-tabs::-webkit-scrollbar {
-  height: 3px;
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+/* 统一 tablist 内平铺 workspace、编辑器和 pane tabs，保持一条连续视觉流 */
+.terminal-pane-tab-group-unified .workspace-tab:not(.active) {
+  background: transparent;
+}
+
+.terminal-pane-tab-group-unified + .workspace-tab-add {
+  position: sticky;
+  z-index: 2;
+  right: 0;
+  margin-left: 2px;
+  background: var(--bg-secondary);
+}
+
+.terminal-pane-tab-group-unified + .workspace-tab-add:hover {
+  background: var(--bg-tertiary);
 }
 
 .terminal-pane-tab {
@@ -3854,7 +3859,8 @@ body.terminal-split-resizing-vertical .terminal-split-horizontal > .terminal-spl
 
 .terminal-pane-tab.active {
   color: var(--text-primary);
-  border-bottom-color: #c7c7c7;
+  border-bottom-color: var(--accent-blue, #61afef);
+  background: rgba(97, 175, 239, 0.1);
   font-weight: 500;
 }
 
@@ -3943,6 +3949,11 @@ body.terminal-split-resizing-vertical .terminal-split-horizontal > .terminal-spl
 
 .terminal-drop-preview.replace::after {
   content: '释放后加入当前 pane';
+}
+
+.terminal-drop-preview.tabbar {
+  inset: 0;
+  background: rgba(97, 175, 239, 0.28);
 }
 
 .terminal-workspace-drop-preview {
@@ -5082,7 +5093,6 @@ body.connection-reordering {
 
 /* Tab bars & small scroll areas — narrower scrollbar */
 .editor-tabs::-webkit-scrollbar,
-.workspace-tabs::-webkit-scrollbar,
 .side-panel-content::-webkit-scrollbar {
   height: 3px;
   width: 3px;
@@ -7746,6 +7756,23 @@ body.has-ai-settings-window .ssh-workbench > :not(.ai-settings-backdrop):not(.di
   background: #000;
 }
 
+/* RDP 文件/目录发送状态 */
+.rdp-file-drop-message {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  z-index: 4;
+  max-width: calc(100% - 32px);
+  padding: 7px 12px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.82);
+  background: rgba(0, 0, 0, 0.76);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
 .rdp-toolbar {
   position: absolute;
   top: 8px;
@@ -7781,6 +7808,30 @@ body.has-ai-settings-window .ssh-workbench > :not(.ai-settings-backdrop):not(.di
   border: 1px solid var(--border, #444);
   border-radius: 4px;
   cursor: pointer;
+}
+
+.rdp-file-send-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 24px;
+  padding: 2px 7px;
+  font-size: 12px;
+  color: var(--text-primary, #fff);
+  background: var(--bg-secondary, #222);
+  border: 1px solid var(--border, #444);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.rdp-file-send-button:hover:not(:disabled) {
+  border-color: var(--accent-blue, #4d8dff);
+  background: rgba(77, 141, 255, 0.18);
+}
+
+.rdp-file-send-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .rdp-disconnect {

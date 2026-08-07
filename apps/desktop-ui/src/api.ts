@@ -1,4 +1,5 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
+import { LogicalPosition } from '@tauri-apps/api/dpi';
 import {
   readText as readNativeClipboardText,
   writeText as writeNativeClipboardText,
@@ -41,10 +42,21 @@ async function focusConnectionWindow(
   await win.setFocus();
 }
 
+async function moveWindowToParentCenter(
+  win: { setPosition: (position: LogicalPosition) => Promise<void> },
+  width: number,
+  height: number,
+) {
+  const position = await resolveParentCenteredPosition(width, height);
+  if (typeof position.x === 'number' && typeof position.y === 'number') {
+    await win.setPosition(new LogicalPosition(position.x, position.y)).catch(() => undefined);
+  }
+}
+
 async function resolveParentCenteredPosition(width: number, height: number) {
   try {
-    const { getCurrentWebviewWindow } = await getWebviewWindowApi();
-    const parent = getCurrentWebviewWindow();
+    const { WebviewWindow, getCurrentWebviewWindow } = await getWebviewWindowApi();
+    const parent = await WebviewWindow.getByLabel('main') ?? getCurrentWebviewWindow();
     const [scale, parentPos, parentSize] = await Promise.all([
       parent.scaleFactor(),
       parent.outerPosition(),
@@ -67,8 +79,6 @@ export function preloadConnectionWindows() {
     void getWebviewWindowApi();
     void import('./ConnectionWindow');
     void import('./AiSettingsWindow');
-    void warmConnectionWindow('manage').catch(() => undefined);
-    void warmAiSettingsWindow().catch(() => undefined);
   };
   if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
     window.requestIdleCallback(() => run(), { timeout: 2500 });
@@ -77,59 +87,21 @@ export function preloadConnectionWindows() {
   globalThis.setTimeout(run, 1800);
 }
 
-async function warmConnectionWindow(mode: ConnectionWindowMode) {
-  const { WebviewWindow } = await getWebviewWindowApi();
-  const label = connectionWindowLabel(mode);
-  if (await WebviewWindow.getByLabel(label)) return;
-
-  const creatingKey = mode === 'create' ? '__pandatermConnCreateWarm' : '__pandatermConnManageWarm';
-  const globalAny = globalThis as typeof globalThis & { [key: string]: Promise<void> | undefined };
-  if (globalAny[creatingKey]) {
-    await globalAny[creatingKey];
-    return;
-  }
-
-  const windowOpts =
-    mode === 'create'
-      ? { width: 640, height: 520, minWidth: 520, minHeight: 420 }
-      : { width: 880, height: 560, minWidth: 720, minHeight: 480 };
-
-  globalAny[creatingKey] = (async () => {
-    const position = await resolveParentCenteredPosition(windowOpts.width, windowOpts.height);
-    // warm=1：页面不主动 show，保持隐藏挂起
-    new WebviewWindow(label, {
-      url: connectionWindowUrl(mode, true),
-      title: mode === 'create' ? '新建连接 — PandaTerm' : '连接管理 — PandaTerm',
-      ...windowOpts,
-      ...('x' in position ? position : { center: true }),
-      resizable: true,
-      decorations: false,
-      transparent: false,
-      visible: false,
-      backgroundColor: '#1e2227',
-    });
-  })();
-
-  try {
-    await globalAny[creatingKey];
-  } finally {
-    globalAny[creatingKey] = undefined;
-  }
-}
-
 export async function openConnectionWindow(mode: ConnectionWindowMode) {
   const { WebviewWindow } = await getWebviewWindowApi();
   const label = connectionWindowLabel(mode);
-  const warmKey = mode === 'create' ? '__pandatermConnCreateWarm' : '__pandatermConnManageWarm';
   const creatingKey = mode === 'create' ? '__pandatermConnCreateCreating' : '__pandatermConnManageCreating';
   const globalAny = globalThis as typeof globalThis & { [key: string]: Promise<void> | undefined };
+  const windowSize = mode === 'create'
+    ? { width: 640, height: 520 }
+    : { width: 880, height: 560 };
 
-  // 等待预热/创建中的实例，避免并发双开
-  if (globalAny[warmKey]) await globalAny[warmKey].catch(() => undefined);
+  // 点击时创建连接窗口，避免复用启动阶段位于旧显示器的隐藏窗口
   if (globalAny[creatingKey]) {
     await globalAny[creatingKey].catch(() => undefined);
     const retryAfterCreate = await WebviewWindow.getByLabel(label);
     if (retryAfterCreate) {
+      await moveWindowToParentCenter(retryAfterCreate, windowSize.width, windowSize.height);
       await focusConnectionWindow(retryAfterCreate, mode, label);
       return;
     }
@@ -137,6 +109,7 @@ export async function openConnectionWindow(mode: ConnectionWindowMode) {
 
   const existing = await WebviewWindow.getByLabel(label);
   if (existing) {
+    await moveWindowToParentCenter(existing, windowSize.width, windowSize.height);
     await focusConnectionWindow(existing, mode, label);
     return;
   }
@@ -186,15 +159,14 @@ export async function openConnectionWindow(mode: ConnectionWindowMode) {
 export async function openAiSettingsWindow(tab: 'models' | 'mcp' = 'models') {
   const { WebviewWindow } = await getWebviewWindowApi();
   const label = 'ai-settings';
-  const warmKey = '__pandatermAiSettingsWarm';
   const creatingKey = '__pandatermAiSettingsCreating';
   const globalAny = globalThis as typeof globalThis & { [key: string]: Promise<void> | undefined };
 
-  if (globalAny[warmKey]) await globalAny[warmKey].catch(() => undefined);
   if (globalAny[creatingKey]) {
     await globalAny[creatingKey].catch(() => undefined);
     const retryAfterCreate = await WebviewWindow.getByLabel(label);
     if (retryAfterCreate) {
+      await moveWindowToParentCenter(retryAfterCreate, 980, 700);
       await focusAiSettingsWindow(retryAfterCreate, tab);
       return;
     }
@@ -202,6 +174,7 @@ export async function openAiSettingsWindow(tab: 'models' | 'mcp' = 'models') {
 
   const existing = await WebviewWindow.getByLabel(label);
   if (existing) {
+    await moveWindowToParentCenter(existing, 980, 700);
     await focusAiSettingsWindow(existing, tab);
     return;
   }
@@ -261,41 +234,6 @@ function aiSettingsWindowUrl(tab: 'models' | 'mcp', warm = false) {
   return import.meta.env.DEV
     ? `http://localhost:1420?${query}`
     : `index.html?${query}`;
-}
-
-async function warmAiSettingsWindow() {
-  const { WebviewWindow } = await getWebviewWindowApi();
-  const label = 'ai-settings';
-  if (await WebviewWindow.getByLabel(label)) return;
-
-  const warmKey = '__pandatermAiSettingsWarm';
-  const globalAny = globalThis as typeof globalThis & { [key: string]: Promise<void> | undefined };
-  if (globalAny[warmKey]) {
-    await globalAny[warmKey];
-    return;
-  }
-
-  const windowOpts = { width: 980, height: 700, minWidth: 760, minHeight: 520 };
-  globalAny[warmKey] = (async () => {
-    const position = await resolveParentCenteredPosition(windowOpts.width, windowOpts.height);
-    new WebviewWindow(label, {
-      url: aiSettingsWindowUrl('models', true),
-      title: 'AI 设置 — PandaTerm',
-      ...windowOpts,
-      ...('x' in position ? position : { center: true }),
-      resizable: true,
-      decorations: false,
-      transparent: false,
-      visible: false,
-      backgroundColor: '#1D2025',
-    });
-  })();
-
-  try {
-    await globalAny[warmKey];
-  } finally {
-    globalAny[warmKey] = undefined;
-  }
 }
 
 export type AuthType =
@@ -902,7 +840,8 @@ export type RdpInputEvent =
   | { kind: 'unicode'; ch: string; pressed: boolean }
   | { kind: 'releaseAll' }
   | { kind: 'resize'; width: number; height: number }
-  | { kind: 'clipboard'; text: string };
+  | { kind: 'clipboard'; text: string }
+  | { kind: 'fileDrop'; paths: string[] };
 
 export async function rdpInput(terminalId: string, event: RdpInputEvent): Promise<void> {
   await invoke('rdp_input', { terminalId, event });

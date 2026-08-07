@@ -38,6 +38,7 @@ x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 native-tls = "0.2.18"
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 sha2 = "0.10"
+tauri-plugin-dialog = "2.7.2"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

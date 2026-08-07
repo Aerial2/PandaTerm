@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { Channel } from '@tauri-apps/api/core';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { rdpConnect, rdpDisconnect, rdpInputBatch } from './api';
 import type { RdpInputEvent, RdpQuality } from './api';
-import { Volume2, VolumeX } from 'lucide-react';
+import { FileUp, FolderUp, Volume2, VolumeX } from 'lucide-react';
 import { codeToScancode } from './scancode';
 
 // 帧二进制协议常量：必须与后端 src-tauri/src/rdp.rs 完全一致（多字节小端）。
@@ -381,6 +382,7 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
   const [reconnectNonce, setReconnectNonce] = useState(0);
   const [resolution, setResolution] = useState<RdpResolution>('adaptive');
   const [quality, setQuality] = useState<RdpQuality>('hd');
+  const [fileDropMessage, setFileDropMessage] = useState('');
   const [volume, setVolume] = useState<number>(() => {
     const raw = Number(localStorage.getItem('pandaterm.rdpVolume'));
     return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : 1;
@@ -665,6 +667,49 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
     };
   }, [sessionId, terminalId, reconnectNonce, resolution, quality]);
 
+  const sendFilePaths = (paths: string[]) => {
+    const acceptedPaths = paths.filter(Boolean).slice(0, 256);
+    if (status !== 'connected' || acceptedPaths.length === 0) return;
+
+    canvasRef.current?.focus();
+    const pasteEvents: RdpInputEvent[] = [{ kind: 'fileDrop', paths: acceptedPaths }];
+    const ctrl = codeToScancode('ControlLeft');
+    const keyV = codeToScancode('KeyV');
+    if (ctrl !== undefined && keyV !== undefined) {
+      pasteEvents.push(
+        { kind: 'key', scancode: ctrl, pressed: true },
+        { kind: 'key', scancode: keyV, pressed: true },
+        { kind: 'key', scancode: keyV, pressed: false },
+        { kind: 'key', scancode: ctrl, pressed: false },
+      );
+    }
+    setFileDropMessage(`正在传输 ${acceptedPaths.length} 个所选项目到远程当前焦点位置`);
+    void rdpInputBatch(terminalId, pasteEvents)
+      .then(() => window.setTimeout(() => setFileDropMessage(''), 2500))
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        setFileDropMessage(`文件传输失败：${message}`);
+        onErrorRef.current?.(message);
+      });
+  };
+
+  const chooseRemotePaths = async (directory: boolean) => {
+    if (status !== 'connected') return;
+    try {
+      const selected = await openFileDialog({
+        multiple: true,
+        directory,
+        title: directory ? '选择要发送到远程桌面的目录' : '选择要发送到远程桌面的文件（可多选）',
+      });
+      const paths = selected === null ? [] : Array.isArray(selected) ? selected : [selected];
+      sendFilePaths(paths);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setFileDropMessage(`选择${directory ? '目录' : '文件'}失败：${message}`);
+      onErrorRef.current?.(message);
+    }
+  };
+
   return (
     <div className="rdp-view" ref={containerRef}>
       <canvas
@@ -690,6 +735,26 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
             ))}
           </select>
         </label>
+        <button
+          type="button"
+          className="rdp-file-send-button"
+          title="选择一个或多个文件发送到远程桌面"
+          onClick={() => void chooseRemotePaths(false)}
+          disabled={status !== 'connected'}
+        >
+          <FileUp size={15} />
+          发送文件
+        </button>
+        <button
+          type="button"
+          className="rdp-file-send-button"
+          title="选择目录并保留目录结构发送到远程桌面"
+          onClick={() => void chooseRemotePaths(true)}
+          disabled={status !== 'connected'}
+        >
+          <FolderUp size={15} />
+          发送目录
+        </button>
         <div className="rdp-volume">
           <button
             type="button"
@@ -715,6 +780,9 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
           />
         </div>
       </div>
+      {fileDropMessage && (
+        <div className="rdp-file-drop-message">{fileDropMessage}</div>
+      )}
       {status !== 'connected' && (
         <div className="rdp-overlay">
           {status === 'connecting' && <span>正在连接远程桌面…</span>}
