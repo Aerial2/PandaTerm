@@ -2924,6 +2924,7 @@ export function App() {
   }
 
   function handleFileClick(event: React.MouseEvent, file: ResourceFile, index: number) {
+    (event.currentTarget as HTMLElement).focus();
     const ctrl = event.ctrlKey || event.metaKey; // metaKey for macOS
     const shift = event.shiftKey;
     const plainClick = !ctrl && !shift;
@@ -2987,6 +2988,9 @@ export function App() {
   }
 
   function handleResourceKeyDown(event: React.KeyboardEvent) {
+    const target = event.target as HTMLElement;
+    if (target.closest('input, textarea, button, select, [contenteditable="true"]')) return;
+
     const ctrl = event.ctrlKey || event.metaKey;
     const selectedItems = getSelectedResourceFiles();
 
@@ -4987,17 +4991,6 @@ export function App() {
     beginAiGeneration(conversation, [...baseMessages, userMessage], userMessage);
   }
 
-  function addAiTerminalOutputContext(action: AiTerminalAction) {
-    if (action.status !== 'completed') return;
-    const output = action.output?.trim() || '命令未产生输出';
-    addPendingAiContext({
-      kind: 'terminal',
-      label: `命令输出：${action.summary}`,
-      source: action.id,
-      preview: `command: ${action.command}\nexit_code: ${action.exitCode ?? 'unknown'}\noutput:\n${output.slice(-8000)}`,
-    });
-  }
-
   function continueAgentAfterTerminal(conversationId: string, messageId: string, action: AiTerminalAction) {
     const workspace = aiWorkspaceRef.current;
     if (workspace.activeConversationId !== conversationId || aiActiveRequestRef.current) return;
@@ -6380,8 +6373,6 @@ export function App() {
         <aside
           className={`file-panel${isDragOver ? ' is-drag-over' : ''}`}
           style={{ gridTemplateRows: '42px auto minmax(0, 1fr)' }}
-          tabIndex={0}
-          onKeyDown={handleResourceKeyDown}
           onDragEnter={handleDragEnter}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
@@ -6535,6 +6526,8 @@ export function App() {
                 </div>
                 <div
                   className="file-list-body"
+                  tabIndex={0}
+                  onKeyDown={handleResourceKeyDown}
                   onContextMenu={handleBlankContextMenu}
                   onClick={(event) => {
                     if (event.target !== event.currentTarget) return;
@@ -6808,18 +6801,7 @@ export function App() {
                 const isUser = message.role === 'user';
                 const isEditingUser = isUser && editingUserMessageId === message.id;
                 const isContinuation = isUser && isAiAgentContinuationMessage(message);
-                if (isContinuation && !isEditingUser) {
-                  const label = message.contexts.find((c) => c.label.startsWith(AI_AGENT_RESULT_LABEL_PREFIX))?.label
-                    || '工具结果已回传';
-                  return (
-                    <article key={message.id} className="ai-message user continuation">
-                      <div className="ai-agent-continuation" title={message.content}>
-                        <span className="ai-agent-continuation-badge">续跑</span>
-                        <span className="ai-agent-continuation-text">{label}</span>
-                      </div>
-                    </article>
-                  );
-                }
+                if (isContinuation) return null;
                 return (
                 <article key={message.id} className={`ai-message ${message.role} ${message.status}${isEditingUser ? ' editing' : ''}`}>
                   <div className="ai-message-body">
@@ -7010,7 +6992,6 @@ export function App() {
                               {activeAiConversation?.mode === 'agent' && !action.continued && !canContinueAiAgent(activeAiConversation) && (
                                 <span>已达到单次任务 {AI_AGENT_MAX_CONTINUATIONS} 步上限，结果未回传</span>
                               )}
-                              {action.continued && <span>结果已自动发送</span>}
                             </>
                           )}
                           {action.status === 'rejected' && <span>已拒绝</span>}
@@ -7060,7 +7041,6 @@ export function App() {
                                   onClick={() => continueAgentAfterMcp(activeAiConversation.id, message.id, action)}
                                 >继续 Agent</button>
                               )}
-                              {action.continued && <span>结果已自动发送</span>}
                               {activeAiConversation?.mode === 'agent' && !action.continued && !canContinueAiAgent(activeAiConversation) && (
                                 <span>已达到单次任务 {AI_AGENT_MAX_CONTINUATIONS} 步上限，结果未回传</span>
                               )}
@@ -7070,18 +7050,6 @@ export function App() {
                         </div>
                       </section>
                     ))}
-                    {message.role === 'assistant' && message.status !== 'streaming' && (
-                      <div className="ai-message-actions">
-                        <button
-                          type="button"
-                          title="重新生成"
-                          disabled={isAiGenerating}
-                          onClick={() => regenerateAiMessage(message.id)}
-                        >
-                          <RotateCcw size={12} />重新生成
-                        </button>
-                      </div>
-                    )}
                   </div>
                 </article>
                 );
