@@ -1,4 +1,4 @@
-﻿//! Local shell + PTY domain: shell name/prompt derivation, one-shot command
+//! Local shell + PTY domain: shell name/prompt derivation, one-shot command
 //! execution (PowerShell on Windows, zsh/bash on Unix) and interactive PTY
 //! command/size construction. Pure of app State; used by the local terminal commands.
 
@@ -9,6 +9,8 @@ use tokio::process::Command;
 
 use crate::local_fs::format_path;
 use crate::shell_text::{decode_shell_text, shell_cwd_marker, split_shell_output};
+
+const WINDOWS_CONDA_HOOK: &str = r#"$env:PYTHONIOENCODING = 'utf-8'; $condaHook = (& conda shell.powershell hook 2>$null | Out-String); if (-not [string]::IsNullOrWhiteSpace($condaHook)) { Invoke-Expression $condaHook }"#;
 
 pub(crate) fn local_shell_name() -> &'static str {
     if cfg!(target_os = "windows") {
@@ -48,7 +50,8 @@ async fn run_windows_shell_command(
     cwd: &Path,
 ) -> Result<(String, Option<String>, bool), String> {
     let script = format!(
-        "& {{ param([string]$workingDirectory, [string]$userCommand) Set-Location -LiteralPath $workingDirectory; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); Invoke-Expression $userCommand; $exitCode = if ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 0 }}; Write-Output ('{}' + (Get-Location).Path); exit $exitCode }}",
+        "& {{ param([string]$workingDirectory, [string]$userCommand) Set-Location -LiteralPath $workingDirectory; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); {}; Invoke-Expression $userCommand; $exitCode = if ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 0 }}; Write-Output ('{}' + (Get-Location).Path); exit $exitCode }}",
+        WINDOWS_CONDA_HOOK,
         shell_cwd_marker()
     );
 
@@ -129,8 +132,13 @@ pub(crate) fn local_pty_command(cwd: &Path) -> CommandBuilder {
         command.arg("-NoLogo");
         command.arg("-NoExit");
         command.arg("-NoProfile");
+        command.arg("-ExecutionPolicy");
+        command.arg("Bypass");
         command.arg("-Command");
-        command.arg(r#"[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); function global:prompt { "PS $($PWD.Path)>" }"#);
+        command.arg(format!(
+            r#"[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); {}; function global:prompt {{ "$(if ($env:CONDA_PROMPT_MODIFIER) {{ $env:CONDA_PROMPT_MODIFIER }})PS $($PWD.Path)>" }}"#,
+            WINDOWS_CONDA_HOOK
+        ));
         command.cwd(cwd);
         command
     } else {
