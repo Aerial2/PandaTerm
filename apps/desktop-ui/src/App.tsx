@@ -6223,9 +6223,9 @@ export function App() {
     if (!paneTab) return null;
     const isActivePane = node.tabId === activePaneId;
     const isWorkspacePane = activeTab ? paneTabIds.includes(activeTab.id) : false;
-    // pane tabbar 始终显示；workspace chips 固定在 workspace root 所在 pane，避免切换分屏焦点时整组标签跟着移动。
-    // 每个 pane 都保留自己的 leaf tabs 和新建按钮；编辑器内容也与 workspace root 保持同一 pane。
-    const showWorkspaceChips = isWorkspacePane;
+    // 编辑器打开时，当前活动 pane 仍是编辑器标签栏的承载 pane。
+    // 不再只依赖 workspace root tab，避免本地编辑器切换后 root 判断短暂失配导致 tabs 消失。
+    const showWorkspaceChips = isWorkspacePane || (showEditor && activePaneId === node.tabId);
 
     return (
       <section
@@ -6238,7 +6238,7 @@ export function App() {
             for (const tabId of paneTabIds) terminalPaneRefs.current.delete(tabId);
           }
         }}
-        className={`${isActivePane ? 'terminal-split-pane active' : 'terminal-split-pane'} has-tabbar${showEditor && isWorkspacePane ? ' is-editor' : ''}${getPaneDropClass(node.tabId)}`}
+        className={`${isActivePane ? 'terminal-split-pane active' : 'terminal-split-pane'} has-tabbar${showEditor && showWorkspaceChips ? ' is-editor' : ''}${getPaneDropClass(node.tabId)}`}
         onMouseDown={() => {
           if (showEditor) return;
           focusTerminalPane(node.tabId);
@@ -6287,7 +6287,7 @@ export function App() {
                 <span>{paneTab.statusMessage || '等待终端就绪...'}</span>
               </div>
             )}
-            {isWorkspacePane && (
+            {showWorkspaceChips && (
               <div className={`terminal-pane-editor-host${showEditor ? '' : ' is-hidden'}`}>
                 <EditorPanel
                   tabs={editorTabs}
