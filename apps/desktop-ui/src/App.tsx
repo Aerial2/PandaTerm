@@ -182,7 +182,9 @@ import { useUploadConflict } from './useUploadConflict';
 import { RdpView } from './RdpView';
 import {
   applyTerminalLifecycleState,
+  reconnectDelayMs,
   shouldApplyTerminalStatus,
+  shouldReconnect,
   terminalLifecycleMessage,
 } from './terminalLifecycle';
 import {
@@ -657,6 +659,7 @@ export function App() {
   const lastPaneTabClickRef = useRef<{ tabId: string; at: number } | null>(null);
   const tabsRef = useRef<WorkspaceTab[]>([]);
   const cancelledConnectionTabIdsRef = useRef<Set<string>>(new Set());
+  const reconnectTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   // Track which terminal_ids have been started on the backend to avoid double-start
   const startedTerminalsRef = useRef<Set<string>>(new Set());
   // Map backend terminal_id → tab id, set immediately when startLocalTerminal resolves.
@@ -810,6 +813,39 @@ export function App() {
     }
   }
 
+  function scheduleTerminalReconnect(tabId: string) {
+    const tab = tabsRef.current.find((item) => item.id === tabId);
+    if (!tab || tab.kind !== 'terminal' || tab.closedByUser || !tab.terminalId) return;
+    if (!shouldReconnect(tab.status, tab.session.reconnect, false, tab.reconnectAttempts)) return;
+    if (reconnectTimersRef.current.has(tabId)) return;
+
+    const attempt = tab.reconnectAttempts + 1;
+    const delay = reconnectDelayMs(tab.session.reconnect, tab.reconnectAttempts);
+    setTabs((current) => current.map((item) => item.id === tabId
+      ? {
+        ...item,
+        status: 'reconnecting',
+        reconnectAttempts: attempt,
+        statusMessage: `连接已断开，${delay / 1000} 秒后重连（${attempt}/${tab.session.reconnect.max_attempts}）`,
+      }
+      : item));
+
+    const timer = setTimeout(() => {
+      reconnectTimersRef.current.delete(tabId);
+      const current = tabsRef.current.find((item) => item.id === tabId);
+      if (!current || current.closedByUser || !current.terminalId) return;
+      void connectSession(current.session.id, current.terminalId).catch((error) => {
+        applyTerminalStatusToTab({
+          terminal_id: current.terminalId,
+          transport: 'remote',
+          state: 'failed',
+          reason: error instanceof Error ? error.message : String(error),
+        }, tabId);
+      });
+    }, delay);
+    reconnectTimersRef.current.set(tabId, timer);
+  }
+
   function applyTerminalStatusToTab(event: TerminalStatusEvent, tabId: string) {
     const message = terminalLifecycleMessage(event);
     const sessionName = tabsRef.current.find((item) => item.id === tabId)?.session.name
@@ -833,6 +869,13 @@ export function App() {
 
     setOpeningConnection((current) => current?.tabId === tabId ? null : current);
     setStatusMessage(`${event.state === 'failed' ? '连接失败' : message}：${sessionName}`);
+    if (event.transport === 'remote' && (event.state === 'failed' || event.state === 'disconnected')) {
+      scheduleTerminalReconnect(tabId);
+    }
+    if (event.state === 'connected') {
+      reconnectTimersRef.current.delete(tabId);
+      setTabs((current) => current.map((item) => item.id === tabId ? { ...item, reconnectAttempts: 0 } : item));
+    }
   }
 
   function consumePendingTerminalStatus(terminalId: string, tabId: string) {
@@ -872,6 +915,11 @@ export function App() {
   }
 
   function disposeTerminalRuntime(tab: WorkspaceTab) {
+    const reconnectTimer = reconnectTimersRef.current.get(tab.id);
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimersRef.current.delete(tab.id);
+    }
     setPendingTerminalPaste((current) => current?.tabId === tab.id ? null : current);
     setTerminalContextMenu((current) => current?.tabId === tab.id ? null : current);
     terminalPasteInFlightRef.current.delete(tab.id);

@@ -91,7 +91,9 @@ pub struct SessionCatalog {
 
 impl SessionCatalog {
     pub fn new(sessions: Vec<Session>) -> Self {
-        Self { sessions }
+        Self {
+            sessions: sessions.into_iter().map(normalize_session_metadata).collect(),
+        }
     }
 
     pub fn all(&self) -> &[Session] {
@@ -120,6 +122,7 @@ impl SessionCatalog {
     }
 
     pub fn upsert(&mut self, session: Session) -> SessionResult<()> {
+        let session = normalize_session_metadata(session);
         validate_session(&session)?;
 
         if let Some(existing) = self.sessions.iter_mut().find(|item| item.id == session.id) {
@@ -163,6 +166,22 @@ impl SessionCatalog {
     }
 }
 
+pub fn normalize_session_metadata(mut session: Session) -> Session {
+    session.group = session.group.trim().to_string();
+    if session.group.is_empty() {
+        session.group = "Custom".into();
+    }
+    let mut tags = Vec::with_capacity(session.tags.len());
+    for tag in session.tags {
+        let normalized = tag.trim().to_string();
+        if !normalized.is_empty() && !tags.contains(&normalized) {
+            tags.push(normalized);
+        }
+    }
+    session.tags = tags;
+    session
+}
+
 pub fn validate_session(session: &Session) -> SessionResult<()> {
     if session.name.trim().is_empty() {
         return Err(SessionError::Validation("name is required".into()));
@@ -179,6 +198,45 @@ pub fn validate_session(session: &Session) -> SessionResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_session(id: Uuid, group: &str, tags: &[&str]) -> Session {
+        Session {
+            id,
+            name: "node".into(),
+            group: group.into(),
+            protocol: Protocol::Ssh,
+            host: "example.test".into(),
+            port: 22,
+            username: "root".into(),
+            domain: None,
+            auth: AuthType::Agent,
+            tags: tags.iter().map(|tag| (*tag).into()).collect(),
+            last_connected_at: None,
+            reconnect: ReconnectPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn upsert_normalizes_metadata() {
+        let id = Uuid::new_v4();
+        let mut catalog = SessionCatalog::default();
+        catalog.upsert(make_session(id, "  ", &[" linux ", "", "linux"])).unwrap();
+        assert_eq!(catalog.all()[0].group, "Custom");
+        assert_eq!(catalog.all()[0].tags, vec!["linux"]);
+    }
+
+    #[test]
+    fn search_includes_group_and_tags() {
+        let session = make_session(Uuid::new_v4(), "Production", &["critical"]);
+        let catalog = SessionCatalog::new(vec![session]);
+        assert_eq!(catalog.search("critical").len(), 1);
+        assert_eq!(catalog.search("production").len(), 1);
+    }
 }
 
 pub fn demo_sessions() -> Vec<Session> {

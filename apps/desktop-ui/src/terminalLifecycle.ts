@@ -14,17 +14,39 @@ export type TerminalRuntimeStatus =
   | 'disconnected'
   | 'closed';
 
+export type ReconnectPolicy = {
+  enabled: boolean;
+  max_attempts: number;
+  delay_ms: number;
+};
+
+export function shouldReconnect(
+  current: TerminalRuntimeStatus,
+  policy: ReconnectPolicy,
+  manuallyClosed: boolean,
+  attempt: number,
+): boolean {
+  return !manuallyClosed
+    && policy.enabled
+    && current !== 'closed'
+    && attempt < Math.max(0, policy.max_attempts);
+}
+
+export function reconnectDelayMs(policy: ReconnectPolicy, attempt: number): number {
+  const base = Math.max(0, policy.delay_ms);
+  const exponent = Math.max(0, Math.min(attempt, 6));
+  return Math.min(base * (2 ** exponent), 60_000);
+}
+
 export function applyTerminalLifecycleState(
   current: TerminalRuntimeStatus,
   next: TerminalLifecycleState,
 ): TerminalRuntimeStatus {
   if (current === 'closed') return current;
 
-  if (next === 'connected') {
-    return current === 'failed' ? current : 'connected';
-  }
+  if (next === 'connected') return current === 'failed' ? current : 'connected';
   if (next === 'failed') return 'failed';
-  return current === 'failed' ? current : 'disconnected';
+  return current === 'failed' ? 'failed' : 'disconnected';
 }
 
 export function shouldApplyTerminalStatus(

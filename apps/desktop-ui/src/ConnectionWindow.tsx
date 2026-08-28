@@ -25,6 +25,14 @@ import {
 } from './api';
 import type { CredentialStatus, Session, AuthType, Protocol } from './api';
 import { SelectDropdown, type SelectOption } from './SelectDropdown';
+import {
+  filterSessions,
+  normalizeSessionMetadata,
+  selectVisibleSessions,
+  sessionGroups,
+  sessionTags,
+  toggleSessionSelection,
+} from './sessionModel';
 import './styles.css';
 
 type ConnectionAuthMethod = 'password' | 'public_key' | 'keyboard_interactive' | 'gssapi';
@@ -69,6 +77,8 @@ type ConnectionFormState = {
   host: string;
   username: string;
   port: string;
+  group: string;
+  tags: string;
   password: string;
   privateKeyPath: string;
   privateKeyPassphrase: string;
@@ -82,6 +92,8 @@ const initialConnectionForm: ConnectionFormState = {
   host: '',
   username: '',
   port: '22',
+  group: 'Custom',
+  tags: 'custom',
   password: '',
   privateKeyPath: '',
   privateKeyPassphrase: '',
@@ -108,7 +120,10 @@ export function ConnectionWindow() {
   const [mode, setMode] = useState<ConnectionWindowMode>(initialWindowMode);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
   const [connectionSearchQuery, setConnectionSearchQuery] = useState('');
+  const [connectionGroupFilter, setConnectionGroupFilter] = useState('');
+  const [connectionTagFilter, setConnectionTagFilter] = useState('');
   const [connectionAuthMethod, setConnectionAuthMethod] = useState<ConnectionAuthMethod>('password');
   const [connectionForm, setConnectionForm] = useState<ConnectionFormState>(initialConnectionForm);
   const [connectionFormError, setConnectionFormError] = useState('');
@@ -300,23 +315,50 @@ export function ConnectionWindow() {
 
   async function refreshSessions() {
     setSelectedSessionId(null);
+    setSelectedSessionIds(new Set());
     try {
-      setSessions(await listSessions());
+      setSessions((await listSessions()).map(normalizeSessionMetadata));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setConnectionFormError(`加载连接列表失败：${message}`);
     }
   }
 
-  const filteredSessions = useMemo(() => {
-    const q = connectionSearchQuery.trim().toLowerCase();
-    if (!q) return sessions;
-    return sessions.filter((session) =>
-      session.name.toLowerCase().includes(q)
-      || session.host.toLowerCase().includes(q)
-      || session.username.toLowerCase().includes(q),
-    );
-  }, [sessions, connectionSearchQuery]);
+  const groups = useMemo(() => sessionGroups(sessions), [sessions]);
+  const tags = useMemo(() => sessionTags(sessions), [sessions]);
+  const filteredSessions = useMemo(() => filterSessions(sessions, {
+    query: connectionSearchQuery,
+    group: connectionGroupFilter,
+    tag: connectionTagFilter,
+  }), [sessions, connectionSearchQuery, connectionGroupFilter, connectionTagFilter]);
+
+  async function emitConnectSessions(selected: Session[]) {
+    for (const session of selected) {
+      await emitConnectSession(session, false);
+    }
+    if (selected.length > 0) await handleCloseWindow();
+  }
+
+  async function deleteSelectedSessions() {
+    const selected = sessions.filter((session) => selectedSessionIds.has(session.id));
+    for (const session of selected) {
+      try {
+        const nextSessions = await deleteSession(session.id);
+        setSessions(nextSessions.map(normalizeSessionMetadata));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setConnectionFormError(`批量删除失败：${message}`);
+        break;
+      }
+    }
+    setSelectedSessionIds(new Set());
+    setSelectedSessionId(null);
+    setContextMenu(null);
+    try {
+      const { emit } = await import('@tauri-apps/api/event');
+      await emit('sessions-changed');
+    } catch { /* non-critical */ }
+  }
 
   function loadSessionToForm(session: Session) {
     setEditingId(session.id);
@@ -326,6 +368,8 @@ export function ConnectionWindow() {
       host: session.host,
       username: session.username,
       port: String(session.port),
+      group: session.group,
+      tags: session.tags.join(', '),
       password: '',
       privateKeyPath: session.auth.type === 'private_key' ? session.auth.key_id : '',
       privateKeyPassphrase: '',
@@ -411,14 +455,14 @@ export function ConnectionWindow() {
     const session: Session = {
       id: editingId ?? crypto.randomUUID(),
       name: connectionForm.name.trim(),
-      group: original?.group ?? 'Custom',
+      group: connectionForm.group.trim() || 'Custom',
       protocol: connectionForm.protocol,
       host: connectionForm.host.trim(),
       port: Number(connectionForm.port.trim() || DEFAULT_PORT_BY_PROTOCOL[connectionForm.protocol]),
       username: connectionForm.username.trim(),
       domain: original?.domain ?? null,
       auth: buildConnectionAuth(),
-      tags: original?.tags ?? ['custom', connectionAuthMethod],
+      tags: [...new Set(connectionForm.tags.split(',').map((tag) => tag.trim()).filter(Boolean))],
       last_connected_at: original?.last_connected_at ?? null,
       reconnect: original?.reconnect ?? { enabled: true, max_attempts: 3, delay_ms: 1500 },
     };
@@ -436,7 +480,7 @@ export function ConnectionWindow() {
         ? connectionForm.privateKeyPassphrase
         : null;
       const nextSessions = await saveSession(session, secret, passphrase);
-      setSessions(nextSessions);
+      setSessions(nextSessions.map(normalizeSessionMetadata));
       setConnectionForm(initialConnectionForm);
       setConnectionAuthMethod('password');
       setEditingId(null);
@@ -466,7 +510,12 @@ export function ConnectionWindow() {
   async function deleteConnectionSession(session: Session) {
     try {
       const nextSessions = await deleteSession(session.id);
-      setSessions(nextSessions);
+      setSessions(nextSessions.map(normalizeSessionMetadata));
+      setSelectedSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(session.id);
+        return next;
+      });
       setSelectedSessionId(null);
       setContextMenu(null);
       // Notify other open connection windows to refresh their lists
@@ -557,12 +606,11 @@ export function ConnectionWindow() {
     window.addEventListener('pointerup', onUp);
   }
 
-  async function emitConnectSession(session: Session) {
+  async function emitConnectSession(session: Session, closeWindow = true) {
     try {
       const { emit } = await import('@tauri-apps/api/event');
       await emit('connection-window-connect-session', session);
-      // Auto-close window after connecting
-      await handleCloseWindow();
+      if (closeWindow) await handleCloseWindow();
     } catch (e) {
       console.error('Failed to emit connect session event:', e);
     }
@@ -683,6 +731,14 @@ export function ConnectionWindow() {
                     <LockKeyhole size={14} /><span>锁定</span>
                   </button>
                 )}
+                <button className="connection-toolbar-btn" disabled={selectedSessionIds.size === 0}
+                  title="连接选中的会话" onClick={() => void emitConnectSessions(sessions.filter((session) => selectedSessionIds.has(session.id)))}>
+                  <Server size={14} /><span>批量连接 ({selectedSessionIds.size})</span>
+                </button>
+                <button className="connection-toolbar-btn danger" disabled={selectedSessionIds.size === 0}
+                  title="删除选中的会话" onClick={() => void deleteSelectedSessions()}>
+                  <Trash2 size={14} /><span>批量删除</span>
+                </button>
               </div>
               <div className="connection-search-bar">
                 <Search size={15} />
@@ -697,6 +753,20 @@ export function ConnectionWindow() {
                   </button>
                 )}
               </div>
+              <div className="connection-filter-row">
+                <select value={connectionGroupFilter} onChange={(event) => setConnectionGroupFilter(event.target.value)} aria-label="按分组筛选">
+                  <option value="">全部分组</option>
+                  {groups.map((group) => <option key={group} value={group}>{group}</option>)}
+                </select>
+                <select value={connectionTagFilter} onChange={(event) => setConnectionTagFilter(event.target.value)} aria-label="按标签筛选">
+                  <option value="">全部标签</option>
+                  {tags.map((tag) => <option key={tag} value={tag}>{tag}</option>)}
+                </select>
+                <button className="connection-toolbar-btn" title="全选当前筛选结果"
+                  onClick={() => setSelectedSessionIds((current) => selectVisibleSessions(current, filteredSessions))}>
+                  全选当前结果
+                </button>
+              </div>
             </div>
             {connectionFormError && <div className="connection-form-error">{connectionFormError}</div>}
 
@@ -707,6 +777,12 @@ export function ConnectionWindow() {
                   <thead>
                     <tr>
                       <th className="conn-th-index" style={{ width: `${connColumnWidths.index}%` }}>
+                        <input
+                          type="checkbox"
+                          checked={filteredSessions.length > 0 && filteredSessions.every((session) => selectedSessionIds.has(session.id))}
+                          onChange={() => setSelectedSessionIds((current) => selectVisibleSessions(current, filteredSessions))}
+                          aria-label="全选当前筛选结果"
+                        />
                         #
                         <span className="conn-col-resizer" onPointerDown={(e) => startConnColResize('index', e)} />
                       </th>
@@ -746,8 +822,20 @@ export function ConnectionWindow() {
                         onContextMenu={(e) => handleRowContextMenu(e, session)}
                         onPointerDown={(event) => startConnectionRowDrag(session, event)}
                       >
-                        <td className="conn-td-index">{rowIndex + 1}</td>
-                        <td className="conn-td-name">{session.name}</td>
+                        <td className="conn-td-index">
+                          <input
+                            type="checkbox"
+                            checked={selectedSessionIds.has(session.id)}
+                            onChange={() => setSelectedSessionIds((current) => toggleSessionSelection(current, session.id))}
+                            onClick={(event) => event.stopPropagation()}
+                            aria-label={`选择 ${session.name}`}
+                          />
+                          {rowIndex + 1}
+                        </td>
+                        <td className="conn-td-name">
+                          <strong>{session.name}</strong>
+                          <small>{session.group} {session.tags.length ? ` · ${session.tags.join(', ')}` : ''}</small>
+                        </td>
                         <td className="conn-td-host">{session.host}</td>
                         <td className="conn-td-user">{session.username}</td>
                         <td className="conn-td-protocol">{(session.protocol ?? 'ssh').toUpperCase()}</td>
@@ -826,6 +914,22 @@ export function ConnectionWindow() {
                   value={connectionForm.username}
                   placeholder="root"
                   onChange={(event) => updateConnectionForm('username', event.target.value)}
+                />
+              </label>
+              <label>
+                <span>分组</span>
+                <input
+                  value={connectionForm.group}
+                  placeholder="例如：生产环境"
+                  onChange={(event) => updateConnectionForm('group', event.target.value)}
+                />
+              </label>
+              <label>
+                <span>标签</span>
+                <input
+                  value={connectionForm.tags}
+                  placeholder="用逗号分隔，例如：linux, 核心"
+                  onChange={(event) => updateConnectionForm('tags', event.target.value)}
                 />
               </label>
               <label>

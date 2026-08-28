@@ -3,6 +3,8 @@ import {
   applyTerminalLifecycleState,
   shouldApplyTerminalStatus,
   terminalLifecycleMessage,
+  reconnectDelayMs,
+  shouldReconnect,
   type TerminalStatusEvent,
 } from './terminalLifecycle';
 
@@ -24,6 +26,23 @@ describe('applyTerminalLifecycleState', () => {
 
   it('moves connected terminals to disconnected', () => {
     expect(applyTerminalLifecycleState('connected', 'disconnected')).toBe('disconnected');
+  });
+});
+
+describe('reconnect policy', () => {
+  const policy = { enabled: true, max_attempts: 3, delay_ms: 1500 };
+
+  it('limits attempts and honors manual close', () => {
+    expect(shouldReconnect('disconnected', policy, false, 0)).toBe(true);
+    expect(shouldReconnect('disconnected', policy, false, 3)).toBe(false);
+    expect(shouldReconnect('closed', policy, false, 0)).toBe(false);
+    expect(shouldReconnect('disconnected', policy, true, 0)).toBe(false);
+  });
+
+  it('uses capped exponential delay', () => {
+    expect(reconnectDelayMs(policy, 0)).toBe(1500);
+    expect(reconnectDelayMs(policy, 2)).toBe(6000);
+    expect(reconnectDelayMs({ ...policy, delay_ms: 100000 }, 1)).toBe(60000);
   });
 });
 
