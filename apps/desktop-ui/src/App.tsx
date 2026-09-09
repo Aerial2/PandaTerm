@@ -618,6 +618,8 @@ export function App() {
   const pendingPaneTabIdRef = useRef(pendingPaneTabId);
   pendingPaneTabIdRef.current = pendingPaneTabId;
   const [editorTabs, setEditorTabs] = useState<EditorTab[]>([]);
+  const editorTabsRef = useRef<EditorTab[]>(editorTabs);
+  editorTabsRef.current = editorTabs;
   const [activeEditorTabId, setActiveEditorTabId] = useState<string | null>(null);
   /** 编辑器宿主 pane：编辑器固定在打开它的 pane，不随终端焦点切换而搬家 */
   /** 各 workspace 已知 pane 集合：用于检测 pane 被移除（合并分屏/关终端），把归属它的文件标签改为无归属 */
@@ -1413,6 +1415,26 @@ export function App() {
     return sortDirection === 'asc' ? sorted : sorted.reverse();
   }, [fileSearchQuery, resourceFiles, sortDirection, sortKey]);
 
+  /** 关闭某 workspace 时一并关闭归属其 pane 的文件（未保存内容此时已被确认丢弃） */
+  function closeEditorTabsForWorkspace(paneIds: Set<string>): void {
+    if (paneIds.size === 0) return;
+    const targetIds = editorTabsRef.current
+      .filter((t) => t.hostPaneId && paneIds.has(t.hostPaneId))
+      .map((t) => t.id);
+    if (targetIds.length === 0) return;
+    const targetSet = new Set(targetIds);
+    setEditorTabs((current) => {
+      const next = current.filter((t) => !targetSet.has(t.id));
+      if (activeEditorTabId && targetSet.has(activeEditorTabId)) {
+        const fallback = next.length > 0 ? next[next.length - 1].id : null;
+        setActiveEditorTabId(fallback);
+        if (!fallback) setShowEditor(false);
+      }
+      return next;
+    });
+    for (const id of targetIds) editorSaveGenerationRef.current.delete(id);
+  }
+
   async function closeTab(tab: WorkspaceTab) {
     const currentTabs = tabsRef.current;
     const relatedTabIds = new Set<string>([tab.id]);
@@ -1451,36 +1473,71 @@ export function App() {
       return;
     }
 
-    let expanded = true;
-    while (expanded) {
-      expanded = false;
-      for (const item of currentTabs) {
-        if (item.parentTabId && relatedTabIds.has(item.parentTabId) && !relatedTabIds.has(item.id)) {
-          relatedTabIds.add(item.id);
-          expanded = true;
+    const performWorkspaceClose = () => {
+      let expanded = true;
+      while (expanded) {
+        expanded = false;
+        for (const item of currentTabs) {
+          if (item.parentTabId && relatedTabIds.has(item.parentTabId) && !relatedTabIds.has(item.id)) {
+            relatedTabIds.add(item.id);
+            expanded = true;
+          }
         }
       }
-    }
 
-    for (const relatedTab of currentTabs.filter((item) => relatedTabIds.has(item.id))) {
-      if (relatedTab.kind === 'terminal' && relatedTab.status === 'connecting') {
-        cancelledConnectionTabIdsRef.current.add(relatedTab.id);
+      for (const relatedTab of currentTabs.filter((item) => relatedTabIds.has(item.id))) {
+        if (relatedTab.kind === 'terminal' && relatedTab.status === 'connecting') {
+          cancelledConnectionTabIdsRef.current.add(relatedTab.id);
+        }
+        disposeTerminalRuntime({ ...relatedTab, closedByUser: true, status: 'closed' });
       }
-      disposeTerminalRuntime({ ...relatedTab, closedByUser: true, status: 'closed' });
-    }
 
-    const remainingTabs = currentTabs.filter((item) => !relatedTabIds.has(item.id));
-    setTabs(remainingTabs);
-    setActiveTabId((current) => {
-      if (current && remainingTabs.some((item) => item.id === current)) return current;
-      return remainingTabs.find((item) => !item.parentTabId)?.id ?? null;
-    });
+      const remainingTabs = currentTabs.filter((item) => !relatedTabIds.has(item.id));
+      setTabs(remainingTabs);
+      setActiveTabId((current) => {
+        if (current && remainingTabs.some((item) => item.id === current)) return current;
+        return remainingTabs.find((item) => !item.parentTabId)?.id ?? null;
+      });
+
+      // 该连接里打开的文件一并关闭，避免关闭后变成看不到的孤儿
+      closeEditorTabsForWorkspace(new Set(paneTabIds));
+    };
+
+    // 该连接里有未保存的文件时先确认，防止误关丢失改动
+    const dirtyFileCount = editorTabsRef.current.filter(
+      (t) => t.hostPaneId && paneTabIds.includes(t.hostPaneId) && t.content !== t.originalContent,
+    ).length;
+    if (dirtyFileCount > 0) {
+      requestConfirm({
+        title: '连接含未保存文件',
+        message: `该连接里有 ${dirtyFileCount} 个文件存在未保存的修改。关闭连接将同时关闭它们，未保存内容会丢失。确定关闭吗？`,
+        confirmLabel: '关闭并丢弃更改',
+        danger: true,
+        onConfirm: performWorkspaceClose,
+      });
+      return;
+    }
+    performWorkspaceClose();
   }
 
   function focusTerminalPane(tabId: string) {
     const ownerTab = findTerminalWorkspaceOwner(tabsRef.current, tabId);
     if (!ownerTab) return;
     setShowEditor(false);
+    setActiveTabId(ownerTab.id);
+    setTabs((current) => current.map((item) => {
+      if (item.id !== ownerTab.id) return item;
+      const layout = activateTerminalPaneTab(item.layout ?? createDefaultTerminalLayout(item.id), tabId);
+      return { ...item, layout, activePaneId: tabId };
+    }));
+    scheduleTerminalSettledFit(tabId);
+    focusTerminal(tabId);
+  }
+
+  /** 编辑器视图下点击其它 pane：把焦点切到该终端，但保持编辑器停在宿主 pane（不关编辑器视图） */
+  function focusPaneKeepEditor(tabId: string) {
+    const ownerTab = findTerminalWorkspaceOwner(tabsRef.current, tabId);
+    if (!ownerTab) return;
     setActiveTabId(ownerTab.id);
     setTabs((current) => current.map((item) => {
       if (item.id !== ownerTab.id) return item;
@@ -6359,7 +6416,11 @@ export function App() {
         }}
         className={`${isActivePane ? 'terminal-split-pane active' : 'terminal-split-pane'} has-tabbar${showEditor && showWorkspaceChips ? ' is-editor' : ''}${getPaneDropClass(node.tabId)}`}
         onMouseDown={() => {
-          if (showEditor) return;
+          if (showEditor) {
+            // 编辑器视图下点其它 pane：焦点切过去输入，编辑器留在宿主 pane
+            if (node.tabId !== editorDisplayPaneId) focusPaneKeepEditor(node.tabId);
+            return;
+          }
           focusTerminalPane(node.tabId);
         }}
       >
