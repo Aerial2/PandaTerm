@@ -121,8 +121,8 @@ export function addTransferRecords(
   }));
   emitTransferLog({
     ...transferLogSnapshot,
-    // 不截断：条数上限交给 UI 虚拟列表承担渲染成本
-    transferRecords: [...fulls, ...transferLogSnapshot.transferRecords],
+    // 保留上限：终态记录不自动回收，长期使用会让数组无界增长；截断只影响最老的历史条目
+    transferRecords: [...fulls, ...transferLogSnapshot.transferRecords].slice(0, 500),
   });
   return fulls.map((row) => row.id);
 }

@@ -1986,9 +1986,10 @@ export function App() {
         const tab = tabsRef.current.find((t) => t.id === tabId);
         if (!tab || !tab.terminalId) return;
         if (tab.session.id === localSession.id) {
-          void sendLocalTerminalInput(tab.terminalId, data);
+          // 连接断开瞬间后端会返回 Err：吞掉即可，避免每次按键产生 unhandled rejection
+          void sendLocalTerminalInput(tab.terminalId, data).catch(() => {});
         } else {
-          void terminalWrite(tab.terminalId, data);
+          void terminalWrite(tab.terminalId, data).catch(() => {});
         }
       });
       terminalDataDisposablesRef.current.set(tabId, dataDisposable);
@@ -2407,6 +2408,10 @@ export function App() {
       addLogEntry('info', `开始上传 ${fileList.length} 个文件到 ${targetLabel}：${destDir}`);
     }
 
+    // 提升到函数级作用域，保证 finally 里能统一清理（进度监听与中止表）
+    let progressUnlisten: (() => void) | null = null;
+    let recordIds: string[] = [];
+
     try {
       const fileItems = fileList.map((file, i) => ({
         file,
@@ -2426,7 +2431,7 @@ export function App() {
       // One shared progress listener for all concurrent uploads. It maps each
       // event's transfer_id back to its transfer record and updates progress.
       const speedTrackers = new Map<string, { startTime: number }>();
-      const progressUnlisten = await listen<{
+      progressUnlisten = await listen<{
         transfer_id: string;
         phase: 'transferring' | 'verifying' | 'committing';
         transferred?: number;
@@ -2577,7 +2582,7 @@ export function App() {
           displayFileName: relPath || file.name,
         };
       });
-      const recordIds = addTransferRecords(
+      recordIds = addTransferRecords(
         preparedJobs.map((job) => ({
           fileName: job.displayFileName,
           direction: 'upload' as const,
@@ -2622,7 +2627,6 @@ export function App() {
       for (let w = 0; w < poolSize; w++) workers.push(worker());
       await Promise.all(workers);
 
-      progressUnlisten();
       if (uploaded > 0) {
         setStatusMessage(`已上传 ${uploaded} 个文件到 ${targetLabel}：${destDir}${skipped > 0 ? `，跳过 ${skipped} 个` : ''}`);
         if ((activePaneTabRef.current?.id ?? '__local__') === sourcePaneKey && currentPathRef.current === destDir) {
@@ -2635,6 +2639,9 @@ export function App() {
         setStatusMessage(`部分文件上传失败：${failed}`);
       }
     } finally {
+      // 无论正常结束、并发池抛错还是被取消，都清理本批上传的进度监听与中止表，避免泄漏
+      progressUnlisten?.();
+      for (const rid of recordIds) uploadAbortRefs.current.delete(rid);
       setIsUploading(false);
     }
   }
@@ -3642,11 +3649,21 @@ export function App() {
 
   useEffect(() => {
     if (isAiSettingsWindow) return;
+    // disposed 守卫：避免 cleanup 先于 listen() resolve 时（StrictMode 双挂载/HMR）
+    // 产生无清理的常驻监听
+    let disposed = false;
     let removeListener: (() => void) | null = null;
     void listen('ai-provider-config-changed', () => {
+      if (disposed) return;
       void refreshAiProviderConfig();
-    }).then((remove) => { removeListener = remove; });
-    return () => removeListener?.();
+    }).then((remove) => {
+      if (disposed) { remove(); return; }
+      removeListener = remove;
+    });
+    return () => {
+      disposed = true;
+      removeListener?.();
+    };
   }, []);
 
   useEffect(() => {

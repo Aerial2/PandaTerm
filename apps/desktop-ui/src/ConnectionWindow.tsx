@@ -574,7 +574,7 @@ export function ConnectionWindow() {
 
   function handleCopySessionInfo(session: Session) {
     const info = `${session.name}\t${session.host}\t${session.username}\t${session.port}`;
-    void writeClipboardText(info);
+    void writeClipboardText(info).catch(() => {});
     setContextMenu(null);
   }
 

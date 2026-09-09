@@ -6115,7 +6115,9 @@ fn main() {
 
                 // Apply dark mode DWM attributes to the main window (has native titlebar)
                 if let Some(window) = app.get_webview_window("main") {
-                    let hwnd = window.hwnd().unwrap().0;
+                    // 拿不到原生句柄时跳过深色模式应用，避免启动路径 panic
+                    let Ok(native_hwnd) = window.hwnd() else { return Ok(()); };
+                    let hwnd = native_hwnd.0;
                     let dark_mode: i32 = 1;
                     let bg_color: u32 = 0x0027221e; // #1e2227 BGR
                     let text_color: u32 = 0x00d0c4c2; // #c2c4d0 BGR
