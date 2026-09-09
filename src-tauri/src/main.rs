@@ -2439,7 +2439,9 @@ async fn cancel_transfer(
 
     let cleanup_state = Arc::clone(state.inner());
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(300)).await;
+        // cancel 后 30s 仍未注册的传输视为已放弃；缩短兜底窗口，
+        // 避免多次取消在后台滞留大量 5 分钟才结束的空转清理任务
+        tokio::time::sleep(Duration::from_secs(30)).await;
         discard_unregistered_cancellation(&cleanup_state, &transfer_id, &cancellation).await;
     });
     Ok(())
@@ -3447,8 +3449,18 @@ async fn get_process_list(
         Ok(system_monitor::parse_process_list(&String::from_utf8_lossy(&stdout)))
     } else {
         ensure_local_sys_monitor(&state).await;
-        let mut guard = local_sys_monitor_guard(&state.local_sys_monitor);
-        Ok(system_monitor::collect_local_processes(&mut guard))
+        // 全量进程采集较耗时：放 blocking 线程池执行，避免占 tokio worker 与 SSH 读写争抢
+        let app_state = Arc::clone(state.inner());
+        let processes = tokio::task::spawn_blocking(move || {
+            let mut guard = match app_state.local_sys_monitor.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            system_monitor::collect_local_processes(&mut guard)
+        })
+        .await
+        .map_err(|e| format!("进程采样任务失败：{e}"))?;
+        Ok(processes)
     }
 }
 
@@ -3476,8 +3488,18 @@ async fn get_system_monitor(
         Ok(system_monitor::parse_system_monitor(&String::from_utf8_lossy(&stdout)))
     } else {
         ensure_local_sys_monitor(&state).await;
-        let mut guard = local_sys_monitor_guard(&state.local_sys_monitor);
-        Ok(system_monitor::collect_local_monitor(&mut guard))
+        // 磁盘/网络/进程全量采集较耗时：放 blocking 线程池，避免阻塞 tokio worker
+        let app_state = Arc::clone(state.inner());
+        let data = tokio::task::spawn_blocking(move || {
+            let mut guard = match app_state.local_sys_monitor.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            system_monitor::collect_local_monitor(&mut guard)
+        })
+        .await
+        .map_err(|e| format!("系统监控采样任务失败：{e}"))?;
+        Ok(data)
     }
 }
 
@@ -4510,8 +4532,10 @@ async fn reconnect_mcp_server(
         .find(|item| item.id == server_id)
         .ok_or_else(|| format!("未找到 MCP 服务器：{server_id}"))?
         .clone();
-    // 连接失败仍返回快照，让 UI 展示 error 状态
-    let _ = state.mcp_runtime.connect_server(&server).await;
+    // 连接失败仍返回快照，让 UI 展示 error 状态；失败也要留痕便于排查
+    if let Err(error) = state.mcp_runtime.connect_server(&server).await {
+        eprintln!("[MCP] reconnect failed for {server_id}: {error}");
+    }
     let path = mcp_config_file_path()?
         .to_string_lossy()
         .into_owned();

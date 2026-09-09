@@ -21,16 +21,23 @@ fn load_known_hosts() -> HashMap<String, String> {
     let Ok(path) = known_hosts_path() else {
         return HashMap::new();
     };
-    let Ok(content) = fs::read_to_string(path) else {
+    let Ok(content) = fs::read_to_string(&path) else {
         return HashMap::new();
     };
     match serde_json::from_str(&content) {
         Ok(hosts) => hosts,
         Err(error) => {
-            // 信任库损坏会被静默清零并触发“重新首信”，存在 MITM 窗口，必须留痕
+            // 信任库损坏：留痕并把损坏文件改名备份（可人工恢复），
+            // 避免无感清零后下次连接全部变“首见”重新弹确认
             eprintln!(
-                "[HostKey] WARNING: known_hosts.json is corrupt ({error}); trust store reset"
+                "[HostKey] WARNING: known_hosts.json is corrupt ({error}); backing up and resetting trust store"
             );
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let backup = std::path::PathBuf::from(format!("{}.corrupt-{}", path.display(), ts));
+            let _ = fs::rename(&path, &backup);
             HashMap::new()
         }
     }
