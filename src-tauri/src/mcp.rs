@@ -222,7 +222,26 @@ pub struct McpImportPreview {
 // ── Runtime ─────────────────────────────────────────────────────────────
 
 struct PendingRequest {
-    response_tx: oneshot::Sender<Result<Value, String>>,
+    response_tx: oneshot::Sender<Result<Value, McpCallFailure>>,
+}
+
+/// stdio 请求失败的分类：决定错误处理是“保留会话”还是“重建会话”。
+#[derive(Debug)]
+enum McpCallFailure {
+    /// 传输层损坏（进程退出 / 管道写入失败）：唯一需要杀掉子进程并标记 error 的情形
+    Transport(String),
+    /// 应用层失败（单次调用超时、服务器返回 JSON-RPC error）：
+    /// 会话仍然健康，本次调用直接失败返回即可，不应杀死整个 MCP 进程
+    Application(String),
+}
+
+impl McpCallFailure {
+    fn into_message(self) -> String {
+        match self {
+            McpCallFailure::Transport(message) => message,
+            McpCallFailure::Application(message) => message,
+        }
+    }
 }
 
 struct LiveStdioSession {
@@ -1470,12 +1489,15 @@ impl McpRuntime {
                             let mut pending = reader_pending.lock().await;
                             if let Some(entry) = pending.remove(&id) {
                                 if let Some(error) = message.get("error") {
+                                    // 服务器显式返回 JSON-RPC error：进程仍健康
                                     let text = error
                                         .get("message")
                                         .and_then(Value::as_str)
                                         .unwrap_or("MCP 请求失败")
                                         .to_string();
-                                    let _ = entry.response_tx.send(Err(text));
+                                    let _ = entry
+                                        .response_tx
+                                        .send(Err(McpCallFailure::Application(text)));
                                 } else {
                                     let result = message.get("result").cloned().unwrap_or(Value::Null);
                                     let _ = entry.response_tx.send(Ok(result));
@@ -1488,7 +1510,10 @@ impl McpRuntime {
                         eprintln!("[MCP {}] reader stopped: {error}", reader_server_id);
                         let mut pending = reader_pending.lock().await;
                         for (_, entry) in pending.drain() {
-                            let _ = entry.response_tx.send(Err(error.clone()));
+                            // 读循环终止意味着管道/进程不可用，属传输层故障
+                            let _ = entry
+                                .response_tx
+                                .send(Err(McpCallFailure::Transport(error.clone())));
                         }
                         break;
                     }
@@ -1524,10 +1549,10 @@ impl McpRuntime {
         .await;
         let init_result = match init_result {
             Ok(value) => value,
-            Err(error) => {
+            Err(failure) => {
                 let tail = stderr_tail.lock().await.clone();
                 let _ = live.child.kill().await;
-                return Err(append_mcp_stderr_hint(error, &tail));
+                return Err(append_mcp_stderr_hint(failure.into_message(), &tail));
             }
         };
         let _ = init_result;
@@ -1569,10 +1594,10 @@ impl McpRuntime {
         .await
         {
             Ok(value) => value,
-            Err(error) => {
+            Err(failure) => {
                 let tail = stderr_tail.lock().await.clone();
                 let _ = live.child.kill().await;
-                return Err(append_mcp_stderr_hint(error, &tail));
+                return Err(append_mcp_stderr_hint(failure.into_message(), &tail));
             }
         };
         let tools = parse_tools_list(&tools_result)?;
@@ -1752,7 +1777,7 @@ impl McpRuntime {
                         )
                         .await
                     }
-                    None => Err("MCP 会话未就绪".to_string()),
+                    None => Err(McpCallFailure::Transport("MCP 会话未就绪".to_string())),
                 };
                 let mut sessions = self.sessions.lock().await;
                 if let Some(slot) = sessions.get_mut(&server.id) {
@@ -1761,6 +1786,8 @@ impl McpRuntime {
                 call
             }
             LiveSession::Http(mut http) => {
+                // 远程 HTTP 每次调用独立成请求，保留“出错即重建会话”的既有恢复策略，
+                // 以便服务器重启后换用新 session id 重试。
                 let call = http_jsonrpc_request(
                     &mut http,
                     "tools/call",
@@ -1772,7 +1799,8 @@ impl McpRuntime {
                     false,
                 )
                 .await
-                .and_then(|value| value.ok_or_else(|| "MCP tools/call 无响应".to_string()));
+                .and_then(|value| value.ok_or_else(|| "MCP tools/call 无响应".to_string()))
+                .map_err(McpCallFailure::Transport);
                 let mut sessions = self.sessions.lock().await;
                 if let Some(slot) = sessions.get_mut(&server.id) {
                     slot.live = Some(LiveSession::Http(http));
@@ -1781,19 +1809,25 @@ impl McpRuntime {
             }
         };
 
+        // 只有传输层故障才杀进程、标记 error；应用层失败（单次超时 / 工具返回错误）
+        // 说明会话仍健康，直接把本次调用结果回传，避免一条慢工具拖垮整个 MCP 会话。
+        let transport_failed = matches!(result, Err(McpCallFailure::Transport(_)));
         match result {
             Ok(value) => Ok(parse_tool_call_result(value)),
-            Err(error) => {
-                let mut sessions = self.sessions.lock().await;
-                if let Some(slot) = sessions.get_mut(&server.id) {
-                    slot.status = "error".to_string();
-                    slot.error = Some(error.clone());
-                    if let Some(live) = slot.live.take() {
-                        live.shutdown().await;
+            Err(failure) => {
+                let message = failure.into_message();
+                if transport_failed {
+                    let mut sessions = self.sessions.lock().await;
+                    if let Some(slot) = sessions.get_mut(&server.id) {
+                        slot.status = "error".to_string();
+                        slot.error = Some(message.clone());
+                        if let Some(live) = slot.live.take() {
+                            live.shutdown().await;
+                        }
                     }
+                    self.response_routes.lock().await.remove(&server.id);
                 }
-                self.response_routes.lock().await.remove(&server.id);
-                Err(error)
+                Err(message)
             }
         }
     }
@@ -1987,41 +2021,49 @@ async fn request_on_session(
     method: &str,
     params: Value,
     timeout: Duration,
-) -> Result<Value, String> {
+) -> Result<Value, McpCallFailure> {
     let id = next_id.fetch_add(1, Ordering::SeqCst);
-    let (tx, rx) = oneshot::channel();
-    {
-        let mut pending = pending_map.lock().await;
-        pending.insert(id, PendingRequest { response_tx: tx });
-    }
     let body = json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": method,
         "params": params,
     });
-    let frame = encode_mcp_message(&body)?;
+    // 先编码再登记 pending，避免编码失败时条目泄漏在表中
+    let frame = encode_mcp_message(&body).map_err(McpCallFailure::Transport)?;
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut pending = pending_map.lock().await;
+        pending.insert(id, PendingRequest { response_tx: tx });
+    }
     {
         let mut stdin_guard = stdin.lock().await;
         if let Err(error) = stdin_guard.write_all(&frame).await {
             let mut pending = pending_map.lock().await;
             pending.remove(&id);
-            return Err(format!("MCP 请求写入失败：{error}"));
+            return Err(McpCallFailure::Transport(format!(
+                "MCP 请求写入失败：{error}"
+            )));
         }
         if let Err(error) = stdin_guard.flush().await {
             let mut pending = pending_map.lock().await;
             pending.remove(&id);
-            return Err(format!("MCP 请求写入失败：{error}"));
+            return Err(McpCallFailure::Transport(format!(
+                "MCP 请求写入失败：{error}"
+            )));
         }
     }
 
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("MCP 请求通道已关闭".to_string()),
+        Ok(Err(_)) => Err(McpCallFailure::Transport("MCP 请求通道已关闭".to_string())),
         Err(_) => {
+            // 单次调用超时只让本次请求失败；进程本身可能仍在正常工作
             let mut pending = pending_map.lock().await;
             pending.remove(&id);
-            Err(format!("MCP 请求超时（{method}）"))
+            Err(McpCallFailure::Application(format!(
+                "MCP 请求超时（{method}）"
+            )))
         }
     }
 }

@@ -1,15 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import {
-  Plus,
-  Edit,
-  Trash2,
   Search,
   Server,
   X,
-  Copy,
-  ShieldCheck,
-  LockKeyhole,
 } from 'lucide-react';
 import {
   listSessions,
@@ -28,10 +22,6 @@ import { SelectDropdown, type SelectOption } from './SelectDropdown';
 import {
   filterSessions,
   normalizeSessionMetadata,
-  selectVisibleSessions,
-  sessionGroups,
-  sessionTags,
-  toggleSessionSelection,
 } from './sessionModel';
 import './styles.css';
 
@@ -120,10 +110,7 @@ export function ConnectionWindow() {
   const [mode, setMode] = useState<ConnectionWindowMode>(initialWindowMode);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
   const [connectionSearchQuery, setConnectionSearchQuery] = useState('');
-  const [connectionGroupFilter, setConnectionGroupFilter] = useState('');
-  const [connectionTagFilter, setConnectionTagFilter] = useState('');
   const [connectionAuthMethod, setConnectionAuthMethod] = useState<ConnectionAuthMethod>('password');
   const [connectionForm, setConnectionForm] = useState<ConnectionFormState>(initialConnectionForm);
   const [connectionFormError, setConnectionFormError] = useState('');
@@ -154,7 +141,7 @@ export function ConnectionWindow() {
   type ConnColumnKey = 'index' | 'name' | 'host' | 'user' | 'protocol' | 'port';
   const CONN_COLUMN_ORDER: ConnColumnKey[] = ['index', 'name', 'host', 'user', 'protocol', 'port'];
   const CONN_COLUMN_DEFAULT_WIDTHS: Record<ConnColumnKey, number> = {
-    index: 6, name: 36, host: 19, user: 16, protocol: 10, port: 13,
+    index: 6, name: 36, host: 19, user: 12, protocol: 12, port: 15,
   };
   const CONN_COLUMN_WIDTHS_KEY = 'pandaterm.connColumnWidths';
   // 列宽属于 UI 偏好，用 localStorage 持久化，重开窗口/刷新后无需重新拖动。
@@ -315,7 +302,6 @@ export function ConnectionWindow() {
 
   async function refreshSessions() {
     setSelectedSessionId(null);
-    setSelectedSessionIds(new Set());
     try {
       setSessions((await listSessions()).map(normalizeSessionMetadata));
     } catch (error) {
@@ -324,41 +310,10 @@ export function ConnectionWindow() {
     }
   }
 
-  const groups = useMemo(() => sessionGroups(sessions), [sessions]);
-  const tags = useMemo(() => sessionTags(sessions), [sessions]);
   const filteredSessions = useMemo(() => filterSessions(sessions, {
     query: connectionSearchQuery,
-    group: connectionGroupFilter,
-    tag: connectionTagFilter,
-  }), [sessions, connectionSearchQuery, connectionGroupFilter, connectionTagFilter]);
+  }), [sessions, connectionSearchQuery]);
 
-  async function emitConnectSessions(selected: Session[]) {
-    for (const session of selected) {
-      await emitConnectSession(session, false);
-    }
-    if (selected.length > 0) await handleCloseWindow();
-  }
-
-  async function deleteSelectedSessions() {
-    const selected = sessions.filter((session) => selectedSessionIds.has(session.id));
-    for (const session of selected) {
-      try {
-        const nextSessions = await deleteSession(session.id);
-        setSessions(nextSessions.map(normalizeSessionMetadata));
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        setConnectionFormError(`批量删除失败：${message}`);
-        break;
-      }
-    }
-    setSelectedSessionIds(new Set());
-    setSelectedSessionId(null);
-    setContextMenu(null);
-    try {
-      const { emit } = await import('@tauri-apps/api/event');
-      await emit('sessions-changed');
-    } catch { /* non-critical */ }
-  }
 
   function loadSessionToForm(session: Session) {
     setEditingId(session.id);
@@ -511,11 +466,6 @@ export function ConnectionWindow() {
     try {
       const nextSessions = await deleteSession(session.id);
       setSessions(nextSessions.map(normalizeSessionMetadata));
-      setSelectedSessionIds((current) => {
-        const next = new Set(current);
-        next.delete(session.id);
-        return next;
-      });
       setSelectedSessionId(null);
       setContextMenu(null);
       // Notify other open connection windows to refresh their lists
@@ -699,15 +649,15 @@ export function ConnectionWindow() {
             <div className="connection-manage-toolbar">
               <div className="connection-manage-toolbar-actions">
                 <button className="connection-toolbar-btn" title="新建连接" onClick={() => void openConnectionWindow('create')}>
-                  <Plus size={14} /><span>新建</span>
+                  <span>新建</span>
                 </button>
                 <button className="connection-toolbar-btn" title="编辑连接" disabled={!selectedSessionId}
                   onClick={() => { const s = sessions.find(s => s.id === selectedSessionId); if (s) loadSessionToForm(s); }}>
-                  <Edit size={14} /><span>编辑</span>
+                  <span>编辑</span>
                 </button>
                 <button className="connection-toolbar-btn danger" title="删除连接" disabled={!selectedSessionId}
                   onClick={() => { const s = sessions.find(s => s.id === selectedSessionId); if (s) void deleteConnectionSession(s); }}>
-                  <Trash2 size={14} /><span>删除</span>
+                  <span>删除</span>
                 </button>
                 <button
                   className="connection-toolbar-btn"
@@ -719,7 +669,6 @@ export function ConnectionWindow() {
                   disabled={Boolean(credentialStatus?.error)}
                   onClick={() => void handleCredentialSecurity()}
                 >
-                  <ShieldCheck size={14} />
                   <span>{credentialStatus?.error
                     ? '凭据仓库异常'
                     : credentialStatus?.mode === 'master_password'
@@ -728,17 +677,9 @@ export function ConnectionWindow() {
                 </button>
                 {credentialStatus?.mode === 'master_password' && !credentialStatus.locked && (
                   <button className="connection-toolbar-btn" title="立即锁定凭据" onClick={() => void handleLockCredentials()}>
-                    <LockKeyhole size={14} /><span>锁定</span>
+                    <span>锁定</span>
                   </button>
                 )}
-                <button className="connection-toolbar-btn" disabled={selectedSessionIds.size === 0}
-                  title="连接选中的会话" onClick={() => void emitConnectSessions(sessions.filter((session) => selectedSessionIds.has(session.id)))}>
-                  <Server size={14} /><span>批量连接 ({selectedSessionIds.size})</span>
-                </button>
-                <button className="connection-toolbar-btn danger" disabled={selectedSessionIds.size === 0}
-                  title="删除选中的会话" onClick={() => void deleteSelectedSessions()}>
-                  <Trash2 size={14} /><span>批量删除</span>
-                </button>
               </div>
               <div className="connection-search-bar">
                 <Search size={15} />
@@ -753,20 +694,6 @@ export function ConnectionWindow() {
                   </button>
                 )}
               </div>
-              <div className="connection-filter-row">
-                <select value={connectionGroupFilter} onChange={(event) => setConnectionGroupFilter(event.target.value)} aria-label="按分组筛选">
-                  <option value="">全部分组</option>
-                  {groups.map((group) => <option key={group} value={group}>{group}</option>)}
-                </select>
-                <select value={connectionTagFilter} onChange={(event) => setConnectionTagFilter(event.target.value)} aria-label="按标签筛选">
-                  <option value="">全部标签</option>
-                  {tags.map((tag) => <option key={tag} value={tag}>{tag}</option>)}
-                </select>
-                <button className="connection-toolbar-btn" title="全选当前筛选结果"
-                  onClick={() => setSelectedSessionIds((current) => selectVisibleSessions(current, filteredSessions))}>
-                  全选当前结果
-                </button>
-              </div>
             </div>
             {connectionFormError && <div className="connection-form-error">{connectionFormError}</div>}
 
@@ -777,13 +704,7 @@ export function ConnectionWindow() {
                   <thead>
                     <tr>
                       <th className="conn-th-index" style={{ width: `${connColumnWidths.index}%` }}>
-                        <input
-                          type="checkbox"
-                          checked={filteredSessions.length > 0 && filteredSessions.every((session) => selectedSessionIds.has(session.id))}
-                          onChange={() => setSelectedSessionIds((current) => selectVisibleSessions(current, filteredSessions))}
-                          aria-label="全选当前筛选结果"
-                        />
-                        #
+                        序号
                         <span className="conn-col-resizer" onPointerDown={(e) => startConnColResize('index', e)} />
                       </th>
                       <th className="conn-th-name" style={{ width: `${connColumnWidths.name}%` }}>
@@ -822,20 +743,8 @@ export function ConnectionWindow() {
                         onContextMenu={(e) => handleRowContextMenu(e, session)}
                         onPointerDown={(event) => startConnectionRowDrag(session, event)}
                       >
-                        <td className="conn-td-index">
-                          <input
-                            type="checkbox"
-                            checked={selectedSessionIds.has(session.id)}
-                            onChange={() => setSelectedSessionIds((current) => toggleSessionSelection(current, session.id))}
-                            onClick={(event) => event.stopPropagation()}
-                            aria-label={`选择 ${session.name}`}
-                          />
-                          {rowIndex + 1}
-                        </td>
-                        <td className="conn-td-name">
-                          <strong>{session.name}</strong>
-                          <small>{session.group} {session.tags.length ? ` · ${session.tags.join(', ')}` : ''}</small>
-                        </td>
+                        <td className="conn-td-index">{rowIndex + 1}</td>
+                        <td className="conn-td-name">{session.name}</td>
                         <td className="conn-td-host">{session.host}</td>
                         <td className="conn-td-user">{session.username}</td>
                         <td className="conn-td-protocol">{(session.protocol ?? 'ssh').toUpperCase()}</td>
@@ -1058,17 +967,17 @@ export function ConnectionWindow() {
           style={{ left: contextMenu.x, top: contextMenu.y }}
         >
           <button className="connection-context-item" onClick={() => { void emitConnectSession(contextMenu.session); setContextMenu(null); }}>
-            <Server size={14} /><span>连接</span>
+            <span>连接</span>
           </button>
           <button className="connection-context-item" onClick={() => { loadSessionToForm(contextMenu.session); setContextMenu(null); }}>
-            <Edit size={14} /><span>编辑</span>
+            <span>编辑</span>
           </button>
           <button className="connection-context-item" onClick={() => { handleCopySessionInfo(contextMenu.session); setContextMenu(null); }}>
-            <Copy size={14} /><span>复制信息</span>
+            <span>复制信息</span>
           </button>
           <div className="connection-context-divider" />
           <button className="connection-context-item danger" onClick={() => { void deleteConnectionSession(contextMenu.session); }}>
-            <Trash2 size={14} /><span>删除</span>
+            <span>删除</span>
           </button>
         </div>
       )}

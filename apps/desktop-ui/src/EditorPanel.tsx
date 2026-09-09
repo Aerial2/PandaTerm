@@ -149,8 +149,17 @@ export function EditorPanel({
       return existing;
     }
     const uri = tabModelUri(tab.id);
-    const stale = monaco.editor.getModel(uri);
-    if (stale && !stale.isDisposed()) stale.dispose();
+    // 分屏时可能同时挂载多个 EditorPanel（workspace 所在 pane + 当前活动 pane），
+    // 它们共用同一 tabId → 同一 URI 的 model。这里必须复用全局已存在的 model：
+    // 若在此 dispose 后重建，会销毁另一个面板正在使用的 model，导致那个面板变空白。
+    const shared = monaco.editor.getModel(uri);
+    if (shared && !shared.isDisposed()) {
+      modelsRef.current.set(tab.id, shared);
+      if (shared.getLanguageId() !== tab.language) {
+        monaco.editor.setModelLanguage(shared, tab.language);
+      }
+      return shared;
+    }
     const model = monaco.editor.createModel(tab.content, tab.language, uri);
     modelsRef.current.set(tab.id, model);
     return model;

@@ -44,7 +44,7 @@ use local_shell::{
     is_clear_command, local_prompt, local_pty_command, local_pty_size, local_shell_name,
     run_local_shell_command,
 };
-use shell_text::decode_terminal_bytes;
+use shell_text::StreamDecoder;
 use panda_core::{TerminalEvent, TerminalEventKind};
 use panda_crypto::{protect_secret, unprotect_secret, ProtectionMode, SecretError};
 use panda_session::{AuthType, Session, SessionCatalog};
@@ -55,7 +55,7 @@ use credential::{
     CredentialVault, CredentialVaultState, CREDENTIAL_VAULT_VERSION, CREDENTIAL_VERIFIER_CONTEXT,
     CREDENTIAL_VERIFIER_VALUE,
 };
-use known_hosts::verify_or_trust_host_key;
+use known_hosts::{check_fingerprint, trust_fingerprint, FingerprintCheck};
 use session_store::{
     load_secure_state, migrate_legacy_credentials, resolved_session, save_persistent_sessions,
 };
@@ -96,6 +96,14 @@ struct AiGenerationEntry {
     notification: Arc<Notify>,
 }
 
+/// 非流式 AI 请求的整体上限。
+const AI_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// 流式响应相邻数据块之间的最大空闲时间。流式回答不设总时长——
+/// 长回答经常超过 2 分钟，若用整体超时会必然在中途断流。
+const AI_STREAM_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// 主机指纹首信需要用户阅读并确认，不能使用过短的握手总超时。
+const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+
 struct AppState {
     sessions: Mutex<SessionCatalog>,
     session_store_error: Mutex<Option<String>>,
@@ -121,6 +129,8 @@ struct AppState {
     /// Keeps CPU time counters alive so that `refresh_cpu_usage()` computes
     /// correct deltas between successive calls instead of starting from scratch.
     local_sys_monitor: std::sync::Mutex<Option<sysinfo::System>>,
+    /// Serializes the one-time asynchronous CPU baseline sampling.
+    local_sys_monitor_init: Mutex<()>,
 }
 
 type SharedWriter = Arc<std::sync::Mutex<Box<dyn Write + Send>>>;
@@ -661,7 +671,20 @@ fn local_terminal_profile() -> LocalTerminalProfile {
     }
 }
 
+/// Format a host and port without making IPv6 addresses ambiguous.
+pub(crate) fn format_host_port(host: &str, port: u16) -> String {
+    let host = host.trim();
+    if host.starts_with('[') && host.ends_with(']') {
+        format!("{host}:{port}")
+    } else if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 struct SshHandler {
+    app: AppHandle,
     host_port: String,
     /// Filled when host key verification fails so connect can surface a clear error.
     host_key_error: Arc<std::sync::Mutex<Option<String>>>,
@@ -674,17 +697,69 @@ impl russh::client::Handler for SshHandler {
         &mut self,
         server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
-        match verify_or_trust_host_key(&self.host_port, server_public_key) {
-            Ok(true) => Ok(true),
-            Ok(false) => Ok(false),
-            Err(message) => {
+        // 首见指纹需要用户确认（原生对话框）：在阻塞线程弹窗，避免占死
+        // 异步 worker；等待期间连接协程挂起，不会向服务器发送任何凭据。
+        let app = self.app.clone();
+        let host_port = self.host_port.clone();
+        let fingerprint = known_hosts::ssh_server_fingerprint(server_public_key);
+        let result =
+            tokio::task::spawn_blocking(move || {
+                ensure_host_key_trusted_blocking(&app, &host_port, &fingerprint, "SSH")
+            })
+            .await;
+        match result {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(message)) => {
                 if let Ok(mut slot) = self.host_key_error.lock() {
                     *slot = Some(message);
                 }
                 Ok(false)
             }
+            Err(error) => {
+                if let Ok(mut slot) = self.host_key_error.lock() {
+                    *slot = Some(format!("主机指纹确认失败：{error}"));
+                }
+                Ok(false)
+            }
         }
     }
+}
+
+/// SSH/RDP 共用的主机指纹确认（TOFU，但首见必须经用户同意）：
+/// 已知且匹配 → 放行；未知 → 弹原生 Yes/No 对话框，同意后入库；
+/// 指纹不匹配 → 直接报错拦截潜在 MITM。**必须在阻塞线程调用**——
+/// 弹窗期间 RDP 在独立线程阻塞、SSH 走 spawn_blocking。
+pub(crate) fn ensure_host_key_trusted_blocking(
+    app: &AppHandle,
+    host_port: &str,
+    fingerprint: &str,
+    label: &str,
+) -> Result<(), String> {
+    match check_fingerprint(host_port, fingerprint)? {
+        FingerprintCheck::Trusted => return Ok(()),
+        FingerprintCheck::Unknown => {}
+    }
+    let accepted = tauri_plugin_dialog::DialogExt::dialog(app)
+        .message(format!(
+            "未能识别 {label} 主机 {host_port} 的密钥。\n\n指纹：\n{fingerprint}\n\n是否信任并继续连接？\n\n首次连接存在中间人风险，建议与服务器管理员核对指纹。选择“否”将取消本次连接。",
+        ))
+        .title(format!("首次连接：确认 {label} 主机指纹"))
+        .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+        .buttons(tauri_plugin_dialog::MessageDialogButtons::YesNo)
+        .blocking_show();
+    if !accepted {
+        eprintln!("[HostKey] user rejected first-seen key for {host_port}");
+        return Err(format!(
+            "已拒绝信任 {label} 主机 {host_port} 的首次指纹，连接已取消"
+        ));
+    }
+    trust_fingerprint(host_port, fingerprint)?;
+    emit_host_key_saved_log(app, label, host_port);
+    Ok(())
+}
+
+fn emit_host_key_saved_log(_app: &AppHandle, label: &str, host_port: &str) {
+    eprintln!("[HostKey] user accepted and stored key for {label} {host_port}");
 }
 
 async fn connect_russh_session(
@@ -695,7 +770,7 @@ async fn connect_russh_session(
     emit_remote_log(
         app,
         terminal_id,
-        format!("Connecting to {}:{}...", session.host, session.port),
+        format!("Connecting to {}...", format_host_port(&session.host, session.port)),
     );
 
     let config = Arc::new(russh::client::Config {
@@ -705,19 +780,20 @@ async fn connect_russh_session(
         channel_buffer_size: 1024,
         ..russh::client::Config::default()
     });
-    let host_port = format!("{}:{}", session.host, session.port);
+    let host_port = format_host_port(&session.host, session.port);
     let host_key_error = Arc::new(std::sync::Mutex::new(None));
     let handler = SshHandler {
+        app: app.clone(),
         host_port: host_port.clone(),
         host_key_error: Arc::clone(&host_key_error),
     };
 
     let mut handle = tokio::time::timeout(
-        Duration::from_secs(15),
+        SSH_CONNECT_TIMEOUT,
         russh::client::connect(config, (session.host.as_str(), session.port), handler),
     )
     .await
-    .map_err(|_| format!("SSH 连接超时（15s）：{}", session.host))?
+    .map_err(|_| format!("SSH 连接超时（{}s）：{}", SSH_CONNECT_TIMEOUT.as_secs(), session.host))?
     .map_err(|error| {
         if let Ok(guard) = host_key_error.lock() {
             if let Some(message) = guard.as_ref() {
@@ -874,6 +950,25 @@ async fn invalidate_transfer_handle(state: &AppState, terminal_id: Uuid) {
     cache.remove(&terminal_id);
 }
 
+/// 清理任务认领终端表项：仅当表项仍属于 `closed_token` 标识的会话时才移除。
+///
+/// 同一 `terminal_id` 被新连接覆盖后，旧会话的清理任务可能晚于新会话插入
+/// 才被关闭通知唤醒；此时不得误删新会话（否则新终端表现为假死）。
+fn claim_terminal_cleanup<V>(
+    terminals: &mut HashMap<Uuid, V>,
+    terminal_id: Uuid,
+    closed_token: &Arc<AtomicBool>,
+    session_token: impl Fn(&V) -> &Arc<AtomicBool>,
+) -> bool {
+    let is_owner = terminals
+        .get(&terminal_id)
+        .is_some_and(|current| Arc::ptr_eq(session_token(current), closed_token));
+    if is_owner {
+        terminals.remove(&terminal_id);
+    }
+    is_owner
+}
+
 async fn spawn_russh_terminal(
     app: AppHandle,
     terminal_id: String,
@@ -882,7 +977,7 @@ async fn spawn_russh_terminal(
 ) -> Result<RemoteTerminalSession, String> {
     emit_remote_log(&app, &terminal_id, "Opening channel...");
 
-    let mut channel = handle
+    let channel = handle
         .channel_open_session()
         .await
         .map_err(|error| format!("SSH 通道创建失败：{error}"))?;
@@ -912,50 +1007,136 @@ async fn spawn_russh_terminal(
     let shared_handle: SharedRemoteHandle = Arc::new(handle);
     let task_handle = Arc::clone(&shared_handle);
 
+    // 拆分读/写半边：写入走独立任务。此前单一 select 循环中一次超大粘贴会因
+    // SSH 流控在 channel.data() 上长期挂起，饿死 channel.wait() 的输出渲染、
+    // 排队的 Resize，以及 Disconnect 发送的 Close。
+    let (mut channel_read, channel_write) = channel.split();
+
+    // 写入失败经此转发给读循环，由读循环统一发终端状态（保持原有对外语义）
+    let write_failure_slot: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let write_failure_signal = Arc::new(Notify::new());
+    let failure_slot_clone = Arc::clone(&write_failure_slot);
+    let failure_signal_clone = Arc::clone(&write_failure_signal);
+
+    let writer_app = app.clone();
+    let writer_terminal_id = terminal_id.clone();
+    tokio::spawn(async move {
+        const WRITE_CHUNK_BYTES: usize = 32 * 1024;
+        let writer = channel_write;
+        let mut pending_writes = std::collections::VecDeque::<Vec<u8>>::new();
+
+        'writer: loop {
+            // 等待第一条命令；有待发送数据时则在每个分块之间检查新命令。
+            if pending_writes.is_empty() {
+                match rx.recv().await {
+                    Some(RemoteTerminalCommand::Write(data)) => {
+                        for chunk in data.into_bytes().chunks(WRITE_CHUNK_BYTES) {
+                            pending_writes.push_back(chunk.to_vec());
+                        }
+                    }
+                    Some(RemoteTerminalCommand::Resize { cols, rows }) => {
+                        let _ = writer.window_change(cols as u32, rows as u32, 0, 0).await;
+                    }
+                    Some(RemoteTerminalCommand::Close) | None => {
+                        let _ = writer.eof().await;
+                        let _ = writer.close().await;
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // 仅在远端窗口有空间时发送，并把单次发送限制在 32KB 内。
+            // 窗口耗尽时先轮询控制命令，避免 Resize/Close 被卡在一个无限等待的
+            // 大数据写入上；已发送的前缀不会被取消或重复。
+            let writable = writer.writable_packet_size().await;
+            if writable == 0 {
+                match rx.try_recv() {
+                    Ok(RemoteTerminalCommand::Write(data)) => {
+                        for chunk in data.into_bytes().chunks(WRITE_CHUNK_BYTES) {
+                            pending_writes.push_back(chunk.to_vec());
+                        }
+                    }
+                    Ok(RemoteTerminalCommand::Resize { cols, rows }) => {
+                        let _ = writer.window_change(cols as u32, rows as u32, 0, 0).await;
+                    }
+                    Ok(RemoteTerminalCommand::Close)
+                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        let _ = writer.eof().await;
+                        let _ = writer.close().await;
+                        break 'writer;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                continue;
+            }
+
+            let Some(mut chunk) = pending_writes.pop_front() else {
+                continue;
+            };
+            let send_limit = writable.min(WRITE_CHUNK_BYTES);
+            if chunk.len() > send_limit {
+                let remainder = chunk.split_off(send_limit);
+                pending_writes.push_front(remainder);
+            }
+            if let Err(error) = writer.data(chunk.as_slice()).await {
+                let message = format!("终端写入失败：{error}");
+                emit_remote_log(&writer_app, &writer_terminal_id, &message);
+                if let Ok(mut slot) = failure_slot_clone.lock() {
+                    *slot = Some(message);
+                }
+                failure_signal_clone.notify_one();
+                let _ = writer.eof().await;
+                let _ = writer.close().await;
+                break;
+            }
+
+            // 一个分块完成后优先处理已经排队的控制命令。这样 Resize/Close
+            // 最多等待当前 32KB 分块，不会在大粘贴后排队数百 KB。
+            loop {
+                match rx.try_recv() {
+                    Ok(RemoteTerminalCommand::Write(data)) => {
+                        for chunk in data.into_bytes().chunks(WRITE_CHUNK_BYTES) {
+                            pending_writes.push_back(chunk.to_vec());
+                        }
+                    }
+                    Ok(RemoteTerminalCommand::Resize { cols, rows }) => {
+                        let _ = writer.window_change(cols as u32, rows as u32, 0, 0).await;
+                    }
+                    Ok(RemoteTerminalCommand::Close) | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        let _ = writer.eof().await;
+                        let _ = writer.close().await;
+                        break 'writer;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                }
+            }
+        }
+    });
+
     tokio::spawn(async move {
         let mut close_state = TerminalLifecycleState::Disconnected;
         let mut close_reason = None;
+        let mut output_decoder = StreamDecoder::new();
         loop {
             tokio::select! {
-                cmd = rx.recv() => {
-                    match cmd {
-                        Some(RemoteTerminalCommand::Write(data)) => {
-                            if !data.is_empty() {
-                                if let Err(error) = channel.data(data.as_bytes()).await {
-                                    let message = format!("终端写入失败：{error}");
-                                    emit_remote_log(&app, &terminal_id_clone, &message);
-                                    close_state = TerminalLifecycleState::Failed;
-                                    close_reason = Some(message);
-                                    break;
-                                }
-                            }
-                        }
-                        Some(RemoteTerminalCommand::Resize { cols, rows }) => {
-                            let _ = channel
-                                .window_change(cols as u32, rows as u32, 0, 0)
-                                .await;
-                        }
-                        Some(RemoteTerminalCommand::Close) | None => {
-                            let _ = channel.eof().await;
-                            let _ = channel.close().await;
-                            break;
-                        }
-                    }
-                }
-                msg = channel.wait() => {
+                msg = channel_read.wait() => {
                     match msg {
                         Some(ChannelMsg::Data { ref data }) => {
                             emit_terminal_output(
                                 &app,
                                 terminal_id_clone.clone(),
-                                decode_terminal_bytes(data),
+                                output_decoder.feed(data),
                             );
                         }
                         Some(ChannelMsg::ExtendedData { ref data, .. }) => {
                             emit_terminal_output(
                                 &app,
                                 terminal_id_clone.clone(),
-                                decode_terminal_bytes(data),
+                                output_decoder.feed(data),
                             );
                         }
                         Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
@@ -964,13 +1145,18 @@ async fn spawn_russh_terminal(
                         _ => {}
                     }
                 }
+                _ = write_failure_signal.notified() => {
+                    close_state = TerminalLifecycleState::Failed;
+                    close_reason = write_failure_slot.lock().ok().and_then(|mut slot| slot.take());
+                    break;
+                }
             }
         }
 
+        output_decoder.flush();
         closed_clone.store(true, Ordering::SeqCst);
         close_notification_clone.notify_one();
-        let _ = channel.eof().await;
-        let _ = channel.close().await;
+        // eof/close 由写入任务统一负责（Close/None/失败路径均已处理）
         emit_terminal_status(
             &app,
             terminal_id_clone,
@@ -1238,6 +1424,7 @@ fn spawn_terminal_reader(
     eprintln!("[PTY] spawn_terminal_reader started for terminal_id={}", terminal_id_text);
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
+        let mut output_decoder = StreamDecoder::new();
         let mut failure = None;
         loop {
             match reader.read(&mut buffer) {
@@ -1246,7 +1433,7 @@ fn spawn_terminal_reader(
                     break;
                 }
                 Ok(size) => {
-                    let decoded = decode_terminal_bytes(&buffer[..size]);
+                    let decoded = output_decoder.feed(&buffer[..size]);
 
                     let visible_output = if decoded.contains("\u{1b}[6n") {
                         if let Ok(mut guard) = writer.lock() {
@@ -1271,6 +1458,7 @@ fn spawn_terminal_reader(
             }
         }
 
+        output_decoder.flush();
         tauri::async_runtime::spawn(async move {
             let session = {
                 let mut terminals = state.local_terminals.lock().await;
@@ -1558,6 +1746,12 @@ async fn read_remote_file_full(
 
 const REMOTE_UPLOAD_COMPLETION_MARKER: &[u8] = b"__PANDATERM_UPLOAD_COMPLETE__";
 
+/// 读取远程 exec 输出时保留的尾部字节上限。
+/// 远端若在 marker 之前输出了 banner / motd / 警告，旧的"只取前 128 字节"会把
+/// 最后才输出的完成标记截断，导致明明写成功却误判为"未收到完成标记" → 保存失败。
+/// 完成标记是最后输出的，保留尾部即可稳定命中，同时限制内存占用。
+const REMOTE_OUTPUT_TAIL_LIMIT: usize = 4096;
+
 fn format_remote_stderr(stderr: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(stderr);
     let trimmed = text.trim();
@@ -1671,13 +1865,18 @@ async fn write_remote_file_content(
         while let Some(msg) = reader.wait().await {
             match msg {
                 russh::ChannelMsg::Data { data } => {
-                    let remaining = 128usize.saturating_sub(completion_output.len());
-                    completion_output.extend_from_slice(&data[..data.len().min(remaining)]);
+                    // 保留尾部输出：完成标记是最后打印的，若被远端前置输出挤掉会误判为失败
+                    completion_output.extend_from_slice(&data[..]);
+                    let len = completion_output.len();
+                    if len > REMOTE_OUTPUT_TAIL_LIMIT {
+                        completion_output.drain(..len - REMOTE_OUTPUT_TAIL_LIMIT);
+                    }
                 }
                 russh::ChannelMsg::ExtendedData { data, .. } => {
-                    let remaining = 512usize.saturating_sub(stderr_output.len());
-                    if remaining > 0 {
-                        stderr_output.extend_from_slice(&data[..data.len().min(remaining)]);
+                    stderr_output.extend_from_slice(&data[..]);
+                    let len = stderr_output.len();
+                    if len > REMOTE_OUTPUT_TAIL_LIMIT {
+                        stderr_output.drain(..len - REMOTE_OUTPUT_TAIL_LIMIT);
                     }
                 }
                 russh::ChannelMsg::ExitStatus { exit_status } => {
@@ -1771,13 +1970,18 @@ async fn stream_upload_file(
         while let Some(msg) = reader.wait().await {
             match msg {
                 russh::ChannelMsg::Data { data } => {
-                    let remaining = 128usize.saturating_sub(completion_output.len());
-                    completion_output.extend_from_slice(&data[..data.len().min(remaining)]);
+                    // 保留尾部输出：完成标记是最后打印的，若被远端前置输出挤掉会误判为失败
+                    completion_output.extend_from_slice(&data[..]);
+                    let len = completion_output.len();
+                    if len > REMOTE_OUTPUT_TAIL_LIMIT {
+                        completion_output.drain(..len - REMOTE_OUTPUT_TAIL_LIMIT);
+                    }
                 }
                 russh::ChannelMsg::ExtendedData { data, .. } => {
-                    let remaining = 512usize.saturating_sub(stderr_output.len());
-                    if remaining > 0 {
-                        stderr_output.extend_from_slice(&data[..data.len().min(remaining)]);
+                    stderr_output.extend_from_slice(&data[..]);
+                    let len = stderr_output.len();
+                    if len > REMOTE_OUTPUT_TAIL_LIMIT {
+                        stderr_output.drain(..len - REMOTE_OUTPUT_TAIL_LIMIT);
                     }
                 }
                 russh::ChannelMsg::ExitStatus { exit_status } => {
@@ -2405,37 +2609,59 @@ async fn upload_local_file(
     result
 }
 
-/// Recursively upload a local directory to a remote server via SFTP/SSH.
-/// Creates the directory structure on the remote, then uploads each file.
-/// Returns the number of files uploaded and directories created.
+/// 容忍中毒的 sysinfo 锁访问器：任一持锁路径 panic 后系统监控不应永久失效。
+fn local_sys_monitor_guard(
+    mutex: &std::sync::Mutex<Option<sysinfo::System>>,
+) -> std::sync::MutexGuard<'_, Option<sysinfo::System>> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// 确保本地 sysinfo 实例已初始化。CPU 占用需要相隔约 500ms 的两次采样才能
+/// 得到有效增量；这里把等待放在锁外并以异步方式执行——既不在 std Mutex 内
+/// 睡眠阻塞其它命令，也不占死 Tokio worker。
+async fn ensure_local_sys_monitor(state: &AppState) {
+    use sysinfo::{CpuRefreshKind, RefreshKind, System};
+
+    let _init_guard = state.local_sys_monitor_init.lock().await;
+    let needs_seed = {
+        let mut guard = local_sys_monitor_guard(&state.local_sys_monitor);
+        if guard.is_none() {
+            // 先完成第一次数值采样，再放入共享槽成为“播种者”；等待期间不持锁
+            let mut system = System::new_with_specifics(
+                RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
+            );
+            system.refresh_cpu_usage();
+            *guard = Some(system);
+            true
+        } else {
+            false
+        }
+    };
+    if needs_seed {
+        // 第二次采样由当前调用方在等待结束后执行，确保返回值使用完整窗口
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+
 /// Decide how many files to upload in parallel based on the local machine's
 /// current CPU load: 1 when the CPU is busy, 2 when it's idle/free.
 /// Reuses the cached `local_sys_monitor` so we don't spin up a fresh sysinfo
 /// instance per upload. The threshold (60%) mirrors total CPU usage as shown
 /// in Task Manager / top.
-fn recommended_upload_concurrency(state: &AppState) -> usize {
+async fn recommended_upload_concurrency(state: &AppState) -> usize {
     const CPU_BUSY_THRESHOLD: f32 = 60.0;
-    let usage = {
-        use sysinfo::{System, CpuRefreshKind, RefreshKind};
-        let mut guard = state.local_sys_monitor.lock().unwrap();
-        match guard.as_mut() {
-            Some(s) => {
-                s.refresh_cpu_usage();
-                s.global_cpu_usage()
-            }
-            None => {
-                // First call: two samples establish a usable delta baseline.
-                let mut s = System::new_with_specifics(
-                    RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
-                );
-                s.refresh_cpu_usage();
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                s.refresh_cpu_usage();
-                let u = s.global_cpu_usage();
-                *guard = Some(s);
-                u
-            }
+    ensure_local_sys_monitor(state).await;
+    let usage = match local_sys_monitor_guard(&state.local_sys_monitor).as_mut() {
+        Some(s) => {
+            s.refresh_cpu_usage();
+            s.global_cpu_usage()
         }
+        // 初始化竞态兜底：读不到采样按“空闲”处理，不阻塞上传流程
+        None => 0.0,
     };
     if usage >= CPU_BUSY_THRESHOLD {
         1
@@ -2448,10 +2674,13 @@ fn recommended_upload_concurrency(state: &AppState) -> usize {
 /// 2 otherwise). The front-end calls this before a multi-file upload so its
 /// worker pool matches local load.
 #[tauri::command]
-fn get_upload_concurrency(state: State<'_, Arc<AppState>>) -> usize {
-    recommended_upload_concurrency(&state)
+async fn get_upload_concurrency(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
+    Ok(recommended_upload_concurrency(&state).await)
 }
 
+/// Recursively upload a local directory to a remote server via SFTP/SSH.
+/// Creates the directory structure on the remote, then uploads each file.
+/// Returns the number of files uploaded and directories created.
 #[tauri::command]
 async fn upload_directory(
     terminal_id: Uuid,
@@ -2497,6 +2726,13 @@ async fn upload_directory(
     // This is what makes uploading hundreds of tiny files fast (like XShell's
     // SFTP multi-file transfer).
     let mut dir_stack: Vec<(PathBuf, String)> = vec![(local_root.clone(), remote_root.clone())];
+    // 记录已访问目录的真实目标（canonicalize 后）：目录符号链接 / Windows
+    // Junction 成环时（如经典的自指环）若无此集合会无限展开、占满内存。
+    let mut visited_dirs: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+    if let Ok(root_canonical) = local_root.canonicalize() {
+        visited_dirs.insert(root_canonical);
+    }
 
     while let Some((local_path, remote_path)) = dir_stack.pop() {
         if cancellation.load(Ordering::SeqCst) {
@@ -2511,7 +2747,27 @@ async fn upload_directory(
             let entry_name = entry.file_name().to_string_lossy().to_string();
             let remote_entry_path = format!("{remote_path}/{entry_name}");
 
-            if entry_path.is_dir() {
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("读取条目类型失败：{error}"))?;
+            // 符号链接（包括 Windows Junction）统一跳过：跟随链接可能造成目录环，
+            // 而把链接目标当普通文件读取也会越出用户选择的上传目录。
+            if file_type.is_symlink() {
+                eprintln!("[Upload] skip symbolic link: {}", entry_path.display());
+                continue;
+            }
+            if file_type.is_dir() {
+                // 环检测：真实目标已见过则跳过（同时天然去重硬链接式重复子树）
+                let canonical_dir = entry_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| entry_path.clone());
+                if !visited_dirs.insert(canonical_dir) {
+                    eprintln!(
+                        "[Upload] skip cyclic/duplicate directory: {}",
+                        entry_path.display()
+                    );
+                    continue;
+                }
                 // Create remote subdirectory
                 let quoted = shell_quote(&remote_entry_path);
                 let (_, stderr, code) = exec_remote_command_full(&handle, &format!("mkdir -p {quoted}")).await?;
@@ -2532,7 +2788,7 @@ async fn upload_directory(
     }
 
     // Bounded concurrency on one reused transfer connection.
-    let concurrency = recommended_upload_concurrency(&state).max(1);
+    let concurrency = recommended_upload_concurrency(&state).await.max(1);
     let semaphore = std::sync::Arc::new(Semaphore::new(concurrency));
     let mut tasks = Vec::with_capacity(file_jobs.len());
 
@@ -2722,6 +2978,12 @@ fn destination_path(
         });
         if file_name.is_empty() {
             return Err("无法确定源文件名".to_string());
+        }
+        // 与本地分支同强度：目标名必须是单段名字。接受 `../x`、`a/b` 之类的
+        // 多段值会把移动/复制目标指到任意远程路径，绕过所在目录约束。
+        if file_name.contains('/') || file_name.contains('\0') || file_name == "." || file_name == ".."
+        {
+            return Err("目标名称不能包含路径分隔符".to_string());
         }
         return Ok(if dest_dir.ends_with('/') {
             format!("{dest_dir}{file_name}")
@@ -3125,15 +3387,16 @@ async fn create_archive(
                 ],
             )
         } else {
+            // Unix 本地压缩：与远程分支一致使用 shell_quote 转义单引号，
+            // 否则含 `'` 的文件名会闭合引号造成本地命令注入。
             (
                 "sh",
                 vec![
                     "-c".to_string(),
                     format!(
-                        "rm -f '{}' && zip -r '{}' '{}'",
-                        archive_path.to_string_lossy(),
-                        archive_path.to_string_lossy(),
-                        source_path
+                        "rm -f {aq} && zip -r {aq} {q}",
+                        aq = shell_quote(&archive_path.to_string_lossy()),
+                        q = shell_quote(&source_path),
                     ),
                 ],
             )
@@ -3183,8 +3446,9 @@ async fn get_process_list(
         }
         Ok(system_monitor::parse_process_list(&String::from_utf8_lossy(&stdout)))
     } else {
-        let mut guard = state.local_sys_monitor.lock().unwrap();
-        Ok(system_monitor::collect_local_processes(&mut *guard))
+        ensure_local_sys_monitor(&state).await;
+        let mut guard = local_sys_monitor_guard(&state.local_sys_monitor);
+        Ok(system_monitor::collect_local_processes(&mut guard))
     }
 }
 
@@ -3211,8 +3475,9 @@ async fn get_system_monitor(
         }
         Ok(system_monitor::parse_system_monitor(&String::from_utf8_lossy(&stdout)))
     } else {
-        let mut guard = state.local_sys_monitor.lock().unwrap();
-        Ok(system_monitor::collect_local_monitor(&mut *guard))
+        ensure_local_sys_monitor(&state).await;
+        let mut guard = local_sys_monitor_guard(&state.local_sys_monitor);
+        Ok(system_monitor::collect_local_monitor(&mut guard))
     }
 }
 
@@ -3598,6 +3863,22 @@ fn build_claude_messages_payload(
         payload["system"] = Value::String(system_parts.join("\n\n"));
     }
     Ok(payload)
+}
+
+/// 判断 Claude SSE 事件是否为 message_stop。
+///
+/// 必须解析 JSON 的 `type` 字段而非对原文做子串匹配：模型正文中完全可以
+/// 出现字面量 "message_stop"（例如讲解流式协议时），子串匹配会把正常回答
+/// 误判为流结束并截断后续内容。
+fn is_claude_stop_event(data: &str) -> bool {
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|event_type| event_type == "message_stop")
+        })
 }
 
 fn extract_claude_text_content(body: &Value) -> Option<String> {
@@ -4145,7 +4426,7 @@ async fn sync_ai_provider_models(
     } else {
         existing.api_format.clone()
     };
-    let mut builder = state.ai_http.get(endpoint);
+    let mut builder = state.ai_http.get(endpoint).timeout(AI_HTTP_REQUEST_TIMEOUT);
     builder = apply_ai_provider_auth(builder, &format_for_auth, api_key.as_ref().map(|value| value.as_str()));
     let response = builder
         .send()
@@ -4302,7 +4583,7 @@ async fn ai_chat(
         None
     };
 
-    let mut builder = state.ai_http.post(endpoint);
+    let mut builder = state.ai_http.post(endpoint).timeout(AI_HTTP_REQUEST_TIMEOUT);
     builder = apply_ai_provider_auth(builder, &account.api_format, api_key.as_ref().map(|value| value.as_str()));
     let builder = if is_claude_api_format(&account.api_format) {
         let payload = build_claude_messages_payload(&account.model, &request.messages, false)?;
@@ -4421,10 +4702,10 @@ async fn test_ai_provider(
     };
 
     let started = Instant::now();
-    let response = builder
-        .send()
-        .await
-        .map_err(|error| format!("连接 API 失败：{error}"))?;
+    let response = match tokio::time::timeout(AI_HTTP_REQUEST_TIMEOUT, builder.send()).await {
+        Ok(result) => result.map_err(|error| format!("连接 API 失败：{error}"))?,
+        Err(_) => return Err("连接 API 超时（120 秒无响应）".to_string()),
+    };
     let connect_ms = elapsed_ms(started);
     let status = response.status();
     let content_type = response
@@ -4436,10 +4717,10 @@ async fn test_ai_provider(
 
     // 部分网关忽略 stream，直接回 JSON
     if content_type.contains("application/json") && !content_type.contains("event-stream") {
-        let body = response
-            .text()
-            .await
-            .map_err(|error| format!("测试响应读取失败：{error}"))?;
+        let body = match tokio::time::timeout(AI_HTTP_REQUEST_TIMEOUT, response.text()).await {
+            Ok(result) => result.map_err(|error| format!("测试响应读取失败：{error}"))?,
+            Err(_) => return Err("测试响应读取超时".to_string()),
+        };
         let total_ms = elapsed_ms(started);
         if !status.is_success() {
             return Err(format!(
@@ -4503,11 +4784,15 @@ async fn test_ai_provider(
     let mut ttft_ms: Option<u64> = None;
 
     'stream: loop {
-        match response.chunk().await {
-            Ok(Some(bytes)) => buffer.extend_from_slice(&bytes),
-            Ok(None) => break,
-            Err(error) => {
+        let chunk_result = tokio::time::timeout(AI_STREAM_CHUNK_IDLE_TIMEOUT, response.chunk()).await;
+        match chunk_result {
+            Ok(Ok(Some(bytes))) => buffer.extend_from_slice(&bytes),
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
                 return Err(format!("测试流式响应读取失败：{error}"));
+            }
+            Err(_) => {
+                return Err("测试流式响应空闲超时（长时间没有新数据）".to_string());
             }
         }
         for event in take_sse_events(&mut buffer) {
@@ -4520,7 +4805,7 @@ async fn test_ai_provider(
                 break 'stream;
             }
             if claude_format {
-                if data.contains("\"message_stop\"") {
+                if is_claude_stop_event(&data) {
                     break 'stream;
                 }
                 match extract_claude_stream_delta(&data) {
@@ -4992,7 +5277,11 @@ async fn ai_chat_stream(
         None,
     );
     let send_result = tokio::select! {
-        result = builder.send() => Some(result),
+        result = tokio::time::timeout(AI_HTTP_REQUEST_TIMEOUT, builder.send()) => Some(
+            result
+                .map_err(|_| "AI 供应商请求超时（120 秒无响应）".to_string())
+                .and_then(|attempt| attempt.map_err(|error| format!("AI 供应商请求失败：{error}"))),
+        ),
         _ = generation.notification.notified() => None,
     };
     let Some(send_result) = send_result else {
@@ -5009,7 +5298,7 @@ async fn ai_chat_stream(
                 "error",
                 None,
                 None,
-                Some(format!("AI 供应商请求失败：{error}")),
+                Some(error),
             );
             finish_ai_generation(&state, &request.request_id, &generation.signal).await;
             return Ok(());
@@ -5017,7 +5306,11 @@ async fn ai_chat_stream(
     };
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = tokio::time::timeout(AI_HTTP_REQUEST_TIMEOUT, response.text())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
         emit_ai_stream_event(
             &app,
             &request.request_id,
@@ -5042,7 +5335,13 @@ async fn ai_chat_stream(
     let mut tool_call_builders: HashMap<usize, StreamToolCallBuilder> = HashMap::new();
     'stream: loop {
         let chunk = tokio::select! {
-            result = response.chunk() => Some(result),
+            result = tokio::time::timeout(AI_STREAM_CHUNK_IDLE_TIMEOUT, response.chunk()) => Some(match result {
+                Ok(inner) => inner.map_err(|error| format!("AI 流式响应读取失败：{error}")),
+                Err(_) => Err(format!(
+                    "AI 流式响应空闲超时（{} 秒内没有新数据）",
+                    AI_STREAM_CHUNK_IDLE_TIMEOUT.as_secs()
+                )),
+            }),
             _ = generation.notification.notified() => None,
         };
         let Some(chunk) = chunk else {
@@ -5073,7 +5372,7 @@ async fn ai_chat_stream(
                     "error",
                     None,
                     None,
-                    Some(format!("AI 流式响应读取失败：{error}")),
+                    Some(error),
                 );
                 break;
             }
@@ -5104,7 +5403,7 @@ async fn ai_chat_stream(
                 break;
             }
             if claude_format {
-                if data.contains("\"message_stop\"") {
+                if is_claude_stop_event(&data) {
                     if !completed {
                         emit_ai_stream_event_with_tools(
                             &app,
@@ -5488,14 +5787,26 @@ async fn connect_session(
     let cleanup_state = Arc::clone(state.inner());
     {
         let mut terminals = state.remote_terminals.lock().await;
-        terminals.insert(terminal_id, remote_session);
+        // 同一 terminal_id 重连（含 React StrictMode 双触发）时主动关闭旧会话，
+        // 防止旧 SSH 连接与写入循环被覆盖后悬挂泄漏（对齐 rdp_connect 的处理）。
+        if let Some(prev) = terminals.insert(terminal_id, remote_session) {
+            prev.closed.store(true, Ordering::SeqCst);
+            prev.close_notification.notify_one();
+        }
     }
     tokio::spawn(async move {
         if !closed.load(Ordering::SeqCst) {
             close_notification.notified().await;
         }
-        let removed = cleanup_state.remote_terminals.lock().await.remove(&terminal_id);
-        if removed.is_some() {
+        // 只认领自己登记的表项：旧会话被同 id 重连覆盖时，其清理任务可能晚于
+        // 新会话插入才被唤醒，绝不能把新会话从表中删掉。
+        let owned_slot = {
+            let mut terminals = cleanup_state.remote_terminals.lock().await;
+            claim_terminal_cleanup(&mut terminals, terminal_id, &closed, |session| {
+                &session.closed
+            })
+        };
+        if owned_slot {
             invalidate_transfer_handle(&cleanup_state, terminal_id).await;
         }
     });
@@ -5531,6 +5842,7 @@ async fn disconnect_session(
 
 #[tauri::command]
 async fn rdp_connect(
+    app: tauri::AppHandle,
     session_id: Uuid,
     terminal_id: Uuid,
     width: u16,
@@ -5596,7 +5908,7 @@ async fn rdp_connect(
     }
 
     thread::spawn(move || {
-        rdp::run_session(params, channel, thread_closed, ready_tx, input_rx);
+        rdp::run_session(app, params, channel, thread_closed, ready_tx, input_rx);
     });
 
     let result = ready_rx
@@ -5752,7 +6064,8 @@ fn main() {
     let mcp_runtime = Arc::new(mcp::McpRuntime::default());
     let ai_http = Client::builder()
         .redirect(Policy::none())
-        .timeout(Duration::from_secs(120))
+        // 不设 client 级总超时：它对流式响应同样生效，会掐断长回答。
+        // 非流式请求用请求级 .timeout()，流式读循环用块间空闲超时。
         .build()
         .expect("failed to initialize AI HTTP client");
     let state = Arc::new(AppState {
@@ -5774,6 +6087,7 @@ fn main() {
         transfer_handles: Mutex::new(HashMap::new()),
         transfer_cancellations: Mutex::new(HashMap::new()),
         local_sys_monitor: std::sync::Mutex::new(None),
+        local_sys_monitor_init: Mutex::new(()),
     });
 
     // 后台预连接已启用的 stdio MCP（不阻塞启动）
@@ -5930,6 +6244,22 @@ mod tests {
     }
 
     #[test]
+    fn claude_stop_detected_by_type_field_not_substring() {
+        // 真正的 message_stop 事件
+        assert!(is_claude_stop_event(r#"{"type":"message_stop"}"#));
+
+        // 正文里出现字面量 message_stop 时绝不能误判（回归：旧实现用子串匹配会截断回答）
+        let delta_with_literal = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"the stream ends at \"message_stop\" event"}}"#;
+        assert!(!is_claude_stop_event(delta_with_literal));
+
+        let message_start = r#"{"type":"message_start","message":{"model":"claude-x"}}"#;
+        assert!(!is_claude_stop_event(message_start));
+
+        // 非 JSON 行（个别网关的日志/心跳）不终止流
+        assert!(!is_claude_stop_event("event: ping data message_stop"));
+    }
+
+    #[test]
     fn local_terminal_exit_maps_reader_result_to_lifecycle_state() {
         assert_eq!(
             local_terminal_exit_state(None),
@@ -5980,6 +6310,49 @@ mod tests {
             .filter(|claimed| *claimed)
             .count();
         assert_eq!(owner_count, 1);
+    }
+
+    struct CleanupProbe {
+        closed: Arc<AtomicBool>,
+    }
+
+    #[test]
+    fn stale_remote_cleanup_never_removes_reconnected_entry() {
+        let terminal_id = Uuid::new_v4();
+        let old_closed = Arc::new(AtomicBool::new(false));
+        let new_closed = Arc::new(AtomicBool::new(false));
+        let mut terminals =
+            HashMap::from([(terminal_id, CleanupProbe { closed: Arc::clone(&old_closed) })]);
+
+        // 模拟重连覆盖：同 id 插入新会话（旧会话被主动置为 closed）
+        assert!(terminals
+            .insert(terminal_id, CleanupProbe { closed: Arc::clone(&new_closed) })
+            .is_some());
+        old_closed.store(true, Ordering::SeqCst);
+
+        // 旧清理任务此时才被唤醒：必须拒绝认领，不得删掉新会话
+        assert!(!claim_terminal_cleanup(
+            &mut terminals,
+            terminal_id,
+            &old_closed,
+            |probe| &probe.closed
+        ));
+        assert!(terminals.contains_key(&terminal_id));
+
+        // 新会话可被自己的清理任务认领；重复认领是 no-op
+        assert!(claim_terminal_cleanup(
+            &mut terminals,
+            terminal_id,
+            &new_closed,
+            |probe| &probe.closed
+        ));
+        assert!(!terminals.contains_key(&terminal_id));
+        assert!(!claim_terminal_cleanup(
+            &mut terminals,
+            terminal_id,
+            &new_closed,
+            |probe| &probe.closed
+        ));
     }
 
     #[test]
@@ -6342,5 +6715,35 @@ mod tests {
         )
         .expect("resolve Windows destination");
         assert_eq!(destination, r"D:\downloads\report.txt");
+    }
+
+    #[test]
+    fn host_port_format_brackets_ipv6_without_double_bracketing() {
+        assert_eq!(format_host_port("2001:db8::1", 22), "[2001:db8::1]:22");
+        assert_eq!(format_host_port("[2001:db8::1]", 3389), "[2001:db8::1]:3389");
+        assert_eq!(format_host_port("example.com", 22), "example.com:22");
+    }
+
+    #[test]
+    fn remote_destination_rejects_multi_segment_names() {
+        // 路径穿越（../..）与多段名字都必须拒绝，防止绕过所在目录约束
+        for bad in ["../../etc/cron.d/pwn", "a/b", "..", ".", "\0x"] {
+            assert!(
+                destination_path("/var/www/html/index.html", "/srv", Some(bad.to_string()), true)
+                    .is_err(),
+                "remote dest_name={bad:?} should be rejected"
+            );
+        }
+        // 合法单段名字仍可用；缺省时取源文件名
+        assert_eq!(
+            destination_path("/var/www/html/index.html", "/srv/", Some("new.html".into()), true)
+                .expect("valid remote rename"),
+            "/srv/new.html"
+        );
+        assert_eq!(
+            destination_path("/var/www/html/index.html", "/srv", None, true)
+                .expect("default source name"),
+            "/srv/index.html"
+        );
     }
 }

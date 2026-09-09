@@ -2,8 +2,6 @@
 //! SSH 编排与错误提示留在 main.rs 的薄命令层，本模块零 SSH 依赖。
 
 use std::collections::HashMap;
-use std::thread;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +44,7 @@ pub struct ProcessInfo {
     network_bytes_per_sec: f64,
 }
 
-pub const PROCESS_LIST_CMD: &str = r#"nproc=$(nproc 2>/dev/null||echo 1);mem_total=$(awk "/^MemTotal/{print \$2*1024}" /proc/meminfo 2>/dev/null||echo 0);ps aux --sort=-%cpu 2>/dev/null | head -50 | awk -v nc="$nproc" -v mt="$mem_total" "BEGIN{OFS=\"\t\"}NR>1{pid=\$2;cpu=\$3;mem=\$4;stat=substr(\$8,1,1);cmd=\$11;for(i=12;i<=NF;i++)cmd=cmd FS \$i;if(length(cmd)>30)cmd=substr(cmd,1,30);printf \"P\t%d\t%s\t%s\t%.1f\t%d\t0\t0\n\",pid,cmd,stat,cpu/nc,int(mem*mt/100)}" && echo END_PROCESS_LIST"#;
+pub const PROCESS_LIST_CMD: &str = r#"nproc=$(nproc 2>/dev/null||echo 1);mem_total=$(awk "/^MemTotal/{print \$2*1024}" /proc/meminfo 2>/dev/null||echo 0);ps -eo pid=,pcpu=,pmem=,stat=,args= --sort=-pcpu 2>/dev/null | head -50 | awk -v nc="$nproc" -v mt="$mem_total" 'BEGIN{OFS="\t"}{pid=$1;cpu=$2;mem=$3;stat=substr($4,1,1);cmd=$5;for(i=6;i<=NF;i++)cmd=cmd FS $i;if(length(cmd)>30)cmd=substr(cmd,1,30);printf "P\t%d\t%s\t%s\t%.1f\t%d\t0\t0\n",pid,cmd,stat,cpu/nc,int(mem*mt/100)}' && echo END_PROCESS_LIST"#;
 
 pub const SYSTEM_MONITOR_CMD: &str = r#"
 HOSTNAME=$(hostname 2>/dev/null || echo unknown)
@@ -201,13 +199,13 @@ pub fn collect_local_processes(slot: &mut Option<sysinfo::System>) -> Vec<Proces
     let sys = match slot.as_mut() {
         Some(s) => s,
         None => {
-            // First call: initialise the System instance (same as get_system_monitor).
+            // 兜底：正常路径由 main.rs 的 ensure_local_sys_monitor 预先播种
+            // （不持锁等待）。此处仅处理极端竞态，做两次连续刷新即可，不再睡眠。
             use sysinfo::{System, CpuRefreshKind, RefreshKind};
             let mut s = System::new_with_specifics(
                 RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
             );
             s.refresh_cpu_usage();
-            std::thread::sleep(std::time::Duration::from_millis(500));
             s.refresh_cpu_usage();
             *slot = Some(s);
             slot.as_mut().unwrap()
@@ -274,12 +272,11 @@ pub fn collect_local_monitor(slot: &mut Option<sysinfo::System>) -> SystemMonito
             s
         }
         None => {
-            // First call: need two samples to establish a baseline.
+            // 兜底：与 collect_local_processes 相同，正常播种在 main.rs 完成
             let mut s = System::new_with_specifics(
                 RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
             );
             s.refresh_cpu_usage();
-            thread::sleep(Duration::from_millis(500));
             s.refresh_cpu_usage();
             *slot = Some(s);
             slot.as_mut().unwrap()

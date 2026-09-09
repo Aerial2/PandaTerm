@@ -1,9 +1,44 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use encoding_rs::GBK;
 use uuid::Uuid;
 
 use panda_session::{AuthType, Protocol, ReconnectPolicy, Session};
+
+fn decode_xshell_content(bytes: &[u8]) -> String {
+    if let Some(bytes) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let units = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16_lossy(&units);
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let units = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16_lossy(&units);
+    }
+    if let Ok(content) = std::str::from_utf8(bytes) {
+        return content.to_string();
+    }
+
+    #[cfg(windows)]
+    {
+        let (content, _, _) = GBK.decode(bytes);
+        content.into_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
 
 fn xshell_sessions_path() -> Option<PathBuf> {
     if !cfg!(target_os = "windows") {
@@ -27,7 +62,7 @@ fn parse_ini_value(content: &str, key: &str) -> Option<String> {
 }
 
 fn parse_xshell_session(path: &Path) -> Option<Session> {
-    let content = fs::read_to_string(path).ok()?;
+    let content = decode_xshell_content(&fs::read(path).ok()?);
     let host = parse_ini_value(&content, "Host")?;
     let protocol = parse_ini_value(&content, "Protocol").unwrap_or_else(|| "SSH".to_string());
     if !protocol.eq_ignore_ascii_case("ssh") {

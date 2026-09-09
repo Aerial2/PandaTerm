@@ -12,7 +12,6 @@ PandaTerm 是一款面向 Windows 的 SSH 终端与运维工作台。它将远�
 - 支持密码、私钥、Keyboard Interactive 和 GSSAPI 等认证方式。
 - 保存连接名称、分组、标签、主机、端口、用户名及最近连接时间。
 - 支持连接列表拖拽排序和自定义表格列宽。
-- 支持按分组/标签筛选、批量选择、批量连接和批量删除。
 - 支持连接状态跟踪、断线重连策略和终端尺寸同步。
 - 首次连接记录主机密钥，后续连接校验指纹变化，降低中间人攻击风险。
 - 可读取 Windows 上已有的 Xshell 会话并合并到连接列表。
@@ -125,6 +124,66 @@ PandaTerm 将 AI 上下文与运维工作区直接连接，同时保留明确的
 - **桌面运行时**：Tauri 2
 - **后端**：Rust、Tokio、russh、portable-pty、reqwest
 - **前端**：React 19、TypeScript、Vite 6
+
+## 本地运行与打包
+
+以下命令均在仓库根目录执行。
+
+### 环境要求
+
+- Node.js 20+ 与 npm
+- Rust stable 工具链
+- Windows 打包额外需要 WiX（生成 MSI）与 NSIS（生成安装向导）
+
+### 本地运行
+
+```bash
+npm install
+npm run tauri dev
+```
+
+该命令会启动前端开发服务器、编译 Rust 后端（debug），并打开 PandaTerm 窗口。
+
+仅调试界面时可不启动客户端窗口（此时 SSH、文件读写等 Tauri 原生能力不可用）：
+
+```bash
+npm run dev
+# 浏览器访问 http://127.0.0.1:1420
+```
+
+运行前端单元测试：
+
+```bash
+npm run test
+```
+
+### 打包
+
+```bash
+npm run tauri build
+```
+
+该命令会先执行类型检查与前端构建，再以 release 编译后端，最后生成安装包。产物位于 cargo target 目录下：
+
+- `release/bundle/nsis/PandaTerm_<version>_x64-setup.exe`
+- `release/bundle/msi/PandaTerm_<version>_x64_en-US.msi`
+
+target 目录由 `CARGO_TARGET_DIR` 环境变量或 Cargo 配置决定。安装包版本号取自 `src-tauri/tauri.conf.json` 的 `version` 字段。
+
+### 只编译后端
+
+只想验证 Rust 代码能否编译通过时，可在 `src-tauri` 下直接使用 cargo，跳过前端构建与打包：
+
+```bash
+cd src-tauri
+cargo build            # debug
+cargo build --release  # release
+```
+
+### 注意事项
+
+- 修改 `src-tauri` 下的 Rust 代码后，必须重启 `npm run tauri dev` 才会生效；前端改动支持热更新。
+- 编译或打包前请先关闭正在运行的 PandaTerm，否则覆盖 `pandaterm.exe` 时会因文件被占用而失败（拒绝访问，os error 5）。
 
 ## 说明
 

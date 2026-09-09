@@ -2216,6 +2216,7 @@ export function App() {
     }
     const generation = (editorSaveGenerationRef.current.get(id) ?? 0) + 1;
     editorSaveGenerationRef.current.set(id, generation);
+    setStatusMessage(`正在保存：${tab.path}`);
     try {
       if (tab.isRemote && tab.terminalId) {
         await writeRemoteFile(tab.terminalId, tab.path, tab.content);

@@ -669,10 +669,14 @@ fn build_config(params: &RdpConnectParams) -> connector::Config {
         client_name: "pandaterm".to_owned(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
         platform: MajorPlatformType::WINDOWS,
-        enable_server_pointer: false,
+        // 服务端指针更新必须开启：pointer_software_rendering 依赖它把光标
+        // 烘焙进推送给前端的画面帧；关掉会导致远程桌面看不到鼠标指针。
+        enable_server_pointer: true,
         request_data: None,
         autologon: false,
-        enable_audio_playback: false,
+        // 必须为 true：置 false 会向服务器宣告 NO_AUDIO_PLAYBACK，
+        // rdpsnd 不会下发任何 wave 数据，整条音频链路形同虚设。
+        enable_audio_playback: true,
         compression_type: None,
         pointer_software_rendering: true,
         multitransport_flags: None,
@@ -689,6 +693,7 @@ fn build_config(params: &RdpConnectParams) -> connector::Config {
 /// 阻塞式完整建连：DNS → TCP → connect_begin → TLS 升级 → connect_finalize（CredSSP/NLA）。
 /// 返回协商结果与已升级的 Framed（供 ActiveStage 循环使用）。
 fn connect(
+    app: &tauri::AppHandle,
     config: connector::Config,
     server_name: String,
     port: u16,
@@ -732,12 +737,16 @@ fn connect(
     let (upgraded_stream, server_public_key) = tls_upgrade(initial_stream, server_name.clone())
         .map_err(|e| format!("TLS 升级失败: {e}"))?;
 
-    // TOFU 证书 pinning：TLS 为兼容自签证书放行了校验，握手后改用服务器公钥指纹在
-    // known_hosts 做首信/防篡改比对，在把凭据交给 CredSSP 之前拦截 MITM。
-    // 键加 "rdp:" 前缀与 SSH 记录分区；公钥变更（含服务器重装）将中止建连。
+    // TOFU 证书 pinning：TLS 为兼容自签证书放行了校验，握手后改用服务器公钥指纹
+    // 比对 known_hosts：首见指纹弹原生对话框经用户确认后才入库；公钥变更（含
+    // 服务器重装）直接中止建连。全程发生在把凭据交给 CredSSP 之前，MITM 拿不到密码。
+    // 键加 "rdp:" 前缀与 SSH 记录分区。
     let fingerprint = public_key_fingerprint(&server_public_key);
-    let host_key = format!("rdp:{server_name}:{port}");
-    crate::known_hosts::verify_or_trust_fingerprint(&host_key, &fingerprint, "RDP")?;
+    let host_key = format!(
+        "rdp:{}",
+        crate::format_host_port(&server_name, port)
+    );
+    crate::ensure_host_key_trusted_blocking(app, &host_key, &fingerprint, "RDP")?;
 
     eprintln!("[RDP] TLS 握手成功，开始 CredSSP/NLA 认证");
     let upgraded = ironrdp_blocking::mark_as_upgraded(should_upgrade, &mut connector);
@@ -1258,6 +1267,7 @@ fn flush_batch(channel: &Channel<InvokeResponseBody>, batch: &mut TileBatch) -> 
 
 /// 线程入口：先建连，成功后经 oneshot 回传结果并进入常驻循环。
 pub fn run_session(
+    app: tauri::AppHandle,
     params: RdpConnectParams,
     channel: Channel<InvokeResponseBody>,
     closed: Arc<AtomicBool>,
@@ -1266,7 +1276,7 @@ pub fn run_session(
 ) {
     let config = build_config(&params);
     let (connection_result, framed) =
-        match connect(config, params.host.clone(), params.port, channel.clone()) {
+        match connect(&app, config, params.host.clone(), params.port, channel.clone()) {
             Ok(result) => result,
             Err(error) => {
                 let _ = ready.send(Err(error));

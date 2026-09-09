@@ -39,30 +39,82 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         t[b'/' as usize] = 63;
         t
     };
-    let filtered: Vec<u8> = input.bytes().filter(|&b| b != b'\n' && b != b'\r' && b != b' ').collect();
+    let filtered: Vec<u8> = input
+        .bytes()
+        .filter(|&b| b != b'\n' && b != b'\r' && b != b' ')
+        .collect();
     if filtered.is_empty() {
         return Ok(Vec::new());
     }
     if !filtered.len().is_multiple_of(4) {
         return Err(format!("无效的 base64 长度: {}", filtered.len()));
     }
+
     let mut out = Vec::with_capacity(filtered.len() / 4 * 3);
-    for chunk in filtered.chunks(4) {
+    let last_chunk = filtered.len() / 4 - 1;
+    for (chunk_index, chunk) in filtered.chunks(4).enumerate() {
         let v0 = TABLE[chunk[0] as usize];
         let v1 = TABLE[chunk[1] as usize];
-        let v2 = if chunk[2] == b'=' { 0 } else { TABLE[chunk[2] as usize] };
-        let v3 = if chunk[3] == b'=' { 0 } else { TABLE[chunk[3] as usize] };
         if v0 == 255 || v1 == 255 {
+            return Err("无效的 base64 字符或填充位置".to_string());
+        }
+
+        let has_pad2 = chunk[2] == b'=';
+        let has_pad3 = chunk[3] == b'=';
+        if (has_pad2 || has_pad3) && chunk_index != last_chunk {
+            return Err("base64 填充只能出现在末尾".to_string());
+        }
+        if has_pad2 && !has_pad3 {
+            return Err("base64 填充位置无效".to_string());
+        }
+
+        let v2 = if has_pad2 { 0 } else { TABLE[chunk[2] as usize] };
+        let v3 = if has_pad3 { 0 } else { TABLE[chunk[3] as usize] };
+        if v2 == 255 || v3 == 255 {
             return Err("无效的 base64 字符".to_string());
         }
-        let n = ((v0 as u32) << 18) | ((v1 as u32) << 12) | ((v2 as u32) << 6) | (v3 as u32);
+
+        // Reject non-zero unused bits so malformed encodings cannot silently map
+        // to the same decoded bytes as a different canonical input.
+        if has_pad2 && (v1 & 0x0f) != 0 {
+            return Err("base64 填充位无效".to_string());
+        }
+        if !has_pad2 && has_pad3 && (v2 & 0x03) != 0 {
+            return Err("base64 填充位无效".to_string());
+        }
+
+        let n = ((v0 as u32) << 18)
+            | ((v1 as u32) << 12)
+            | ((v2 as u32) << 6)
+            | (v3 as u32);
         out.push((n >> 16) as u8);
-        if chunk[2] != b'=' {
+        if !has_pad2 {
             out.push((n >> 8) as u8);
         }
-        if chunk[3] != b'=' {
+        if !has_pad3 {
             out.push(n as u8);
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_round_trip_and_whitespace() {
+        let encoded = base64_encode(b"legacy secret");
+        assert_eq!(base64_decode(&encoded).unwrap(), b"legacy secret");
+        assert_eq!(base64_decode(" YWJj\n").unwrap(), b"abc");
+    }
+
+    #[test]
+    fn rejects_invalid_padding_and_characters() {
+        for invalid in ["AB=C", "=AAA", "A=AA", "AAAA=", "AA=A", "AA!A"] {
+            assert!(base64_decode(invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert!(base64_decode("AB==").is_err());
+        assert!(base64_decode("AAA=").is_ok());
+    }
 }
