@@ -21,6 +21,8 @@ export type EditorTab = {
   originalContent: string;
   isRemote: boolean;
   terminalId?: string;
+  /** 打开该文件时所在的终端 pane：文件标签跟随它显示，编辑器位置跟随当前激活文件的归属 */
+  hostPaneId?: string | null;
   loading: boolean;
   loadProgress?: {
     transferred: number;
@@ -68,8 +70,19 @@ export { detectLanguage };
 
 const DARK_THEME = 'pandaterm-dark';
 
-/** 每个 tab 的滚动/光标/选区（跨终端切换、跨 panel 隐藏） */
-const editorViewStateByTabId = new Map<string, monaco.editor.ICodeEditorViewState>();
+/** 每个文件的滚动/光标/选区。key 用「路径 + 来源终端」的稳定标识，
+ *  因此跨终端切换、跨 panel 隐藏、以及关闭后再次打开都能回到原位置。 */
+const editorViewStateByStableKey = new Map<string, monaco.editor.ICodeEditorViewState>();
+/** 视图状态上限：超出后淘汰最旧的，避免长期运行无限增长 */
+const MAX_EDITOR_VIEW_STATES = 200;
+/** 超过该字符数按大文件处理：自动关掉耗性能特性 */
+const HUGE_FILE_CHARS = 4 * 1024 * 1024;
+
+/** tabId 带时间戳（保证 React key 唯一、允许同源文件重复打开），
+ *  所以凡是需要跨"关闭再打开"复用的东西（model URI、视图状态）都必须用这个稳定标识。 */
+function tabStableKey(tab: EditorTab): string {
+  return `${tab.path}::${tab.terminalId ?? 'local'}`;
+}
 
 function formatLoadingBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -77,24 +90,37 @@ function formatLoadingBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function tabModelUri(tabId: string): monaco.Uri {
-  // tabId 常含绝对路径（/home/...、C:\...）。
+function tabModelUri(stableKey: string): monaco.Uri {
+  // key 常含绝对路径（/home/...、C:\...）。
   // scheme:/// + encode(id) 在 decode 后 path 会变成 //...，无 authority 时 Monaco 直接抛 UriError。
   return monaco.Uri.from({
     scheme: 'pandaterm-tab',
     authority: 'model',
-    path: `/${encodeURIComponent(tabId)}`,
+    path: `/${encodeURIComponent(stableKey)}`,
   });
+}
+
+function trimEditorViewStates(): void {
+  const overflow = editorViewStateByStableKey.size - MAX_EDITOR_VIEW_STATES;
+  if (overflow <= 0) return;
+  let dropped = 0;
+  for (const key of [...editorViewStateByStableKey.keys()]) {
+    if (dropped++ >= overflow) break;
+    editorViewStateByStableKey.delete(key);
+  }
 }
 
 function saveEditorViewState(
   editor: monaco.editor.IStandaloneCodeEditor | null | undefined,
-  tabId: string | null | undefined,
+  tab: EditorTab | null | undefined,
 ): void {
-  if (!editor || !tabId) return;
+  if (!editor || !tab) return;
   try {
     const state = editor.saveViewState();
-    if (state) editorViewStateByTabId.set(tabId, state);
+    if (state) {
+      editorViewStateByStableKey.set(tabStableKey(tab), state);
+      trimEditorViewStates();
+    }
   } catch {
     // editor 已 dispose 时忽略
   }
@@ -102,10 +128,10 @@ function saveEditorViewState(
 
 function restoreEditorViewState(
   editor: monaco.editor.IStandaloneCodeEditor | null | undefined,
-  tabId: string | null | undefined,
+  tab: EditorTab | null | undefined,
 ): void {
-  if (!editor || !tabId) return;
-  const state = editorViewStateByTabId.get(tabId);
+  if (!editor || !tab) return;
+  const state = editorViewStateByStableKey.get(tabStableKey(tab));
   if (!state) return;
   try {
     editor.restoreViewState(state);
@@ -130,12 +156,17 @@ export function EditorPanel({
   const modelsRef = useRef<Map<string, monaco.editor.ITextModel>>(new Map());
   /** 当前编辑器上附着的 tab（用于切换时保存旧 tab 视口） */
   const boundTabIdRef = useRef<string | null>(null);
+  /** 当前附着的 tab 对象：视图状态按稳定 key 存储，需要完整 tab 信息 */
+  const boundTabRef = useRef<EditorTab | null>(null);
   const suppressModelEventRef = useRef(false);
-  const saveHandlersRef = useRef<Map<string, () => void>>(new Map());
   const activeTabIdRef = useRef(activeTabId);
   activeTabIdRef.current = activeTabId;
   const onContentChangeRef = useRef(onContentChange);
   onContentChangeRef.current = onContentChange;
+  const onSaveRef = useRef(onSave);
+  onSaveRef.current = onSave;
+  /** viewState 落盘节流时间戳：打字时光标每移动一次都会触发保存 */
+  const lastViewStateSaveAtRef = useRef(0);
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
 
@@ -148,7 +179,7 @@ export function EditorPanel({
       }
       return existing;
     }
-    const uri = tabModelUri(tab.id);
+    const uri = tabModelUri(tabStableKey(tab));
     // 分屏时可能同时挂载多个 EditorPanel（workspace 所在 pane + 当前活动 pane），
     // 它们共用同一 tabId → 同一 URI 的 model。这里必须复用全局已存在的 model：
     // 若在此 dispose 后重建，会销毁另一个面板正在使用的 model，导致那个面板变空白。
@@ -171,14 +202,16 @@ export function EditorPanel({
     if (!editor) return;
 
     const prevId = boundTabIdRef.current;
-    if (prevId && prevId !== tab?.id) {
-      saveEditorViewState(editor, prevId);
+    const prevTab = boundTabRef.current;
+    if (prevTab && prevId && prevId !== tab?.id) {
+      saveEditorViewState(editor, prevTab);
     }
 
     if (!tab || tab.error) {
       if (tab?.error) {
         editor.setModel(null);
         boundTabIdRef.current = null;
+        boundTabRef.current = null;
       }
       return;
     }
@@ -186,9 +219,10 @@ export function EditorPanel({
     if (tab.loading) {
       // 加载中不展示其它 tab 内容
       if (prevId && prevId !== tab.id) {
-        saveEditorViewState(editor, prevId);
+        saveEditorViewState(editor, prevTab);
         editor.setModel(null);
         boundTabIdRef.current = null;
+        boundTabRef.current = null;
       }
       return;
     }
@@ -199,12 +233,13 @@ export function EditorPanel({
       editor.setModel(model);
     }
     boundTabIdRef.current = tab.id;
+    boundTabRef.current = tab;
     if (needSwitch) {
       // 双 rAF：等 Monaco 完成 model 附着与布局后再 restore
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           if (editor.getModel() !== model) return;
-          restoreEditorViewState(editor, tab.id);
+          restoreEditorViewState(editor, tab);
           editor.layout();
         });
       });
@@ -251,9 +286,11 @@ export function EditorPanel({
 
   const handleMount: OnMount = useCallback((editor, monacoApi) => {
     editorRef.current = editor;
+    // 直接从 ref 取最新 tabId / onSave：旧的 Map set/delete 方式在 effect 重跑的
+    // 间隙会短暂取不到 handler，导致 Ctrl+S 按下去没反应
     editor.addCommand(monacoApi.KeyMod.CtrlCmd | monacoApi.KeyCode.KeyS, () => {
-      const handler = saveHandlersRef.current.get(activeTabIdRef.current ?? '');
-      if (handler) handler();
+      const tabId = activeTabIdRef.current;
+      if (tabId) onSaveRef.current(tabId);
     });
     editor.onDidChangeModelContent(() => {
       if (suppressModelEventRef.current) return;
@@ -261,21 +298,25 @@ export function EditorPanel({
       if (!tabId) return;
       onContentChangeRef.current(tabId, editor.getValue());
     });
-    // 滚动/光标变化时持续落盘，切换 tab 前即使异常卸载也能恢复
-    editor.onDidScrollChange(() => {
-      saveEditorViewState(editor, boundTabIdRef.current);
-    });
-    editor.onDidChangeCursorPosition(() => {
-      saveEditorViewState(editor, boundTabIdRef.current);
-    });
+    // 滚动/光标变化时持续落盘，切换 tab 前即使异常卸载也能恢复。
+    // 打字时光标每移动一次都会触发，故做节流，避免频繁序列化视图状态。
+    const throttledSaveViewState = () => {
+      const now = Date.now();
+      if (now - lastViewStateSaveAtRef.current < 200) return;
+      lastViewStateSaveAtRef.current = now;
+      saveEditorViewState(editor, boundTabRef.current);
+    };
+    editor.onDidScrollChange(throttledSaveViewState);
+    editor.onDidChangeCursorPosition(throttledSaveViewState);
 
     const tab = tabsRef.current.find((item) => item.id === activeTabIdRef.current) ?? null;
     if (tab && !tab.loading && !tab.error) {
       const model = ensureModel(tab);
       editor.setModel(model);
       boundTabIdRef.current = tab.id;
+      boundTabRef.current = tab;
       requestAnimationFrame(() => {
-        restoreEditorViewState(editor, tab.id);
+        restoreEditorViewState(editor, tab);
       });
     }
   }, [ensureModel]);
@@ -286,11 +327,20 @@ export function EditorPanel({
     ? Math.min(100, Math.round((activeLoadProgress.transferred / activeLoadProgress.total) * 100))
     : null;
 
+  // 大文件自动关掉耗性能特性，避免输入/滚动卡顿
+  const isHugeFile = (activeTab?.content.length ?? 0) > HUGE_FILE_CHARS;
   useEffect(() => {
-    if (!activeTab) return;
-    saveHandlersRef.current.set(activeTab.id, () => onSave(activeTab.id));
-    return () => { saveHandlersRef.current.delete(activeTab.id); };
-  }, [activeTab, onSave]);
+    const editor = editorRef.current;
+    if (!editor) return;
+    editor.updateOptions({
+      minimap: { enabled: !isHugeFile, scale: 1 },
+      stickyScroll: { enabled: !isHugeFile },
+      bracketPairColorization: { enabled: !isHugeFile },
+      renderLineHighlight: isHugeFile ? 'none' : 'all',
+      fontLigatures: !isHugeFile,
+      folding: !isHugeFile,
+    });
+  }, [isHugeFile, activeTabId]);
 
   // tab 切换 / 加载结束 → 绑定 model 并恢复该 tab 视口
   useEffect(() => {
@@ -319,46 +369,54 @@ export function EditorPanel({
     if (keepView && editor) {
       requestAnimationFrame(() => editor.restoreViewState(keepView));
     }
-  }, [activeTabId, activeTab?.content, activeTab?.language, activeTab?.loading, activeTab?.error, activeTab, bindTabToEditor]);
+  }, [activeTabId, activeTab?.content, activeTab?.language, activeTab?.loading, activeTab?.error, bindTabToEditor]);
 
   // 隐藏面板：保存视口；再显示 layout + 恢复
   useEffect(() => {
     const editor = editorRef.current;
-    const tabId = boundTabIdRef.current ?? activeTabIdRef.current;
+    const tab = boundTabRef.current
+      ?? tabsRef.current.find((item) => item.id === activeTabIdRef.current)
+      ?? null;
     if (!visible) {
-      saveEditorViewState(editor, tabId);
+      saveEditorViewState(editor, tab);
       return;
     }
     const frame = requestAnimationFrame(() => {
       editor?.layout();
-      restoreEditorViewState(editor, tabId);
+      restoreEditorViewState(editor, tab);
     });
     return () => cancelAnimationFrame(frame);
   }, [visible]);
 
-  // 关闭的 tab：释放 model + viewState
+  // 关闭的 tab：释放 model；视图状态按稳定 key 保留，便于再次打开恢复位置（上限由 trim 控制）
   useEffect(() => {
     const alive = new Set(tabs.map((t) => t.id));
     for (const [id, model] of [...modelsRef.current.entries()]) {
       if (alive.has(id)) continue;
       if (!model.isDisposed()) model.dispose();
       modelsRef.current.delete(id);
-      editorViewStateByTabId.delete(id);
-      if (boundTabIdRef.current === id) boundTabIdRef.current = null;
+      if (boundTabIdRef.current === id) {
+        boundTabIdRef.current = null;
+        boundTabRef.current = null;
+      }
     }
   }, [tabs]);
 
   // 卸载：保存视口、不销毁全局 viewState（同会话可能再挂载）
   useEffect(() => () => {
-    saveEditorViewState(editorRef.current, boundTabIdRef.current ?? activeTabIdRef.current);
+    saveEditorViewState(editorRef.current, boundTabRef.current);
   }, []);
 
+  // showTabBar=false（嵌入 pane）时标签栏不渲染，无需统计重名
   const nameCounts = new Map<string, number>();
-  for (const t of tabs) nameCounts.set(t.name, (nameCounts.get(t.name) ?? 0) + 1);
+  if (showTabBar) {
+    for (const t of tabs) nameCounts.set(t.name, (nameCounts.get(t.name) ?? 0) + 1);
+  }
 
   function tabLabel(tab: EditorTab): string {
     if ((nameCounts.get(tab.name) ?? 0) > 1) {
-      const parts = tab.path.split('/');
+      // 同时兼容 / 与 \，否则 Windows 路径取不到父目录
+      const parts = tab.path.split(/[/\\]/);
       const parent = parts.length >= 2 ? parts[parts.length - 2] : '';
       return parent ? `${tab.name} (${parent})` : tab.name;
     }

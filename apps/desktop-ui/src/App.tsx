@@ -619,6 +619,9 @@ export function App() {
   pendingPaneTabIdRef.current = pendingPaneTabId;
   const [editorTabs, setEditorTabs] = useState<EditorTab[]>([]);
   const [activeEditorTabId, setActiveEditorTabId] = useState<string | null>(null);
+  /** 编辑器宿主 pane：编辑器固定在打开它的 pane，不随终端焦点切换而搬家 */
+  /** 各 workspace 已知 pane 集合：用于检测 pane 被移除（合并分屏/关终端），把归属它的文件标签改为无归属 */
+  const knownPaneIdsByWorkspaceRef = useRef<Map<string, Set<string>>>(new Map());
   const untitledEditorCounterRef = useRef(1);
   const [showEditor, setShowEditor] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: ResourceFile | null } | null>(null);
@@ -634,6 +637,10 @@ export function App() {
   const pathEditInputRef = useRef<HTMLInputElement | null>(null);
   const uploadAbortRefs = useRef<Map<string, AbortController>>(new Map());
   const editorSaveGenerationRef = useRef<Map<string, number>>(new Map());
+  /** 正在保存中的编辑器 tab：避免并发保存时旧内容后落盘覆盖新内容 */
+  const editorSavingIdsRef = useRef<Set<string>>(new Set());
+  /** 保存期间又产生的改动：当前这次结束后再补存一次 */
+  const editorPendingSaveRef = useRef<Set<string>>(new Set());
   /** seconds 用 DOM 刷新，避免连接中每秒整 App 重渲 */
   const [openingConnection, setOpeningConnection] = useState<{ session: Session; tabId: string; startedAt: number } | null>(null);
   const openingSecondsRef = useRef<HTMLSpanElement | null>(null);
@@ -1208,6 +1215,30 @@ export function App() {
     if (!showEditor) return null;
     return editorTabs.find((tab) => tab.id === activeEditorTabId) ?? null;
   }, [showEditor, editorTabs, activeEditorTabId]);
+
+  // pane 被移除（合并分屏、关闭终端）时，把归属它的文件标签改为无归属（渲染时回退到活动 pane）。
+  // 按 workspace 分桶记忆已知 pane，避免切换 workspace 时误清其它 workspace 的归属。
+  useEffect(() => {
+    if (!activeTab || (activeTab.kind !== 'terminal' && activeTab.kind !== 'rdp')) return;
+    const layout = activeTab.layout ?? createDefaultTerminalLayout(activeTab.id);
+    const paneIds = collectTerminalLayoutTabIds(layout);
+    const byWorkspace = knownPaneIdsByWorkspaceRef.current;
+    const previous = byWorkspace.get(activeTab.id);
+    const removed: string[] = [];
+    if (previous) {
+      for (const id of previous) {
+        if (!paneIds.includes(id)) removed.push(id);
+      }
+    }
+    byWorkspace.set(activeTab.id, new Set(paneIds));
+    if (removed.length === 0) return;
+    setEditorTabs((current) => current.map((t) =>
+      t.hostPaneId && removed.includes(t.hostPaneId) ? { ...t, hostPaneId: null } : t,
+    ));
+  }, [activeTab?.id, activeTab?.layout]);
+
+  /** 当前激活文件归属的 pane：编辑器区域显示在哪个 pane 由它决定（无归属回退活动 pane） */
+  const editorDisplayPaneId = editorTabs.find((t) => t.id === activeEditorTabId)?.hostPaneId ?? activePaneId;
   const topStatusName = statusFocusEditor
     ? (statusFocusEditor.isUntitled
       ? statusFocusEditor.name
@@ -2028,6 +2059,7 @@ export function App() {
       content: '',
       originalContent: '',
       isRemote: false,
+      hostPaneId: activePaneIdRef.current,
       loading: false,
       error: '',
       isUntitled: true,
@@ -2062,7 +2094,10 @@ export function App() {
     return parent ? `${tab.name} (${parent})` : tab.name;
   }
 
-  async function openFileInEditor(file: ResourceFile) {
+  /** 超过该大小的文件打开前先确认，避免误点大文件把界面卡死 */
+  const HUGE_FILE_OPEN_BYTES = 20 * 1024 * 1024;
+
+  async function openFileInEditor(file: ResourceFile, options?: { skipSizeConfirm?: boolean }) {
     // If already open, just focus it.  Must match both path AND the
     // originating session (terminalId) so that the same filename on
     // different servers is treated as separate editor tabs.
@@ -2078,6 +2113,17 @@ export function App() {
       return;
     }
 
+    // 超大文件先让用户确认，别一不留神把整个窗口卡住
+    if (!options?.skipSizeConfirm && file.sizeBytes > HUGE_FILE_OPEN_BYTES) {
+      requestConfirm({
+        title: '文件较大',
+        message: `「${file.name}」约 ${(file.sizeBytes / (1024 * 1024)).toFixed(1)} MB，打开会占用较多内存并可能明显卡顿。确定要打开吗？`,
+        confirmLabel: '仍要打开',
+        onConfirm: () => { void openFileInEditor(file, { skipSizeConfirm: true }); },
+      });
+      return;
+    }
+
     const tabId = `${file.path}::${terminalId ?? 'local'}::${Date.now()}`;
     const newTab: EditorTab = {
       id: tabId,
@@ -2088,6 +2134,7 @@ export function App() {
       originalContent: '',
       isRemote: !local,
       terminalId,
+      hostPaneId: activePaneIdRef.current,
       loading: true,
       error: '',
     };
@@ -2202,18 +2249,28 @@ export function App() {
   }
 
   function updateEditorContent(id: string, content: string) {
-    setEditorTabs((current) => current.map((t) =>
-      t.id === id ? { ...t, content } : t,
-    ));
+    setEditorTabs((current) => {
+      const target = current.find((t) => t.id === id);
+      // 内容没变就原样返回：分屏时多个编辑器共享同一 model，
+      // 一次输入会触发多次内容相同的回调，避免重复 re-render
+      if (!target || target.content === content) return current;
+      return current.map((t) => (t.id === id ? { ...t, content } : t));
+    });
   }
 
   async function saveEditorFile(id: string) {
+    // 上一次保存还没结束又触发：只做标记，避免两次写入并发、旧内容后落盘覆盖新内容
+    if (editorSavingIdsRef.current.has(id)) {
+      editorPendingSaveRef.current.add(id);
+      return;
+    }
     const tab = editorTabs.find((t) => t.id === id);
     if (!tab || tab.content === tab.originalContent) return;
     if (tab.isUntitled) {
       setStatusMessage('未命名文件需要先选择保存路径');
       return;
     }
+    editorSavingIdsRef.current.add(id);
     const generation = (editorSaveGenerationRef.current.get(id) ?? 0) + 1;
     editorSaveGenerationRef.current.set(id, generation);
     setStatusMessage(`正在保存：${tab.path}`);
@@ -2232,6 +2289,12 @@ export function App() {
       if (editorSaveGenerationRef.current.get(id) !== generation) return;
       const message = error instanceof Error ? error.message : String(error);
       setStatusMessage(`保存失败：${message}`);
+    } finally {
+      editorSavingIdsRef.current.delete(id);
+      // 保存期间又有新改动：再存一次，保证最终落盘的是最新内容
+      if (editorPendingSaveRef.current.delete(id)) {
+        void saveEditorFile(id);
+      }
     }
   }
 
@@ -6210,8 +6273,13 @@ export function App() {
       .map(renderWorkspaceChip);
   }
 
-  function renderEditorTabItems(): ReactNode {
-    return editorTabs.map(renderEditorPaneTab);
+  function renderEditorTabItems(paneTabId?: string): ReactNode {
+    // 主区独立标签栏（无 paneTabId）显示全部文件标签；
+    // pane 内只显示归属该 pane 的文件标签（无归属的回退到当前活动 pane）
+    const list = paneTabId
+      ? editorTabs.filter((t) => (t.hostPaneId ?? activePaneId) === paneTabId)
+      : editorTabs;
+    return list.map(renderEditorPaneTab);
   }
 
   function renderPaneTabItems(paneTabId: string, paneTabs: WorkspaceTab[]): ReactNode {
@@ -6233,7 +6301,9 @@ export function App() {
           aria-label="标签"
         >
           {showWorkspaceTabs && renderWorkspaceTabItems()}
-          {showWorkspaceTabs && renderEditorTabItems()}
+          {/* 文件标签按归属 pane 过滤（见 renderEditorTabItems）：谁的标签栏显示谁打开的文件，
+              常驻显示、不随编辑器视图开关（showEditor）或焦点切换消失 */}
+          {renderEditorTabItems(paneTabId)}
           {paneTabId && renderPaneTabItems(paneTabId, paneTabs)}
         </div>
         {renderPaneAddButton(targetPaneId)}
@@ -6274,7 +6344,7 @@ export function App() {
     const isWorkspacePane = activeTab ? paneTabIds.includes(activeTab.id) : false;
     // 编辑器打开时，当前活动 pane 仍是编辑器标签栏的承载 pane。
     // 不再只依赖 workspace root tab，避免本地编辑器切换后 root 判断短暂失配导致 tabs 消失。
-    const showWorkspaceChips = isWorkspacePane || (showEditor && activePaneId === node.tabId);
+    const showWorkspaceChips = isWorkspacePane || (showEditor && editorDisplayPaneId === node.tabId);
 
     return (
       <section
@@ -6296,7 +6366,9 @@ export function App() {
         {getPaneDropPreview(node.tabId)}
         <div className="terminal-pane-tabbar">
           {getPaneTabbarDropPreview(node.tabId)}
-          {renderUnifiedPaneTabbar(node.tabId, paneTabs, showWorkspaceChips, node.tabId)}
+          {/* 连接标签只挂在 workspace 根 pane：编辑器宿主 pane 的标签栏只放文件标签 + 自己的终端 tab，
+              否则分屏时每个 pane 都会重复渲染全部服务器连接标签 */}
+          {renderUnifiedPaneTabbar(node.tabId, paneTabs, isWorkspacePane, node.tabId)}
         </div>
         {paneTab.kind === 'rdp' ? (
           <div className="rdp-focus-card">
@@ -6336,8 +6408,10 @@ export function App() {
                 <span>{paneTab.statusMessage || '等待终端就绪...'}</span>
               </div>
             )}
-            {showWorkspaceChips && (
-              <div className={`terminal-pane-editor-host${showEditor ? '' : ' is-hidden'}`}>
+            {/* 编辑器只在当前活动 pane 渲染：分屏时若多个 pane 同时挂 EditorPanel，
+                同一文件会在每个 pane 各显示一份（model 按稳定 key 全局共享） */}
+            {showEditor && editorDisplayPaneId === node.tabId && (
+              <div className="terminal-pane-editor-host">
                 <EditorPanel
                   tabs={editorTabs}
                   activeTabId={activeEditorTabId}

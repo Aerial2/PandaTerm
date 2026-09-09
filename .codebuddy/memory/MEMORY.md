@@ -34,6 +34,20 @@
   - 长任务会被自动转后台/跳过：改用 `Start-Process` 重定向输出到日志文件，再用 read_file 轮询结果。
 - **编译前必须关闭运行中的 pandaterm.exe**：否则 `error: failed to remove file F:/cargo-targets\debug\pandaterm.exe … 拒绝访问 (os error 5)`（代码其实已编译过，只卡在替换二进制）。用 `taskkill /F /IM pandaterm.exe`。
 - **target-dir 实际由环境变量决定**：存在用户级 `CARGO_TARGET_DIR=F:/cargo-targets`，**优先级高于**项目 `.cargo/config.toml` 的 `F:/cargo-targets/PandaTerm`，故产物仍落在 `F:/cargo-targets/debug`，可复用 2026-08-28 缓存（增量很快：check 2.2s、build 6.6s）。
+- **rustup shim 损坏 + PATH 修复（2026-09-09）**：`C:\Users\24901\.cargo\bin` 下 13 个 shim（`cargo.exe`/`rustc.exe`/`rustfmt.exe`/`rust-analyzer.exe` 等）**全是 0 字节坏符号链接**（`Archive, ReparsePoint`），只有 `rustup.exe`、`sccache.exe` 是真实文件。
+  - 症状：`npm run tauri dev` 报 `failed to run 'cargo metadata' … program not found`（重启应用无效，这是环境问题）。
+  - 已修：把真实的 `C:\Users\24901\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin` 加到**用户 PATH 首位**（cargo/rustc 1.95.0 实测可用）。
+  - 注意：`.cargo\bin` 不可依赖；IDE 的 rust-analyzer 若失效，根源是同目录 `rust-analyzer.exe` 坏链接，需硬链接到 toolchain 或重装 rustup。
+  - 改完用户 PATH 后**必须重开终端**才生效（环境变量在进程启动时读取）。
+- **`tauri dev` 与手动 `cargo build` 的 target 目录、features 都不同（2026-09-09 实测）**：
+  - `tauri dev` 走 `cargo run --no-default-features`，产物落在 `F:/cargo-targets/PandaTerm/debug`（项目 `.cargo/config.toml` 的隔离目录**确实生效**）。
+  - 手动 `cargo build` 走默认 features 且受 `CARGO_TARGET_DIR=F:/cargo-targets` 影响，产物落在 `F:/cargo-targets/debug`。
+  - 两者**缓存不通用**：手动编译只要几秒，不代表 `tauri dev` 快——首次 `tauri dev` 会全量编译（实测 757 crates，2 分 36 秒）；之后该目录有缓存就变增量。
+  - 验证"改动能否跑起来"必须以 `tauri dev` 实际启动为准，不能只看手动 `cargo check/build`。
+- **PowerShell profile 已修（2026-09-09）**：`C:\Users\24901\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1` 原本只有一行 `fnm env --use-on-cd ...`，而 fnm 不存在 → 每次开终端必报错。
+  - 已改为：`fnm` 加 `Get-Command` 存在性判断（不再报错）+ 自动把 `C:\Users\24901\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin` 加进 `$env:Path`（带 `-notlike` 判断避免重复累加）。
+  - 原文件备份为同目录 `.bak`。
+  - **关键坑**：改用户级 PATH 后，若 IDE 未重启，它新建的终端标签页仍继承 IDE 的旧环境（继续报 `program not found`）。**改 profile 可绕过此限制，无需重启 IDE**。
 
 ## 5. Monaco 编辑器 model 必须全局共享复用（分屏多实例）
 - `EditorPanel` 的 model URI 只由 `tabId` 决定（`tabModelUri()`，scheme `pandaterm-tab`），**全局唯一**。

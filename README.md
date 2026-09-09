@@ -45,7 +45,7 @@ PandaTerm 是一款面向 Windows 的 SSH 终端与运维工作台。它将远�
 - 支持多编辑器标签、未保存状态提示和 `Ctrl+S` 快捷保存。
 - 根据扩展名识别 TypeScript、JavaScript、Rust、Python、Go、Java、C/C++、JSON、YAML、Markdown、Shell 等常见语言。
 - 大文件读取显示传输进度、已传输大小和实时速度。
-- 保存前校验文件是否被外部修改，避免静默覆盖较新的内容。
+- 保存过程中再次触发会自动排队补存，避免并发写入时旧内容后落盘覆盖新内容。
 
 ### 文件传输中心
 
