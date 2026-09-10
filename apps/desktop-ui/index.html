@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <title>PandaTerm</title>
+    <script>
+      // Prevent white flash before React mounts.
+      const params = new URLSearchParams(window.location.search);
+      const mode = params.get('mode');
+      document.documentElement.style.background = '#2e323a';
+      document.addEventListener('DOMContentLoaded', () => {
+        document.body.style.background = '#2e323a';
+        if (mode === 'connection') {
+          document.body.style.overflow = 'hidden';
+          document.body.style.minWidth = 'unset';
+          document.body.style.minHeight = 'unset';
+        }
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

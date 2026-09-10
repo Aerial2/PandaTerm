@@ -1,0 +1,15 @@
+{
+  "name": "pandaterm-workspace",
+  "private": true,
+  "workspaces": [
+    "apps/desktop-ui"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace apps/desktop-ui",
+    "build": "npm run build --workspace apps/desktop-ui",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.2.7"
+  }
+}

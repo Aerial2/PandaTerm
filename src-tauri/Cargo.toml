@@ -1,0 +1,44 @@
+[package]
+name = "pandaterm"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "pandaterm"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.2.0", features = [] }
+
+[dependencies]
+panda-core = { path = "../crates/panda-core" }
+panda-crypto = { path = "../crates/panda-crypto" }
+panda-session = { path = "../crates/panda-session" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.2.5", features = [] }
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+encoding_rs = "0.8.35"
+portable-pty = "0.9.0"
+russh = "0.51"
+sysinfo = "0.33"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+zeroize = "1.9.0"
+tauri-plugin-clipboard-manager = "2.3.2"
+tauri-plugin-opener = "2.5.4"
+ironrdp = { version = "0.17", features = ["connector", "session", "graphics", "input", "pdu", "dvc", "displaycontrol", "core", "svc", "cliprdr", "rdpsnd"] }
+ironrdp-blocking = "0.10"
+sspi = { version = "0.21", features = ["network_client"] }
+tokio-rustls = "0.26"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+native-tls = "0.2.18"
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+sha2 = "0.10"
+tauri-plugin-dialog = "2.7.2"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

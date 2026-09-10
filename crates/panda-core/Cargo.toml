@@ -1,0 +1,13 @@
+[package]
+name = "panda-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+panda-session = { path = "../panda-session" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
