@@ -4,6 +4,8 @@ PandaTerm 是一款面向 Windows 的 SSH 终端与运维工作台。它将远�
 
 > 当前版本：`0.1.2`。项目仍处于持续开发阶段，功能和数据格式可能继续调整。
 
+![PandaTerm 主界面：SSH 终端分屏、文件管理树、文件传输与主机监控](docs/images/pandaterm-main-window.png)
+
 ## 功能概览
 
 ### SSH 连接与会话管理
