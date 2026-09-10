@@ -20,8 +20,9 @@ pub fn extract_command(archive_path: &str, dest_dir: &str) -> String {
         format!("mkdir -p {d} && tar xf {q} -C {d}")
     } else if lower.ends_with(".zip") {
         // Try unzip first, fall back to python3's zipfile module if unzip is missing.
+        // python3 extractall 存在 Zip Slip（../ 或绝对路径成员可写出目标目录），先校验成员名。
         format!(
-            "mkdir -p {d} && (command -v unzip >/dev/null 2>&1 && unzip -o {q} -d {d} || python3 -c \"import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])\" {q} {d})"
+            "mkdir -p {d} && (command -v unzip >/dev/null 2>&1 && unzip -o {q} -d {d} || python3 -c \"import zipfile,sys,posixpath;z=zipfile.ZipFile(sys.argv[1]);[sys.exit('unsafe zip member: '+n) for n in z.namelist() if posixpath.normpath(n).startswith('..') or posixpath.isabs(n)];z.extractall(sys.argv[2])\" {q} {d})"
         )
     } else if lower.ends_with(".gz") {
         format!("gunzip -f {q}")

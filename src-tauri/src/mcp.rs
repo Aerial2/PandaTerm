@@ -292,10 +292,24 @@ impl Default for SessionSlot {
     }
 }
 
+/// MCP 服务器可能把环境变量/凭据打到 stderr：落日志前对疑似敏感行整行脱敏，
+/// 避免 token / api key / password 进入后端日志与前端错误提示。
+fn redact_mcp_log_line(line: &str) -> String {
+    const SENSITIVE: [&str; 6] = ["token", "api_key", "apikey", "api-key", "secret", "password"];
+    let lowered = line.to_lowercase();
+    if SENSITIVE.iter().any(|key| lowered.contains(key)) {
+        return "[已脱敏：疑似包含凭据]".to_string();
+    }
+    line.to_string()
+}
+
 pub struct McpRuntime {
     sessions: Mutex<HashMap<String, SessionSlot>>,
     /// Shared stdout reader tasks need to route responses.
     response_routes: Mutex<HashMap<String, Arc<Mutex<HashMap<u64, PendingRequest>>>>>,
+    /// 每个 server 一个调用信号量：让同一会话的 tools/call 串行，
+    /// 避免并发调用互相 take 走 live 而导致其中一个误判“会话未连接”
+    call_locks: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     http: reqwest::Client,
 }
 
@@ -309,6 +323,7 @@ impl Default for McpRuntime {
         Self {
             sessions: Mutex::new(HashMap::new()),
             response_routes: Mutex::new(HashMap::new()),
+            call_locks: Mutex::new(HashMap::new()),
             http,
         }
     }
@@ -1166,7 +1181,9 @@ async fn read_mcp_message(reader: &mut BufReader<ChildStdout>) -> Result<Value, 
                 .trim()
                 .parse::<usize>()
                 .map_err(|_| "MCP Content-Length 无效".to_string())?;
-            // 读完剩余 header 直到空行
+            // 读完剩余 header 直到空行；限制行数，避免异常服务器持续发送非空行，
+            // 把这条唯一的响应读循环挂住（之后所有在途请求只能逐个超时失败）
+            let mut header_lines = 0usize;
             loop {
                 let mut header_line = String::new();
                 let hn = reader
@@ -1178,6 +1195,10 @@ async fn read_mcp_message(reader: &mut BufReader<ChildStdout>) -> Result<Value, 
                 }
                 if header_line.trim_end_matches(['\r', '\n']).is_empty() {
                     break;
+                }
+                header_lines += 1;
+                if header_lines > 32 {
+                    return Err("MCP 响应 header 过长".to_string());
                 }
             }
             if length > 8 * 1024 * 1024 {
@@ -1216,6 +1237,7 @@ impl McpRuntime {
             }
         }
         self.response_routes.lock().await.clear();
+        self.call_locks.lock().await.clear();
     }
 
     pub async fn disconnect_server(&self, server_id: &str) {
@@ -1226,6 +1248,7 @@ impl McpRuntime {
             }
         }
         self.response_routes.lock().await.remove(server_id);
+        self.call_locks.lock().await.remove(server_id);
     }
 
     pub async fn snapshot(
@@ -1458,7 +1481,7 @@ impl McpRuntime {
                             if text.is_empty() {
                                 continue;
                             }
-                            eprintln!("[MCP {}] {text}", server_id);
+                            eprintln!("[MCP {}] {}", server_id, redact_mcp_log_line(text));
                             let mut buf = stderr_tail.lock().await;
                             if !buf.is_empty() {
                                 buf.push('\n');
@@ -1604,6 +1627,18 @@ impl McpRuntime {
         live.tools = tools.clone();
 
         let mut sessions = self.sessions.lock().await;
+        // initialize 最长可达 MCP_INIT_TIMEOUT：期间用户可能已禁用/重连该服务器。
+        // 若 slot 已不存在或状态不再是 connecting，说明本次 spawn 的结果已过期：
+        // 丢弃并杀掉子进程，否则会“复活”一个已经被关闭的会话。
+        let still_connecting = matches!(
+            sessions.get(&config.id),
+            Some(slot) if slot.status == "connecting"
+        );
+        if !still_connecting {
+            drop(sessions);
+            let _ = live.child.kill().await;
+            return Err(format!("MCP 服务器「{}」在连接过程中已被关闭", config.id));
+        }
         sessions.insert(
             config.id.clone(),
             SessionSlot {
@@ -1744,6 +1779,20 @@ impl McpRuntime {
         }
 
         let arguments = request.arguments.unwrap_or_else(|| json!({}));
+
+        // 同一 server 的调用串行化：并发调用会互相把 live take 走，
+        // 使第二个调用直接报“会话未连接”（实际上会话是健康的）
+        let call_permit = {
+            let mut locks = self.call_locks.lock().await;
+            locks
+                .entry(server.id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+                .clone()
+        };
+        let _call_guard = match call_permit.acquire().await {
+            Ok(guard) => guard,
+            Err(_) => return Err("MCP 调用并发控制已失效".to_string()),
+        };
 
         // 取出 live，避免在 await 期间长期占用 sessions 锁
         let live = {

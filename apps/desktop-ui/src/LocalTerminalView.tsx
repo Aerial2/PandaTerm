@@ -13,6 +13,7 @@ import {
   type TerminalOutputEvent,
   type TerminalStatusEvent,
 } from './api';
+import { prepareTerminalPaste } from './terminalPaste';
 
 const terminalTheme = {
   background: '#1e1e1e',
@@ -120,9 +121,17 @@ export function LocalTerminalView({ active }: LocalTerminalViewProps) {
         if (event.type === 'keydown' && !event.repeat) {
           void (async () => {
             try {
-              const text = await readClipboardText();
+              const raw = await readClipboardText();
               const id = terminalIdRef.current;
-              if (text && id) await sendLocalTerminalInput(id, text);
+              if (!raw || !id) return;
+              // 与远端 SSH 粘贴保持一致：超长截断 + 危险控制字符/多行提示，
+              // 避免把含 ESC 等控制序列的剪贴板直接灌进本地 shell
+              const prepared = prepareTerminalPaste(raw);
+              if (prepared.requiresConfirmation
+                && !window.confirm('剪贴板内容包含控制字符或多行命令，粘贴到本地终端可能触发意外行为。确定粘贴吗？')) {
+                return;
+              }
+              await sendLocalTerminalInput(id, prepared.text);
             } catch {
               // ignore
             }

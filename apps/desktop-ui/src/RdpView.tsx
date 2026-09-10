@@ -460,17 +460,20 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
       void rdpInputBatch(terminalId, batch).catch(() => undefined);
     };
 
-    const pollLocalClipboard = async () => {
+    /** 把本地剪贴板送往远程。force=true 用于用户主动粘贴（允许重复发送同一内容）。
+     *  不再做后台定时轮询：否则在用户无感知的情况下，本地复制的密码/令牌会被自动推送给远程主机。 */
+    const sendLocalClipboard = async (force: boolean) => {
       if (disposed || !connected) return;
       const startedAtEpoch = clipboardEpoch;
       try {
         const text = await readText();
         if (disposed || !connected || startedAtEpoch !== clipboardEpoch) return;
-        if (text === lastClipboardText || text.length * 2 + 2 > MAX_CLIPBOARD_BYTES) return;
+        if (text.length * 2 + 2 > MAX_CLIPBOARD_BYTES) return;
+        if (!force && text === lastClipboardText) return;
         lastClipboardText = text;
         queueInput({ kind: 'clipboard', text });
       } catch {
-        // 系统剪贴板可能被其他进程短暂占用，下个轮询周期自动重试。
+        // 系统剪贴板可能被其他进程短暂占用，忽略本次
       }
     };
 
@@ -580,6 +583,13 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
       queueInput({ kind: 'wheel', vertical, delta: units });
     };
     const onKeyDown = (e: KeyboardEvent) => {
+      // 粘贴：仅在用户主动按下 Ctrl/Cmd+V（或 Shift+Insert）时才把本地剪贴板送往远程；
+      // 按键本身照常下发，由远程应用决定如何粘贴。
+      const isPaste = ((e.ctrlKey || e.metaKey) && !e.altKey
+        && (e.code === 'KeyV' || e.key === 'v' || e.key === 'V'))
+        || (e.shiftKey && e.code === 'Insert');
+      if (isPaste) void sendLocalClipboard(true);
+
       const scancode = codeToScancode(e.code);
       if (scancode === undefined) return;
       e.preventDefault();
@@ -623,9 +633,6 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
     });
 
     const initial = resolutionToDesktopSize(container, resolution);
-    clipboardPollTimer = window.setInterval(() => {
-      void pollLocalClipboard();
-    }, 500);
     rdpConnect(sessionId, terminalId, initial.width, initial.height, quality, channel)
       .then((result) => {
         if (disposed) return;
@@ -636,7 +643,6 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
         lastH = result.height;
         setStatus('connected');
         observer.observe(container);
-        void pollLocalClipboard();
       })
       .catch((e) => {
         if (disposed) return;
@@ -786,7 +792,12 @@ export function RdpView({ sessionId, terminalId, onError }: RdpViewProps) {
       {status !== 'connected' && (
         <div className="rdp-overlay">
           {status === 'connecting' && <span>正在连接远程桌面…</span>}
-          {status === 'error' && <span>远程桌面已停止：{errorMsg}</span>}
+          {status === 'error' && (
+            <div className="rdp-disconnect">
+              <span>远程桌面已停止：{errorMsg}</span>
+              <button type="button" onClick={() => setReconnectNonce((n) => n + 1)}>重新连接</button>
+            </div>
+          )}
           {status === 'disconnected' && (
             <div className="rdp-disconnect">
               <span>远程桌面会话已断开{errorMsg ? '：' + errorMsg : ''}</span>

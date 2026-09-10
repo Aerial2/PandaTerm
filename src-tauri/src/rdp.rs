@@ -876,8 +876,15 @@ impl TileBatch {
         self.payload.extend_from_slice(&w.to_le_bytes());
         self.payload.extend_from_slice(&h.to_le_bytes());
 
-        for row in 0..usize::from(h) {
-            let src_row_start = (usize::from(y) + row) * stride + usize::from(x) * BYTES_PER_PIXEL;
+        // 脏矩形由远端驱动，可能超出当前图像边界（如 DeactivateAll 后 image 重建前）。
+        // 越界直接跳过该块，避免对 DecodedImage 越界切片导致 RDP 线程 panic。
+        let rows = usize::from(h);
+        for row in 0..rows {
+            let src_row = usize::from(y) + row;
+            let src_row_start = src_row * stride + usize::from(x) * BYTES_PER_PIXEL;
+            if src_row_start.saturating_add(row_bytes) > src.len() {
+                break;
+            }
             self.payload
                 .extend_from_slice(&src[src_row_start..src_row_start + row_bytes]);
         }
