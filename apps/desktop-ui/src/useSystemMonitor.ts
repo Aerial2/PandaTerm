@@ -5,6 +5,7 @@ import type { WorkspaceTab } from './terminalLayout';
 
 type LeftActivity = 'files' | 'monitor' | 'processes' | 'ai' | null;
 export type ProcessSortKey = 'cpu' | 'memory' | 'name';
+export type ProcessSortDir = 'asc' | 'desc';
 
 interface UseSystemMonitorParams {
   // 当前激活的左侧活动栏面板，决定是否轮询 monitor / processes
@@ -24,7 +25,18 @@ export function useSystemMonitor({ leftActivity, activePaneTabRef, isLocalResour
   const [isLoadingProcesses, setIsLoadingProcesses] = useState(false);
   const processRequestGenerationRef = useRef(0);
   const [processSortKey, setProcessSortKey] = useState<ProcessSortKey>('cpu');
+  const [processSortDir, setProcessSortDir] = useState<ProcessSortDir>('desc');
   const [processSearch, setProcessSearch] = useState('');
+
+  /** 点击列头：同一列切换升序/降序；换列时回到该列的默认方向（数值列降序、名称升序） */
+  function toggleProcessSort(key: ProcessSortKey) {
+    if (key === processSortKey) {
+      setProcessSortDir((current) => (current === 'asc' ? 'desc' : 'asc'));
+      return;
+    }
+    setProcessSortKey(key);
+    setProcessSortDir(key === 'name' ? 'asc' : 'desc');
+  }
 
   async function refreshMonitorData() {
     const generation = ++monitorRequestGenerationRef.current;
@@ -140,6 +152,8 @@ export function useSystemMonitor({ leftActivity, activePaneTabRef, isLocalResour
     isLoadingProcesses,
     processSortKey,
     setProcessSortKey,
+    processSortDir,
+    toggleProcessSort,
     processSearch,
     setProcessSearch,
   };

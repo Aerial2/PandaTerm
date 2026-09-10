@@ -42,9 +42,14 @@ pub struct ProcessInfo {
     memory_bytes: u64,
     disk_bytes_per_sec: f64,
     network_bytes_per_sec: f64,
+    /// 该进程占用的 TCP 端口（逗号分隔）。采集不到时为空字符串，前端显示为 “-”。
+    ports: String,
 }
 
-pub const PROCESS_LIST_CMD: &str = r#"nproc=$(nproc 2>/dev/null||echo 1);mem_total=$(awk "/^MemTotal/{print \$2*1024}" /proc/meminfo 2>/dev/null||echo 0);ps -eo pid=,pcpu=,pmem=,stat=,args= --sort=-pcpu 2>/dev/null | head -50 | awk -v nc="$nproc" -v mt="$mem_total" 'BEGIN{OFS="\t"}{pid=$1;cpu=$2;mem=$3;stat=substr($4,1,1);cmd=$5;for(i=6;i<=NF;i++)cmd=cmd FS $i;if(length(cmd)>30)cmd=substr(cmd,1,30);printf "P\t%d\t%s\t%s\t%.1f\t%d\t0\t0\n",pid,cmd,stat,cpu/nc,int(mem*mt/100)}' && echo END_PROCESS_LIST"#;
+// 进程列表 + 端口映射：先尽力从 ss/netstat 取 “PID→端口”，再随 ps 结果一起输出。
+// 端口采集失败（无 ss/netstat、或非 root 看不到 pid）时映射为空，端口列留空，
+// 不影响进程本身的输出格式。
+pub const PROCESS_LIST_CMD: &str = r#"nproc=$(nproc 2>/dev/null||echo 1);mem_total=$(awk "/^MemTotal/{print \$2*1024}" /proc/meminfo 2>/dev/null||echo 0);portmap=$( (ss -H -tunlp 2>/dev/null || netstat -tunlp 2>/dev/null) | awk '{pid="";port="";for(i=1;i<=NF;i++){if($i ~ /pid=[0-9]+/){p=$i;sub(/.*pid=/,"",p);sub(/[^0-9].*$/,"",p);pid=p};if(pid=="" && $i ~ /^[0-9]+\/[A-Za-z_]/){p=$i;sub(/\/.*$/,"",p);if(p ~ /^[0-9]+$/)pid=p};if(port=="" && $i ~ /:[0-9]+$/){a=$i;sub(/.*:/,"",a);if(a ~ /^[0-9]+$/ && a+0>0)port=a}};if(pid!="" && port!="" && !((pid SUBSEP port) in seen)){seen[pid,port]=1;m[pid]=(pid in m)?m[pid] "," port:port}}END{for(p in m)printf "%s\t%s\n",p,m[p]}');ps -eo pid=,pcpu=,pmem=,stat=,args= --sort=-pcpu 2>/dev/null | head -50 | awk -v nc="$nproc" -v mt="$mem_total" -v pm="$portmap" 'BEGIN{OFS="\t";n=split(pm,lines,"\n");for(i=1;i<=n;i++){if(lines[i]!=""){split(lines[i],kv,"\t");ports[kv[1]]=kv[2]}}}{pid=$1;cpu=$2;mem=$3;stat=substr($4,1,1);cmd=$5;for(i=6;i<=NF;i++)cmd=cmd FS $i;if(length(cmd)>30)cmd=substr(cmd,1,30);printf "P\t%d\t%s\t%s\t%.1f\t%d\t0\t%s\n",pid,cmd,stat,cpu/nc,int(mem*mt/100),(pid in ports?ports[pid]:"")}' && echo END_PROCESS_LIST"#;
 
 pub const SYSTEM_MONITOR_CMD: &str = r#"
 HOSTNAME=$(hostname 2>/dev/null || echo unknown)
@@ -138,6 +143,8 @@ pub fn parse_process_list(output: &str) -> Vec<ProcessInfo> {
         let status = parts[3].to_string();
         let cpu = parts[4].parse::<f64>().ok().unwrap_or(0.0);
         let mem_bytes = parts[5].parse::<u64>().ok().unwrap_or(0);
+        // 第 8 列是端口（可选）：旧服务器/无权限时缺失，留空即可
+        let ports = parts.get(7).map(|value| value.to_string()).unwrap_or_default();
 
         processes.push(ProcessInfo {
             pid,
@@ -147,6 +154,7 @@ pub fn parse_process_list(output: &str) -> Vec<ProcessInfo> {
             memory_bytes: mem_bytes,
             disk_bytes_per_sec: 0.0,
             network_bytes_per_sec: 0.0,
+            ports,
         });
     }
     processes
@@ -193,6 +201,104 @@ pub fn parse_system_monitor(output: &str) -> SystemMonitorData {
     }
 }
 
+/// 尽力采集「PID → TCP 端口列表」映射：Windows 走 `netstat -ano`，其它走 ss/netstat。
+/// 采集失败或无权限时返回空表，端口列留空（前端显示 “-”），不影响进程列表本身。
+fn collect_local_pid_ports() -> std::collections::HashMap<u32, String> {
+    use std::collections::{HashMap, HashSet};
+    use std::process::Command;
+
+    let output = if cfg!(windows) {
+        Command::new("netstat").args(["-ano", "-p", "tcp"]).output()
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg("ss -H -tunlp 2>/dev/null || netstat -tunlp 2>/dev/null")
+            .output()
+    };
+    let Ok(out) = output else {
+        return HashMap::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    let mut by_pid: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut seen: HashSet<(u32, u32)> = HashSet::new();
+
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        let mut pid: Option<u32> = None;
+        let mut port: Option<u32> = None;
+        for field in &fields {
+            // 端口：0.0.0.0:22 / [::]:22 / *:22 —— 取最后一个冒号后的数字
+            if port.is_none() {
+                if let Some(idx) = field.rfind(':') {
+                    let tail = &field[idx + 1..];
+                    if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+                        if let Ok(value) = tail.parse::<u32>() {
+                            if value > 0 {
+                                port = Some(value);
+                            }
+                        }
+                    }
+                }
+            }
+            // PID：ss 的 users:(("sshd",pid=1234,fd=3))
+            if pid.is_none() && field.contains("pid=") {
+                let digits: String = field
+                    .split("pid=")
+                    .nth(1)
+                    .unwrap_or("")
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(value) = digits.parse::<u32>() {
+                    pid = Some(value);
+                }
+            }
+            // PID：netstat(Linux) 的 1234/sshd
+            if pid.is_none() && field.contains('/') {
+                let head = field.split('/').next().unwrap_or("");
+                if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(value) = head.parse::<u32>() {
+                        pid = Some(value);
+                    }
+                }
+            }
+        }
+        // Windows：netstat -ano 的 PID 是最后一列的纯数字
+        if pid.is_none() {
+            if let Some(last) = fields.last() {
+                if !last.is_empty() && last.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(value) = last.parse::<u32>() {
+                        pid = Some(value);
+                    }
+                }
+            }
+        }
+
+        if let (Some(pid), Some(port)) = (pid, port) {
+            if seen.insert((pid, port)) {
+                by_pid.entry(pid).or_default().push(port);
+            }
+        }
+    }
+
+    by_pid
+        .into_iter()
+        .map(|(pid, mut ports)| {
+            ports.sort_unstable();
+            let joined = ports
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            (pid, joined)
+        })
+        .collect()
+}
+
 pub fn collect_local_processes(slot: &mut Option<sysinfo::System>) -> Vec<ProcessInfo> {
     use sysinfo::{ProcessesToUpdate, ProcessRefreshKind};
 
@@ -223,6 +329,8 @@ pub fn collect_local_processes(slot: &mut Option<sysinfo::System>) -> Vec<Proces
     // processes.  Divide by CPU count to get % of *total* CPU, matching what users
     // expect from Task Manager / top.
     let cpu_count = sys.cpus().len() as f64;
+    // 端口映射：尽力而为，失败时为空表，端口列留空
+    let port_map = collect_local_pid_ports();
 
     let processes: Vec<ProcessInfo> = sys.processes()
         .values()
@@ -245,6 +353,7 @@ pub fn collect_local_processes(slot: &mut Option<sysinfo::System>) -> Vec<Proces
             memory_bytes: p.memory(),
             disk_bytes_per_sec: 0.0,
             network_bytes_per_sec: 0.0,
+            ports: port_map.get(&p.pid().as_u32()).cloned().unwrap_or_default(),
         })
         .collect();
 

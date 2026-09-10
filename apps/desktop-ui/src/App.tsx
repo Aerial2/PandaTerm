@@ -313,10 +313,14 @@ export function App() {
     ?? aiConversations[0];
   const aiMessages = activeAiConversation?.messages ?? [];
   const aiMessageListRef = useRef<HTMLDivElement | null>(null);
+  /** 标记本次定位属于“打开面板 / 切换会话 / 载入历史”，应瞬时落到底部而不是平滑滚动 */
+  const aiInstantScrollRef = useRef(false);
   useLayoutEffect(() => {
     const messageList = aiMessageListRef.current;
     if (!messageList) return;
     messageList.scrollTop = messageList.scrollHeight;
+    // 随后的消息 effect 还会再滚一次，这里标记掉，避免 smooth 造成“从头滚到尾”的观感
+    aiInstantScrollRef.current = true;
   }, [activeAiConversation?.id]);
   const [aiInput, setAiInput] = useState('');
   /** AI 主输入框：按内容撑高，上限后内部滚动 */
@@ -1259,7 +1263,8 @@ export function App() {
     processList,
     isLoadingProcesses,
     processSortKey,
-    setProcessSortKey,
+    processSortDir,
+    toggleProcessSort,
     processSearch,
     setProcessSearch,
   } = useSystemMonitor({ leftActivity, activePaneTabRef, isLocalResourceTab });
@@ -3636,8 +3641,24 @@ export function App() {
     };
   }, [terminalContextMenu]);
 
+  // 刚进入 AI 面板：随后的定位要瞬时到底
+  useEffect(() => {
+    if (leftActivity === 'ai') {
+      aiInstantScrollRef.current = true;
+    }
+  }, [leftActivity]);
+
   useEffect(() => {
     if (leftActivity !== 'ai') return;
+    if (aiInstantScrollRef.current) {
+      aiInstantScrollRef.current = false;
+      const messageList = aiMessageListRef.current;
+      // 打开面板 / 切换会话 / 载入历史：直接定位到底部，不做滚动动画
+      if (messageList) {
+        messageList.scrollTop = messageList.scrollHeight;
+        return;
+      }
+    }
     aiMessagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [aiMessages, isAiGenerating, leftActivity]);
 
@@ -7795,32 +7816,42 @@ export function App() {
                   <div className="process-table-header">
                     <div
                       className={`process-col process-col-name${processSortKey === 'name' ? ' sorted' : ''}`}
-                      onClick={() => setProcessSortKey('name')}
+                      onClick={() => toggleProcessSort('name')}
+                      title="点击切换升序 / 降序"
                     >
-                      名称 {processSortKey === 'name' && <ChevronDown size={12} />}
+                      名称 {processSortKey === 'name' && (processSortDir === 'asc' ? <ChevronUp size={12} /> : <ChevronDown size={12} />)}
                     </div>
                     <div className="process-col process-col-status">状态</div>
                     <div
                       className={`process-col process-col-cpu${processSortKey === 'cpu' ? ' sorted' : ''}`}
-                      onClick={() => setProcessSortKey('cpu')}
+                      onClick={() => toggleProcessSort('cpu')}
+                      title="点击切换升序 / 降序"
                     >
-                      CPU {processSortKey === 'cpu' && <ChevronDown size={12} />}
+                      CPU {processSortKey === 'cpu' && (processSortDir === 'asc' ? <ChevronUp size={12} /> : <ChevronDown size={12} />)}
                     </div>
                     <div
                       className={`process-col process-col-mem${processSortKey === 'memory' ? ' sorted' : ''}`}
-                      onClick={() => setProcessSortKey('memory')}
+                      onClick={() => toggleProcessSort('memory')}
+                      title="点击切换升序 / 降序"
                     >
-                      内存 {processSortKey === 'memory' && <ChevronDown size={12} />}
+                      内存 {processSortKey === 'memory' && (processSortDir === 'asc' ? <ChevronUp size={12} /> : <ChevronDown size={12} />)}
                     </div>
+                    <div className="process-col process-col-ports">端口</div>
                   </div>
                   {(() => {
                     const filtered = processList.filter((p) =>
                       !processSearch || p.name.toLowerCase().includes(processSearch.toLowerCase())
                     );
+                    // desc = -1（默认降序，看最耗资源的在前）；asc = 1（再点一次同一列切换）
+                    const dir = processSortDir === 'asc' ? 1 : -1;
                     const sorted = [...filtered].sort((a, b) => {
-                      if (processSortKey === 'cpu') return b.cpu_usage_percent - a.cpu_usage_percent;
-                      if (processSortKey === 'memory') return b.memory_bytes - a.memory_bytes;
-                      return a.name.localeCompare(b.name);
+                      if (processSortKey === 'cpu') {
+                        return (a.cpu_usage_percent - b.cpu_usage_percent) * dir;
+                      }
+                      if (processSortKey === 'memory') {
+                        return (a.memory_bytes - b.memory_bytes) * dir;
+                      }
+                      return a.name.localeCompare(b.name) * dir;
                     });
                     return sorted.map((p) => (
                       <div className="process-row" key={p.pid}>
@@ -7840,6 +7871,9 @@ export function App() {
                         </div>
                         <div className="process-col process-col-mem">
                           {formatBytes(p.memory_bytes)}
+                        </div>
+                        <div className="process-col process-col-ports" title={p.ports || '无监听端口'}>
+                          {p.ports || '-'}
                         </div>
                       </div>
                     ));

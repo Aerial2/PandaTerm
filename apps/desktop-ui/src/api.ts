@@ -1058,6 +1058,8 @@ export interface ProcessInfo {
   memory_bytes: number;
   disk_bytes_per_sec: number;
   network_bytes_per_sec: number;
+  /** 进程占用的 TCP 端口（逗号分隔）；采集不到时为空字符串，前端显示为 “-” */
+  ports: string;
 }
 
 export async function getProcessList(terminalId?: string | null): Promise<ProcessInfo[]> {
