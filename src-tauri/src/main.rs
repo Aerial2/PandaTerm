@@ -29,13 +29,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ai_config::{
-    ai_chat_endpoint, ai_models_url, ai_request_reasoning_effort, find_ai_account,
-    find_ai_account_mut, is_claude_api_format, load_ai_config, merge_ai_models,
+    ai_chat_endpoint, ai_models_url, ai_request_max_tokens, ai_request_reasoning_effort,
+    find_ai_account, find_ai_account_mut, is_claude_api_format, load_ai_config, merge_ai_models,
     normalize_ai_account_name, normalize_ai_config_store, normalize_ai_models,
     normalize_enabled_ai_models, save_ai_config, validate_ai_api_format, validate_ai_base_url,
-    validate_ai_model, validate_ai_reasoning_effort, AiProviderAccountStore,
-    AiProviderConfigStore, AI_CONFIG_VERSION, DEFAULT_AI_API_FORMAT, DEFAULT_AI_BASE_URL,
-    DEFAULT_AI_MODEL, MAX_AI_ACCOUNTS, MAX_AI_MODELS,
+    validate_ai_context_window, validate_ai_max_tokens, validate_ai_model,
+    validate_ai_reasoning_effort, AiProviderAccountStore, AiProviderConfigStore,
+    AI_CLAUDE_FALLBACK_MAX_TOKENS, AI_CONFIG_VERSION, DEFAULT_AI_API_FORMAT, DEFAULT_AI_BASE_URL,
+    DEFAULT_AI_CONTEXT_WINDOW, DEFAULT_AI_MAX_TOKENS, DEFAULT_AI_MODEL, MAX_AI_ACCOUNTS,
+    MAX_AI_MODELS,
 };
 use archive::{extract_command, extract_local_archive};
 use base64::{base64_decode, base64_encode};
@@ -185,6 +187,10 @@ struct AiProviderConfig {
     enabled_models: Vec<String>,
     reasoning_effort: String,
     api_format: String,
+    /// 模型上下文窗口（token）
+    context_window: u32,
+    /// 最大输出 token；0 = 不限制
+    max_tokens: u32,
     use_api_key: bool,
     api_key_configured: bool,
     api_key: Option<String>,
@@ -210,6 +216,10 @@ struct SaveAiProviderConfigRequest {
     reasoning_effort: Option<String>,
     #[serde(default)]
     api_format: Option<String>,
+    #[serde(default)]
+    context_window: Option<u32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
     use_api_key: bool,
     api_key: Option<String>,
 }
@@ -402,6 +412,9 @@ struct OpenAiChatStreamRequest<'a> {
     model: &'a str,
     messages: &'a [AiChatMessage],
     stream: bool,
+    /// 0（未配置）时不注入，沿用服务端默认
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -470,6 +483,9 @@ struct AiChatResponse {
 struct OpenAiChatRequest<'a> {
     model: &'a str,
     messages: &'a [AiChatMessage],
+    /// 0（未配置）时不注入，沿用服务端默认
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
 }
@@ -3825,6 +3841,7 @@ fn build_claude_messages_payload(
     model: &str,
     messages: &[AiChatMessage],
     stream: bool,
+    max_tokens: u32,
 ) -> Result<Value, String> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut claude_messages: Vec<Value> = Vec::new();
@@ -3877,7 +3894,8 @@ fn build_claude_messages_payload(
     }
     let mut payload = serde_json::json!({
         "model": model,
-        "max_tokens": 8192,
+        // Claude Messages API 必须带 max_tokens：未配置时沿用历史兜底值
+        "max_tokens": if max_tokens == 0 { AI_CLAUDE_FALLBACK_MAX_TOKENS } else { max_tokens },
         "stream": stream,
         "messages": claude_messages,
     });
@@ -3974,6 +3992,8 @@ fn ai_config_snapshot(
         enabled_models: active.enabled_models.clone(),
         reasoning_effort: config.reasoning_effort.clone(),
         api_format: active.api_format.clone(),
+        context_window: active.context_window,
+        max_tokens: active.max_tokens,
         use_api_key: active.use_api_key,
         api_key_configured: active.api_key_secret_id.is_some(),
         api_key,
@@ -4250,6 +4270,10 @@ async fn save_ai_provider_config(
             .as_deref()
             .unwrap_or(&existing.name),
     );
+    let context_window = validate_ai_context_window(
+        request.context_window.unwrap_or(existing.context_window),
+    )?;
+    let max_tokens = validate_ai_max_tokens(request.max_tokens.unwrap_or(existing.max_tokens))?;
     let old_secret_id = existing.api_key_secret_id.clone();
 
     let mut credentials = state.credentials.lock().await;
@@ -4270,6 +4294,8 @@ async fn save_ai_provider_config(
         account.models = models;
         account.enabled_models = enabled_models;
         account.api_format = api_format;
+        account.context_window = context_window;
+        account.max_tokens = max_tokens;
         account.use_api_key = request.use_api_key;
         account.api_key_secret_id = next_secret_id.clone();
     }
@@ -4318,6 +4344,8 @@ async fn add_ai_provider_account(
         models: vec![DEFAULT_AI_MODEL.to_string()],
         enabled_models: vec![DEFAULT_AI_MODEL.to_string()],
         api_format: DEFAULT_AI_API_FORMAT.to_string(),
+        context_window: DEFAULT_AI_CONTEXT_WINDOW,
+        max_tokens: DEFAULT_AI_MAX_TOKENS,
         use_api_key: true,
         api_key_secret_id: None,
     };
@@ -4610,12 +4638,14 @@ async fn ai_chat(
     let mut builder = state.ai_http.post(endpoint).timeout(AI_HTTP_REQUEST_TIMEOUT);
     builder = apply_ai_provider_auth(builder, &account.api_format, api_key.as_ref().map(|value| value.as_str()));
     let builder = if is_claude_api_format(&account.api_format) {
-        let payload = build_claude_messages_payload(&account.model, &request.messages, false)?;
+        let payload =
+            build_claude_messages_payload(&account.model, &request.messages, false, account.max_tokens)?;
         builder.json(&payload)
     } else {
         let payload = OpenAiChatRequest {
             model: &account.model,
             messages: &request.messages,
+            max_tokens: ai_request_max_tokens(account.max_tokens),
             reasoning_effort: ai_request_reasoning_effort(&config.reasoning_effort),
         };
         builder.json(&payload)
@@ -4711,13 +4741,14 @@ async fn test_ai_provider(
     let mut builder = state.ai_http.post(endpoint);
     builder = apply_ai_provider_auth(builder, &api_format, api_key.as_ref().map(|value| value.as_str()));
     let builder = if claude_format {
-        let payload = build_claude_messages_payload(&model, &messages, true)?;
+        let payload = build_claude_messages_payload(&model, &messages, true, 0)?;
         builder.json(&payload)
     } else {
         let payload = OpenAiChatStreamRequest {
             model: &model,
             messages: &messages,
             stream: true,
+            max_tokens: None,
             reasoning_effort: None,
             tools: None,
             tool_choice: None,
@@ -5272,7 +5303,8 @@ async fn ai_chat_stream(
     let mut builder = state.ai_http.post(endpoint);
     builder = apply_ai_provider_auth(builder, &account.api_format, api_key.as_ref().map(|value| value.as_str()));
     let builder = if claude_format {
-        let payload = match build_claude_messages_payload(&account.model, &request.messages, true) {
+        let payload =
+            match build_claude_messages_payload(&account.model, &request.messages, true, account.max_tokens) {
             Ok(payload) => payload,
             Err(error) => {
                 emit_ai_stream_event(&app, &request.request_id, "error", None, None, Some(error));
@@ -5286,6 +5318,7 @@ async fn ai_chat_stream(
             model: &account.model,
             messages: &request.messages,
             stream: true,
+            max_tokens: ai_request_max_tokens(account.max_tokens),
             reasoning_effort: ai_request_reasoning_effort(&config.reasoning_effort),
             tools: agent_tools.as_deref(),
             tool_choice: agent_mode.then_some("auto"),
@@ -6631,6 +6664,7 @@ mod tests {
         let with_effort = serde_json::to_value(OpenAiChatRequest {
             model: "o3-mini",
             messages: &messages,
+            max_tokens: None,
             reasoning_effort: Some("high"),
         })
         .expect("serialize with effort");
@@ -6642,10 +6676,57 @@ mod tests {
         let without_effort = serde_json::to_value(OpenAiChatRequest {
             model: "gpt-4o-mini",
             messages: &messages,
+            max_tokens: None,
             reasoning_effort: None,
         })
         .expect("serialize without effort");
         assert!(without_effort.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn serialize_ai_max_tokens_only_when_configured() {
+        assert_eq!(ai_request_max_tokens(0), None);
+        assert_eq!(ai_request_max_tokens(4096), Some(4096));
+        assert_eq!(validate_ai_max_tokens(0).expect("unlimited"), 0);
+        assert!(validate_ai_max_tokens(u32::MAX).is_err());
+        assert_eq!(
+            validate_ai_context_window(0).expect("zero falls back"),
+            DEFAULT_AI_CONTEXT_WINDOW
+        );
+        assert_eq!(
+            validate_ai_context_window(32_000).expect("accept 32k"),
+            32_000
+        );
+        assert!(validate_ai_context_window(10).is_err());
+        assert!(validate_ai_context_window(3_000_000).is_err());
+
+        let messages = [AiChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let configured = serde_json::to_value(OpenAiChatStreamRequest {
+            model: "gpt-4o-mini",
+            messages: &messages,
+            stream: true,
+            max_tokens: ai_request_max_tokens(4096),
+            reasoning_effort: None,
+            tools: None,
+            tool_choice: None,
+        })
+        .expect("serialize max_tokens");
+        assert_eq!(configured.get("max_tokens").and_then(Value::as_u64), Some(4096));
+
+        let unlimited = serde_json::to_value(OpenAiChatStreamRequest {
+            model: "gpt-4o-mini",
+            messages: &messages,
+            stream: true,
+            max_tokens: ai_request_max_tokens(0),
+            reasoning_effort: None,
+            tools: None,
+            tool_choice: None,
+        })
+        .expect("serialize without max_tokens");
+        assert!(unlimited.get("max_tokens").is_none());
     }
 
     #[test]
@@ -6706,6 +6787,7 @@ mod tests {
             model: "gpt-4o-mini",
             messages: &messages,
             stream: true,
+            max_tokens: None,
             reasoning_effort: None,
             tools: Some(tools.as_slice()),
             tool_choice: Some("auto"),
@@ -6721,6 +6803,7 @@ mod tests {
             model: "gpt-4o-mini",
             messages: &messages,
             stream: true,
+            max_tokens: None,
             reasoning_effort: None,
             tools: None,
             tool_choice: None,

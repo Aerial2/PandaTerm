@@ -433,6 +433,10 @@ export type AiProviderConfig = {
   reasoning_effort: string;
   /** 接口兼容格式：openai | claude */
   api_format: AiApiFormat | string;
+  /** 模型上下文窗口（token），用于上下文用量预算 */
+  context_window: number;
+  /** 最大输出 token；0 = 不限制（OpenAI 不带该字段，Claude 走兜底值） */
+  max_tokens: number;
   use_api_key: boolean;
   api_key_configured: boolean;
   /** 本机 vault 解密后的密钥；仅用于设置页回填展示 */
@@ -572,6 +576,8 @@ export async function saveAiProviderConfig(
     enabled_models?: string[];
     reasoning_effort?: string;
     api_format?: string;
+    context_window?: number;
+    max_tokens?: number;
   },
   apiKey?: string | null,
 ): Promise<AiProviderConfig> {
@@ -585,6 +591,8 @@ export async function saveAiProviderConfig(
       enabled_models: config.enabled_models ?? null,
       reasoning_effort: config.reasoning_effort ?? null,
       api_format: config.api_format ?? null,
+      context_window: config.context_window ?? null,
+      max_tokens: config.max_tokens ?? null,
       use_api_key: config.use_api_key,
       api_key: apiKey || null,
     },

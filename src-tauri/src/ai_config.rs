@@ -17,6 +17,15 @@ pub const DEFAULT_AI_MODEL: &str = "gpt-4o-mini";
 pub const DEFAULT_AI_REASONING_EFFORT: &str = "none";
 /// 默认 OpenAI 兼容协议
 pub const DEFAULT_AI_API_FORMAT: &str = "openai";
+/// 默认上下文窗口（token）；前端据此换算上下文用量预算
+pub const DEFAULT_AI_CONTEXT_WINDOW: u32 = 128_000;
+/// 默认最大输出 token；0 = 不限制（OpenAI 不带 max_tokens，Claude 走兜底值）
+pub const DEFAULT_AI_MAX_TOKENS: u32 = 0;
+/// Claude Messages API 必须带 max_tokens，未配置时兜底 8192（保持历史行为）
+pub const AI_CLAUDE_FALLBACK_MAX_TOKENS: u32 = 8192;
+pub const MIN_AI_CONTEXT_WINDOW: u32 = 1_000;
+pub const MAX_AI_CONTEXT_WINDOW: u32 = 2_000_000;
+pub const MAX_AI_OUTPUT_TOKENS: u32 = 1_000_000;
 
 pub fn validate_ai_model(model: &str) -> Result<String, String> {
     let model = model.trim();
@@ -57,6 +66,36 @@ pub fn ai_request_reasoning_effort(effort: &str) -> Option<&str> {
         None
     } else {
         Some(effort)
+    }
+}
+
+/// 上下文窗口（token）：0 视为未设置 → 回落到默认值
+pub fn validate_ai_context_window(value: u32) -> Result<u32, String> {
+    if value == 0 {
+        return Ok(DEFAULT_AI_CONTEXT_WINDOW);
+    }
+    if !(MIN_AI_CONTEXT_WINDOW..=MAX_AI_CONTEXT_WINDOW).contains(&value) {
+        return Err(format!(
+            "上下文窗口需在 {MIN_AI_CONTEXT_WINDOW} ~ {MAX_AI_CONTEXT_WINDOW} token 之间"
+        ));
+    }
+    Ok(value)
+}
+
+/// 最大输出 token：0 = 不限制
+pub fn validate_ai_max_tokens(value: u32) -> Result<u32, String> {
+    if value > MAX_AI_OUTPUT_TOKENS {
+        return Err(format!("最大输出 Token 不能超过 {MAX_AI_OUTPUT_TOKENS}"));
+    }
+    Ok(value)
+}
+
+/// OpenAI 请求：0 表示不注入 max_tokens（沿用服务端默认）
+pub fn ai_request_max_tokens(max_tokens: u32) -> Option<u32> {
+    if max_tokens == 0 {
+        None
+    } else {
+        Some(max_tokens)
     }
 }
 
@@ -216,6 +255,14 @@ fn default_ai_api_format() -> String {
     DEFAULT_AI_API_FORMAT.to_string()
 }
 
+fn default_ai_context_window() -> u32 {
+    DEFAULT_AI_CONTEXT_WINDOW
+}
+
+fn default_ai_max_tokens() -> u32 {
+    DEFAULT_AI_MAX_TOKENS
+}
+
 fn default_ai_account_name() -> String {
     "默认".to_string()
 }
@@ -234,6 +281,12 @@ pub struct AiProviderAccountStore {
     pub enabled_models: Vec<String>,
     #[serde(default = "default_ai_api_format")]
     pub api_format: String,
+    /// 模型上下文窗口（token），用于上下文用量预算
+    #[serde(default = "default_ai_context_window")]
+    pub context_window: u32,
+    /// 最大输出 token；0 = 不限制
+    #[serde(default = "default_ai_max_tokens")]
+    pub max_tokens: u32,
     pub use_api_key: bool,
     pub api_key_secret_id: Option<String>,
 }
@@ -247,6 +300,8 @@ pub fn new_default_ai_account() -> AiProviderAccountStore {
         models: vec![DEFAULT_AI_MODEL.to_string()],
         enabled_models: vec![DEFAULT_AI_MODEL.to_string()],
         api_format: DEFAULT_AI_API_FORMAT.to_string(),
+        context_window: DEFAULT_AI_CONTEXT_WINDOW,
+        max_tokens: DEFAULT_AI_MAX_TOKENS,
         use_api_key: true,
         api_key_secret_id: None,
     }
@@ -357,6 +412,8 @@ pub fn migrate_ai_config_v1(value: Value) -> Result<AiProviderConfigStore, Strin
         models,
         enabled_models,
         api_format,
+        context_window: DEFAULT_AI_CONTEXT_WINDOW,
+        max_tokens: DEFAULT_AI_MAX_TOKENS,
         use_api_key,
         api_key_secret_id,
     };
@@ -392,6 +449,8 @@ pub fn normalize_ai_config_store(config: &mut AiProviderConfigStore) -> Result<(
         account.enabled_models =
             normalize_enabled_ai_models(&account.models, &account.enabled_models, &account.model)?;
         account.api_format = validate_ai_api_format(&account.api_format)?;
+        account.context_window = validate_ai_context_window(account.context_window)?;
+        account.max_tokens = validate_ai_max_tokens(account.max_tokens)?;
     }
     if !config
         .accounts

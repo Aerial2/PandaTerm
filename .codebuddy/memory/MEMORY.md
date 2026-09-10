@@ -55,3 +55,12 @@
 - **禁止**在 `ensureModel` 里 dispose 已存在的同 URI model（旧代码把它当 stale 销毁）：会销毁另一个面板正在使用的 model，导致那个面板**空白**。
 - 正确做法：`monaco.editor.getModel(uri)` 命中且未 dispose 就**直接复用**并记入本实例 `modelsRef`；仅当不存在时才 `createModel`。多实例共享同一 model，内容天然同步。
 - 模块级 `editorViewStateByTabId` 同为全局共享，多实例下滚动/光标位置会互相覆盖（目前按"同步视图"接受）。
+
+## 6. UI 配色 / 圆角约定（用户偏好，2026-09-10）
+- **选中态禁止蓝色**：应用整体是灰系（`--ai-fg: #B3B4B4`、`--ai-fg-rgb: 179, 180, 180`，`--ai-bg: #1D2025`）。选中/激活一律用中性灰：
+  - 轻量项（左侧导航、账号 chip）：`background: rgba(var(--ai-fg-rgb), 0.14)` + 文字 `var(--text-primary)`；
+  - 带边框项（ghost 按钮）：`border-color: rgba(var(--ai-fg-rgb), 0.35)` + `background: rgba(var(--ai-fg-rgb), 0.1)`；
+  - 分段控件（MCP pane tab）：容器 `#` 圆角 9px + `rgba(255,255,255,0.04)`，选中项 `background: #303640; color: #B3B4B4`。
+  - 禁止使用 `rgba(88, 166, 255, ...)`（GitHub 蓝）之类的高亮色。
+- **圆角"一点点"**：控件 8px（输入框/按钮/nav 项/chip/图标按钮）、容器 9-10px；不用 999px 胶囊，除非设计上明确要胶囊（如 MCP 策略标签）。
+- 相关文件：`apps/desktop-ui/src/styles.css`（`:root` 变量 + `.ai-settings-*` 系列）。

@@ -87,6 +87,7 @@ import {
   Monitor,
   Settings,
   TerminalSquare,
+  Eraser,
   Trash2,
   Upload,
   FolderUp,
@@ -610,8 +611,8 @@ export function App() {
     if (!isAiSettingsOpen) return;
     const q = aiSettingsNavQuery.trim().toLowerCase();
     const items = ([
-      { id: 'models' as const, label: 'Models' },
-      { id: 'mcp' as const, label: 'MCP' },
+      { id: 'models' as const, label: '模型设置' },
+      { id: 'mcp' as const, label: 'MCP服务器' },
     ]).filter((item) => !q || item.label.toLowerCase().includes(q) || item.id.includes(q));
     if (items.length > 0 && !items.some((item) => item.id === aiSettingsTab)) {
       setAiSettingsTab(items[0].id);
@@ -5495,6 +5496,27 @@ export function App() {
     cancelEditUserMessage();
   }
 
+  /** 清除全部 AI 会话：逐个删除后端会话（没有批量命令），本地重置为一个空白会话 */
+  async function clearAllAiConversations() {
+    if (aiConversations.length === 0) return;
+    await stopCurrentAiGeneration();
+    for (const conversation of aiConversations) {
+      try {
+        await deleteAiConversation(conversation.id);
+      } catch (error) {
+        setAiConversationError(error instanceof Error ? error.message : String(error));
+        return;
+      }
+    }
+    const fallback = createAiConversationState();
+    setAiWorkspace({
+      conversations: [fallback],
+      activeConversationId: fallback.id,
+    });
+    setPendingAiContexts([]);
+    cancelEditUserMessage();
+  }
+
   function formatBytes(bytes: number): string {
     if (bytes === 0) return '0 B';
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -6953,6 +6975,23 @@ export function App() {
                   title="清空当前对话"
                   onClick={clearAiConversation}
                   disabled={aiMessages.length === 0}
+                >
+                  <Eraser size={14} />
+                </button>
+                <button
+                  type="button"
+                  className="ai-header-button"
+                  title="清除全部对话"
+                  onClick={() => {
+                    setConfirmDialog({
+                      title: '清除全部 AI 对话',
+                      message: `将删除全部 ${aiConversations.length} 个会话及其聊天记录，此操作不可恢复。确定清除吗？`,
+                      confirmLabel: '清除全部',
+                      danger: true,
+                      onConfirm: () => { void clearAllAiConversations(); },
+                    });
+                  }}
+                  disabled={!aiConversations.some((conversation) => conversation.messages.length > 0)}
                 >
                   <Trash2 size={14} />
                 </button>

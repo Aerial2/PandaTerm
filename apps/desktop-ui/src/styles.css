@@ -6438,7 +6438,7 @@ body.has-ai-settings-window .ssh-workbench > :not(.ai-settings-backdrop):not(.di
   height: 28px;
   padding: 0 10px;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 999px;
+  border-radius: 8px;
   color: var(--text-secondary);
   background: rgba(255, 255, 255, 0.03);
   font-size: 12px;
@@ -6447,6 +6447,7 @@ body.has-ai-settings-window .ssh-workbench > :not(.ai-settings-backdrop):not(.di
   overflow: hidden;
   text-overflow: ellipsis;
   cursor: pointer;
+  transition: color var(--t-fast) var(--ease), background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
 }
 
 .ai-settings-account-chip:hover:not(:disabled) {
@@ -6457,8 +6458,8 @@ body.has-ai-settings-window .ssh-workbench > :not(.ai-settings-backdrop):not(.di
 
 .ai-settings-account-chip.active {
   color: var(--text-primary);
-  border-color: rgba(88, 166, 255, 0.45);
-  background: rgba(88, 166, 255, 0.12);
+  border-color: rgba(var(--ai-fg-rgb), 0.32);
+  background: rgba(var(--ai-fg-rgb), 0.14);
 }
 
 .ai-settings-account-chip:disabled {
@@ -6583,6 +6584,15 @@ body.has-ai-settings-window .ssh-workbench > :not(.ai-settings-backdrop):not(.di
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* 测试模型：等待时长（请求中实时刷新） */
+.ai-provider-test-elapsed {
+  margin-right: auto;
+  align-self: center;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .ai-settings-field-grid {
