@@ -74,7 +74,20 @@
 - 请求体：OpenAI 的 `max_tokens` 仅在配置 >0 时注入（`ai_request_max_tokens`）；Claude Messages 必须带 `max_tokens`，未配置时兜底 8192（`AI_CLAUDE_FALLBACK_MAX_TOKENS`）。
 - 上下文窗口 → 前端预算：`resolveAiContextBudgetChars(tokens) = clamp(tokens × 3.5, 4000, 200_000)`；200k 字符是后端 `MAX_AI_TOTAL_CHARS` 硬上限（`validate_ai_messages` 会拒收更大请求），所以调大窗口不会真的扩大可发送量。
 
-## 8. 禁止「在 setState updater 里写副作用、函数外立刻读」（React 18/19 自动批处理坑，2026-09-10）
+## 8. 打包与发版流程（2026-09-10 实测）
+- **命令**：`npm run tauri build`，但必须先 `$env:Path="C:\Users\24901\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin;$env:Path"`，否则报 `failed to run 'cargo metadata' … program not found`（`.cargo\bin` 的 rustup shim 是坏链接，不可依赖）。
+- **产物**（项目 `.cargo/config.toml` → `F:/cargo-targets/PandaTerm`）：`release\pandaterm.exe`、`release\bundle\nsis\PandaTerm_<版本>_x64-setup.exe`、`release\bundle\msi\PandaTerm_<版本>_x64_en-US.msi`。首次 release 为全量编译（8~10 分钟）；`tauri dev` 在跑不冲突。
+- **远程**：`origin` = codeup.aliyun.com/pandaTerm（分支跟踪它）；`github` = github.com/Aerial2/PandaTerm。推 GitHub 要显式指定远程：`git push github <分支>`。
+- **GitHub main 的来历**：最初是网页上传的 3 个提交，与本地历史**无共同祖先**；2026-09-10 用 `git worktree add .merge-tmp -b github-main-merge github/main` + `git merge --allow-unrelated-histories -X theirs <本地分支>` + `git push github github-main-merge:main` 合并成一条统一历史（fast-forward，非强推；GitHub-only 的旧文件不会被删）。本地保留 `github-main-merge` 分支。
+- **打包时别切分支**：正在编译时切分支会改 main worktree 的源码、可能污染 release 产物，用 `git worktree` 另开目录操作。
+- **日常提交后要更新 GitHub main 的固定套路**（main 与 feat 不是线性关系，直接推会被拒）：
+  `git worktree add .merge-tmp github-main-merge` → `git merge <工作分支>` → `git push github github-main-merge:main` → `git worktree remove .merge-tmp --force`（偶发 Permission denied，重试一次）。合并后可用 `git diff --stat <工作分支>` 确认树一致。
+- **`gh` CLI**：已安装并登录为 `Aerial2`（repo/gist/workflow 权限）；发布 Release 用
+  `gh release create v<版本> --repo Aerial2/PandaTerm --title "PandaTerm v<版本>" --notes-file <notes.md> <安装包...>`。
+  - 应用内「帮助 → 关于」的更新检查（`src-tauri/src/about.rs`）只取 `releases/latest` 的 `tag_name`，不依赖附件名 → 附件可自由传 exe/msi。
+  - 仓库为 **PUBLIC**；Release 说明沿用中文结构：本版本亮点 / 安装 / 版本检查 / 说明。
+
+## 9. 禁止「在 setState updater 里写副作用、函数外立刻读」（React 18/19 自动批处理坑，2026-09-10）
 - 反例（曾导致「低风险自动执行」开关完全无效）：`App.tsx` 的 `finishAiStream` 把解析结果与自动执行任务写在 `updateAiConversation(...)` 的 updater 里（`autoRunCapture.job` / `shouldRepairAgentProtocol`），函数返回后立刻 `if (autoRunCapture.job)` 读取。
 - 根因：React 18/19 只在 fiber 无 pending update 时才「顺带」同步跑 updater（eagerState 优化）；流式场景最后一个 `delta` 的 setState 常未 flush → updater 被推迟到 render 阶段 → 外面读到 null，自动执行/协议纠偏双双失效。
 - 修复（**不要用 `setTimeout(0)` 兜**：定时器与 React 调度（MessageChannel）谁先跑没有硬保证，实测仍失效）：

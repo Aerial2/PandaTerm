@@ -19,7 +19,9 @@ import { VscodeFileIcon } from './FileIcon';
 import { ResourceBottomPanel } from './ResourceBottomPanel';
 import { StatusBar } from './StatusBar';
 import {
+  ARCHIVE_FORMAT_OPTIONS,
   RESOURCE_RENAME_SECOND_CLICK_DELAY_MS,
+  archiveFormatLabel,
   buildPathBreadcrumbs,
   clampPanelWidth,
   compareResource,
@@ -176,7 +178,7 @@ import {
   openAiSettingsWindow,
   preloadConnectionWindows,
 } from './api';
-import type { AiChatStreamEvent, AiProviderConfig, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, TerminalStatusEvent } from './api';
+import type { AiChatStreamEvent, AiProviderConfig, ArchiveFormat, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, TerminalStatusEvent } from './api';
 import { useSystemMonitor } from './useSystemMonitor';
 import { useMediaViewer } from './useMediaViewer';
 import { useUploadConflict } from './useUploadConflict';
@@ -637,6 +639,8 @@ export function App() {
   const untitledEditorCounterRef = useRef(1);
   const [showEditor, setShowEditor] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: ResourceFile | null } | null>(null);
+  /** 右键菜单里的「压缩为…」二级子菜单是否展开 */
+  const [archiveSubmenuOpen, setArchiveSubmenuOpen] = useState(false);
   const [terminalContextMenu, setTerminalContextMenu] = useState<{ x: number; y: number; tabId: string; selection: string } | null>(null);
   const [pendingTerminalPaste, setPendingTerminalPaste] = useState<(PreparedTerminalPaste & { tabId: string }) | null>(null);
   const terminalPasteInFlightRef = useRef(new Set<string>());
@@ -3085,15 +3089,40 @@ export function App() {
     }
   }
 
-  async function handleCreateArchive(file: ResourceFile) {
+  async function handleCreateArchive(
+    file: ResourceFile,
+    format: ArchiveFormat = 'zip',
+    /** 缺少命令时是否弹窗建议换格式；换过一次后不再追问，避免来回弹窗 */
+    allowFormatSwitch = true,
+  ) {
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
+    const targetLabel = local ? '本机' : '目标主机';
     setStatusMessage(`正在压缩：${file.name}...`);
-    addLogEntry('info', `开始压缩：${file.name}`);
+    addLogEntry('info', `开始压缩：${file.name}（${archiveFormatLabel(format)}）`);
     try {
-      const archiveName = await createArchive(file.path, local ? null : tab?.terminalId ?? null);
-      setStatusMessage(`压缩完成：${archiveName}`);
-      addLogEntry('info', `压缩完成：${archiveName}`);
+      const result = await createArchive(file.path, local ? null : tab?.terminalId ?? null, format);
+      const missingTool = (result.missing_tool ?? '').trim();
+      if (!result.path) {
+        // 缺少外部命令（例如服务器没装 zip）：先让用户确认换格式，再真正压缩
+        if (missingTool && allowFormatSwitch) {
+          const suggested = (result.suggested_format ?? 'tar.gz') as ArchiveFormat;
+          const suggestedLabel = archiveFormatLabel(suggested);
+          setStatusMessage(`压缩未执行：${targetLabel}缺少 ${missingTool} 命令`);
+          addLogEntry('warn', `${targetLabel}未安装 ${missingTool} 命令，等待确认是否改用 ${suggestedLabel}`);
+          setConfirmDialog({
+            title: `${missingTool} 命令不可用`,
+            message: `${targetLabel}上没有找到 ${missingTool} 命令，无法压缩为 ${archiveFormatLabel(format)}。是否改用 ${suggestedLabel} 重新压缩？`,
+            confirmLabel: `改用 ${suggestedLabel}`,
+            onConfirm: () => handleCreateArchive(file, suggested, false),
+          });
+          return;
+        }
+        throw new Error(missingTool ? `未安装 ${missingTool} 命令` : '压缩失败：未返回归档路径');
+      }
+      const doneText = `压缩完成：${result.path}`;
+      setStatusMessage(doneText);
+      addLogEntry('info', doneText);
       await loadResourceDirectory(currentPathRef.current || null, false);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -3631,6 +3660,11 @@ export function App() {
       window.removeEventListener('click', close);
       window.removeEventListener('contextmenu', close);
     };
+  }, [contextMenu]);
+
+  // 每次打开/关闭文件右键菜单都收起「压缩为…」子菜单
+  useEffect(() => {
+    setArchiveSubmenuOpen(false);
   }, [contextMenu]);
 
   // Close the terminal right-click menu on any outside click / new right-click
@@ -8172,15 +8206,49 @@ export function App() {
                   <Archive size={15} /> 解压到当前目录
                 </button>
               )}
-              <button
-                className="file-context-item"
-                onClick={() => {
-                  void handleCreateArchive(contextMenu.file!);
-                  setContextMenu(null);
-                }}
+              <div
+                className="file-context-submenu-host"
+                onMouseEnter={() => setArchiveSubmenuOpen(true)}
+                onMouseLeave={() => setArchiveSubmenuOpen(false)}
               >
-                <FileArchive size={15} /> 压缩为 ZIP
-              </button>
+                <button
+                  type="button"
+                  className="file-context-item"
+                  aria-haspopup="menu"
+                  aria-expanded={archiveSubmenuOpen}
+                  onClick={(event) => {
+                    // 必须阻止冒泡：window 上的「点击外部关闭」会立刻收起整个菜单
+                    event.stopPropagation();
+                    setArchiveSubmenuOpen((open) => !open);
+                  }}
+                >
+                  <FileArchive size={15} /> 压缩为
+                  <ChevronRight size={15} className="file-context-submenu-arrow" aria-hidden />
+                </button>
+                {archiveSubmenuOpen && (
+                  <div
+                    className={`file-context-submenu${contextMenu.x + 480 > window.innerWidth ? ' flip-left' : ''}`}
+                    role="menu"
+                    aria-label="压缩格式"
+                  >
+                    {ARCHIVE_FORMAT_OPTIONS.map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        role="menuitem"
+                        className="file-context-item"
+                        onClick={() => {
+                          void handleCreateArchive(contextMenu.file!, option.value);
+                          setContextMenu(null);
+                        }}
+                      >
+                        <FileArchive size={15} aria-hidden /> {option.label}
+                        <em>{option.hint}</em>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
               {contextMenu.file.type === 'file' && !isLocalResourceTab(activePaneTabRef.current) && (
                 <button
                   className="file-context-item"

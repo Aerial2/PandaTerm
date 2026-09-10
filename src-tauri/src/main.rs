@@ -3340,29 +3340,114 @@ async fn extract_archive(
     }
 }
 
-/// Compress a file or directory into a zip archive next to the source.
+/// 支持的压缩格式：`zip`（默认）与 `tar.gz`。
+/// 部分 Linux 发行版没装 `zip` 命令，此时可用 `tar.gz`（tar 基本必定存在）。
+const ARCHIVE_FORMAT_ZIP: &str = "zip";
+const ARCHIVE_FORMAT_TAR_GZ: &str = "tar.gz";
+
+fn normalize_archive_format(raw: Option<&str>) -> Result<&'static str, String> {
+    let value = raw.map(|item| item.trim().to_ascii_lowercase()).unwrap_or_default();
+    match value.as_str() {
+        "" | "zip" => Ok(ARCHIVE_FORMAT_ZIP),
+        "tar.gz" | "tgz" => Ok(ARCHIVE_FORMAT_TAR_GZ),
+        other => Err(format!("不支持的压缩格式：{other}（可选 zip / tar.gz）")),
+    }
+}
+
+/// 命令失败的展示信息（优先 stderr，其次退出码）
+fn command_failure_detail(stderr: &[u8], exit_code: Option<i32>) -> String {
+    if !stderr.is_empty() {
+        String::from_utf8_lossy(stderr).to_string()
+    } else {
+        format!("退出码: {exit_code:?}")
+    }
+}
+
+/// 该格式所需的外部命令名（用于「缺命令」提示）
+fn archive_format_tool(format: &str) -> &'static str {
+    if format == ARCHIVE_FORMAT_TAR_GZ {
+        "tar"
+    } else {
+        "zip"
+    }
+}
+
+/// 缺少命令时可换用的另一种格式
+fn archive_alternative_format(format: &str) -> &'static str {
+    if format == ARCHIVE_FORMAT_TAR_GZ {
+        ARCHIVE_FORMAT_ZIP
+    } else {
+        ARCHIVE_FORMAT_TAR_GZ
+    }
+}
+
+/// 压缩结果。
+/// `path` 为 `None` 表示目标机器缺少该格式所需的命令，需要前端弹窗让用户确认换用 `suggested_format`。
+#[derive(Debug, Clone, Serialize)]
+struct CreateArchiveResult {
+    path: Option<String>,
+    format: String,
+    missing_tool: Option<String>,
+    suggested_format: Option<String>,
+}
+
+impl CreateArchiveResult {
+    fn done(path: String, format: &str) -> Self {
+        Self {
+            path: Some(path),
+            format: format.to_string(),
+            missing_tool: None,
+            suggested_format: None,
+        }
+    }
+
+    /// 目标机器缺少该格式所需的命令：不偷偷换格式，交给前端确认
+    fn needs_tool(format: &str) -> Self {
+        Self {
+            path: None,
+            format: format.to_string(),
+            missing_tool: Some(archive_format_tool(format).to_string()),
+            suggested_format: Some(archive_alternative_format(format).to_string()),
+        }
+    }
+}
+
+/// Compress a file or directory into an archive next to the source.
+/// `format`：`zip`（默认）或 `tar.gz`。
+/// 目标机器缺少该格式所需命令时（shell 退出码 127）**不执行压缩**，
+/// 返回 `missing_tool` / `suggested_format` 让前端弹窗，由用户确认后再换格式重试。
 #[tauri::command]
 async fn create_archive(
     terminal_id: Option<Uuid>,
     source_path: String,
+    format: Option<String>,
     state: State<'_, Arc<AppState>>,
-) -> Result<String, String> {
+) -> Result<CreateArchiveResult, String> {
+    let format = normalize_archive_format(format.as_deref())?;
+    let archive_ext = if format == ARCHIVE_FORMAT_TAR_GZ {
+        ".tar.gz"
+    } else {
+        ".zip"
+    };
     // Extract file name cross-platform (handles both / and \).
     let file_name = source_path
         .rsplit(['/', '\\'])
         .next()
-        .unwrap_or(&source_path);
-    let stem = file_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(file_name);
+        .unwrap_or(&source_path)
+        .to_string();
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(&file_name)
+        .to_string();
 
     if let Some(tid) = terminal_id {
-        // Remote (Unix) — use zip.
+        // Remote (Unix) — tar.gz 用 tar，zip 用 zip（两者归档内容结构保持一致：
+        // tar 用 -C 父目录 + 条目名，只归档条目本身，不写入完整路径）。
         let parent = std::path::Path::new(&source_path)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| ".".to_string());
-        let archive_path = format!("{}/{}.zip", parent.trim_end_matches('/'), stem);
-        let q = shell_quote(&source_path);
-        let aq = shell_quote(&archive_path);
         let handle = {
             let terminals = state.remote_terminals.lock().await;
             terminals
@@ -3370,26 +3455,63 @@ async fn create_archive(
                 .map(|session| Arc::clone(&session.handle))
                 .ok_or_else(|| format!("terminal is not connected: {tid}"))?
         };
-        let cmd = format!("rm -f {aq} && zip -r {aq} {q}");
-        let (_stdout, stderr, exit_code) = exec_remote_command_full(&handle, &cmd).await?;
-        if exit_code != Some(0) {
-            let detail = if !stderr.is_empty() {
-                String::from_utf8_lossy(&stderr).to_string()
+        let build_remote = |payload_format: &str| {
+            let ext = if payload_format == ARCHIVE_FORMAT_TAR_GZ {
+                ".tar.gz"
             } else {
-                format!("退出码: {exit_code:?}")
+                ".zip"
             };
-            return Err(format!("远程压缩失败: {detail}"));
+            let archive_path = format!("{}/{}{}", parent.trim_end_matches('/'), stem, ext);
+            let aq = shell_quote(&archive_path);
+            let cmd = if payload_format == ARCHIVE_FORMAT_TAR_GZ {
+                format!(
+                    "rm -f {aq} && tar -czf {aq} -C {parent} {name}",
+                    aq = aq,
+                    parent = shell_quote(&parent),
+                    name = shell_quote(&file_name),
+                )
+            } else {
+                format!("rm -f {aq} && zip -r {aq} {q}", aq = aq, q = shell_quote(&source_path))
+            };
+            (cmd, archive_path)
+        };
+
+        let (cmd, archive_path) = build_remote(format);
+        let (_stdout, stderr, exit_code) = exec_remote_command_full(&handle, &cmd).await?;
+        if exit_code == Some(0) {
+            return Ok(CreateArchiveResult::done(archive_path, format));
         }
-        Ok(archive_path)
+        // `bash: zip: command not found` → 127：交给前端弹窗让用户确认换格式
+        if exit_code == Some(127) {
+            return Ok(CreateArchiveResult::needs_tool(format));
+        }
+        Err(format!(
+            "远程压缩失败: {}",
+            command_failure_detail(&stderr, exit_code)
+        ))
     } else {
         // Local — put archive next to the source.
         let source = PathBuf::from(&source_path);
         let parent = source
             .parent()
             .ok_or_else(|| "无法确定父目录".to_string())?;
-        let archive_path = parent.join(format!("{}.zip", stem));
+        let archive_path = parent.join(format!("{stem}{archive_ext}"));
 
-        let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+        let (program, args): (&str, Vec<String>) = if format == ARCHIVE_FORMAT_TAR_GZ {
+            // 本地 tar.gz：直接调用 tar（Windows 10+ 自带 bsdtar，Linux/macOS 均有）。
+            // 不走 shell，参数逐个传递，含空格/引号的路径也安全；
+            // -C 父目录 + 文件名，只归档条目本身，与 zip 分支的语义对齐。
+            (
+                "tar",
+                vec![
+                    "-czf".to_string(),
+                    archive_path.to_string_lossy().to_string(),
+                    "-C".to_string(),
+                    parent.to_string_lossy().to_string(),
+                    file_name.clone(),
+                ],
+            )
+        } else if cfg!(windows) {
             (
                 "powershell",
                 vec![
@@ -3419,24 +3541,36 @@ async fn create_archive(
             )
         };
 
-        let output = std::process::Command::new(program)
-            .args(&args)
-            .output()
-            .map_err(|e| format!("执行压缩失败（{program}）: {e}"))?;
+        let output = match std::process::Command::new(program).args(&args).output() {
+            Ok(output) => output,
+            // 程序本身不存在（例如老版本 Windows 没有 bsdtar）
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CreateArchiveResult::needs_tool(format));
+            }
+            Err(error) => return Err(format!("执行压缩失败（{program}）: {error}")),
+        };
 
-        if !output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let detail = if !stderr.is_empty() {
-                stderr.to_string()
-            } else if !stdout.is_empty() {
-                stdout.to_string()
-            } else {
-                format!("退出码: {:?}", output.status.code())
-            };
-            return Err(format!("压缩失败（{program}）: {detail}"));
+        if output.status.success() {
+            return Ok(CreateArchiveResult::done(
+                archive_path.to_string_lossy().to_string(),
+                format,
+            ));
         }
-        Ok(archive_path.to_string_lossy().to_string())
+        // `sh: zip: command not found` → 127：交给前端弹窗让用户确认换格式
+        if output.status.code() == Some(127) {
+            return Ok(CreateArchiveResult::needs_tool(format));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if !stderr.is_empty() {
+            stderr.to_string()
+        } else if !stdout.is_empty() {
+            stdout.to_string()
+        } else {
+            format!("退出码: {:?}", output.status.code())
+        };
+        Err(format!("压缩失败（{program}）: {detail}"))
     }
 }
 
@@ -6644,6 +6778,27 @@ mod tests {
             enabled,
             vec!["gpt-5.6-terra".to_string(), "o1-mini".to_string()]
         );
+    }
+
+    #[test]
+    fn normalize_archive_format_accepts_zip_and_tar_gz() {
+        assert_eq!(
+            normalize_archive_format(None).expect("default is zip"),
+            ARCHIVE_FORMAT_ZIP
+        );
+        assert_eq!(
+            normalize_archive_format(Some(" zip ")).expect("accept zip"),
+            ARCHIVE_FORMAT_ZIP
+        );
+        assert_eq!(
+            normalize_archive_format(Some("TAR.GZ")).expect("accept tar.gz"),
+            ARCHIVE_FORMAT_TAR_GZ
+        );
+        assert_eq!(
+            normalize_archive_format(Some("tgz")).expect("accept tgz alias"),
+            ARCHIVE_FORMAT_TAR_GZ
+        );
+        assert!(normalize_archive_format(Some("rar")).is_err());
     }
 
     #[test]

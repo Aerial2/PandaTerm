@@ -2,7 +2,25 @@
  * 文件资源 / 上传冲突 — 纯数据与工具（无 React）。
  * 从 App.tsx 拆出，避免巨型组件里塞工具函数。
  */
-import type { LocalDirectoryEntry } from './api';
+import type { ArchiveFormat, LocalDirectoryEntry } from './api';
+
+/**
+ * 右键「压缩为…」子菜单的格式列表。
+ * 新增格式时只需要：这里加一项 + 后端 create_archive 支持该 format。
+ */
+export const ARCHIVE_FORMAT_OPTIONS: ReadonlyArray<{
+  value: ArchiveFormat;
+  label: string;
+  hint: string;
+}> = [
+  { value: 'zip', label: 'ZIP', hint: '.zip' },
+  { value: 'tar.gz', label: 'TAR.GZ', hint: '无 zip 命令时可用' },
+];
+
+/** 格式展示名（弹窗/日志用），未知值原样返回 */
+export function archiveFormatLabel(format: string): string {
+  return ARCHIVE_FORMAT_OPTIONS.find((option) => option.value === format)?.label ?? format;
+}
 
 export type ResourceFile = {
   name: string;
@@ -51,7 +69,22 @@ export const RESOURCE_RENAME_SECOND_CLICK_DELAY_MS = 500;
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico']);
 const VIDEO_EXTS = new Set(['mp4', 'webm', 'ogg', 'ogv', 'mov', 'avi', 'mkv']);
 const AUDIO_EXTS = new Set(['mp3', 'wav', 'flac', 'aac', 'm4a', 'ogg']);
-const ARCHIVE_EXTS = new Set(['zip', 'tar', 'gz', 'tgz', 'bz2', 'tbz2', 'xz', 'txz', '7z', 'rar']);
+const ARCHIVE_EXTS = new Set([
+  'zip',
+  'tar',
+  'gz',
+  'tgz',
+  'bz2',
+  'tbz2',
+  'xz',
+  'txz',
+  '7z',
+  'rar',
+  // getFileExt 会对 .tar.gz / .tar.bz2 / .tar.xz 返回复合后缀
+  'tar.gz',
+  'tar.bz2',
+  'tar.xz',
+]);
 
 export function getFileExt(name: string): string {
   const lower = name.toLowerCase();

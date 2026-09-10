@@ -992,10 +992,31 @@ export async function extractArchive(archivePath: string, terminalId?: string | 
   });
 }
 
-export async function createArchive(sourcePath: string, terminalId?: string | null): Promise<string> {
-  return await invoke<string>('create_archive', {
+/** 压缩格式：后端 create_archive 的 format 参数 */
+export type ArchiveFormat = 'zip' | 'tar.gz';
+
+/** create_archive 的返回：path 为空表示目标机器缺少所需命令，需要用户确认换格式 */
+export type CreateArchiveResult = {
+  /** 成功时的归档路径 */
+  path?: string | null;
+  /** 实际（或请求的）格式 */
+  format: string;
+  /** 缺少的命令，如 zip / tar */
+  missing_tool?: string | null;
+  /** 建议改用的格式 */
+  suggested_format?: string | null;
+};
+
+export async function createArchive(
+  sourcePath: string,
+  terminalId?: string | null,
+  /** zip（默认）或 tar.gz（服务器没有 zip 命令时用） */
+  format: ArchiveFormat = 'zip',
+): Promise<CreateArchiveResult> {
+  return await invoke<CreateArchiveResult>('create_archive', {
     terminalId: terminalId ?? null,
     sourcePath,
+    format,
   });
 }
 

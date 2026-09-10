@@ -5425,6 +5425,48 @@ body.connection-reordering {
   color: #fff;
 }
 
+/* 「压缩为…」二级格式菜单：新增格式只需改 resourceModel 的 ARCHIVE_FORMAT_OPTIONS */
+.file-context-submenu-host {
+  position: relative;
+}
+
+.file-context-submenu-arrow {
+  margin-left: auto;
+  flex-shrink: 0;
+  opacity: 0.65;
+}
+
+.file-context-submenu {
+  position: absolute;
+  top: -4px;
+  left: 100%;
+  z-index: 2;
+  min-width: 200px;
+  padding: 4px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: #2c313a;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+/* 右键菜单贴近窗口右边缘时向左展开，避免飞出可视区 */
+.file-context-submenu.flip-left {
+  left: auto;
+  right: 100%;
+}
+
+.file-context-submenu .file-context-item em {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.file-context-submenu .file-context-item:hover em {
+  color: inherit;
+}
+
 .file-context-divider {
   height: 1px;
   margin: 4px 0;
