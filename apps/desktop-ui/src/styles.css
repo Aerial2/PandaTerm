@@ -5741,6 +5741,19 @@ body.has-ai-settings-window .ssh-workbench > :not(.ai-settings-backdrop):not(.di
   cursor: default;
 }
 
+/* 隐藏 number 输入框的原生上下调节按钮（观感粗糙，改为直接键入） */
+.ai-settings-input[type='number'] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+.ai-settings-input[type='number']::-webkit-outer-spin-button,
+.ai-settings-input[type='number']::-webkit-inner-spin-button {
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
 /* API Key：右侧密码可见性开关 */
 .ai-settings-secret {
   position: relative;

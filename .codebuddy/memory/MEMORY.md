@@ -64,3 +64,21 @@
   - 禁止使用 `rgba(88, 166, 255, ...)`（GitHub 蓝）之类的高亮色。
 - **圆角"一点点"**：控件 8px（输入框/按钮/nav 项/chip/图标按钮）、容器 9-10px；不用 999px 胶囊，除非设计上明确要胶囊（如 MCP 策略标签）。
 - 相关文件：`apps/desktop-ui/src/styles.css`（`:root` 变量 + `.ai-settings-*` 系列）。
+
+## 7. AI 设置窗口 / 供应商配置（2026-09-10）
+- **设置窗口只渲染 `AiSettingsWindow.tsx`**（`main.tsx` 按 `windowMode==='ai-settings'` 分流）；`App.tsx` 里那套 `isAiSettingsOpen` 设置表单是**死代码**（`App.tsx:293 const isAiSettingsWindow = false`），改设置 UI 不要动它。
+- 配置存储：`AiProviderConfigStore{ version, active_account_id, accounts[], reasoning_effort }`，`AiProviderAccountStore{ id, name, base_url, model, models, enabled_models, api_format, context_window, max_tokens, use_api_key, api_key_secret_id }`。
+  - `reasoning_effort` 是**全局**（默认 `none`）；`context_window` 与 `max_tokens` 是**账号级**，且 **0 = 留空/未设置**（`AI_UNSET_TOKEN_LIMIT`），设置页输入框留空即写 0，**不要把默认值写进配置**。
+  - 留空时的实际默认：上下文窗口 `AI_DEFAULT_CONTEXT_WINDOW = 400_000`（TS 侧常量，依据 2026 主流旗舰 GPT-5.x 400K / Claude 4.5 200K~1M / Gemini ~1M）；max 输出 token 留空 = **不注入** `max_tokens`（由服务端按模型上限决定，避免压低新模型 64K~128K 又让 gpt-4o-mini 等旧端点报 400）。
+  - 新字段一律 `#[serde(default)]`，无需迁移；改结构体记得同步所有字面量构造处（`new_default_ai_account`、`migrate_ai_config_v1`、`add_ai_provider_account`、单测里的 `OpenAiChat*Request`）。
+- 请求体：OpenAI 的 `max_tokens` 仅在配置 >0 时注入（`ai_request_max_tokens`）；Claude Messages 必须带 `max_tokens`，未配置时兜底 8192（`AI_CLAUDE_FALLBACK_MAX_TOKENS`）。
+- 上下文窗口 → 前端预算：`resolveAiContextBudgetChars(tokens) = clamp(tokens × 3.5, 4000, 200_000)`；200k 字符是后端 `MAX_AI_TOTAL_CHARS` 硬上限（`validate_ai_messages` 会拒收更大请求），所以调大窗口不会真的扩大可发送量。
+
+## 8. 禁止「在 setState updater 里写副作用、函数外立刻读」（React 18/19 自动批处理坑，2026-09-10）
+- 反例（曾导致「低风险自动执行」开关完全无效）：`App.tsx` 的 `finishAiStream` 把解析结果与自动执行任务写在 `updateAiConversation(...)` 的 updater 里（`autoRunCapture.job` / `shouldRepairAgentProtocol`），函数返回后立刻 `if (autoRunCapture.job)` 读取。
+- 根因：React 18/19 只在 fiber 无 pending update 时才「顺带」同步跑 updater（eagerState 优化）；流式场景最后一个 `delta` 的 setState 常未 flush → updater 被推迟到 render 阶段 → 外面读到 null，自动执行/协议纠偏双双失效。
+- 修复（**不要用 `setTimeout(0)` 兜**：定时器与 React 调度（MessageChannel）谁先跑没有硬保证，实测仍失效）：
+  1. **把解析整体移出 updater**——新增 `parseAiAgentTurn(conversation, activeRequest)`，在 `finishAiStream` 里先用 `aiWorkspaceRef.current` 的会话快照**同步**解析，再用结果做纯 `setState` 提交；副作用（协议纠偏/自动执行）全部用同步拿到的返回值。
+  2. 副作用走**幂等派发**（`dispatchAiAutoRun` + `aiAutoRunDispatchedRef` 去重），同步路径与兜底路径共用。
+  3. 再加一层**状态提交兜底**：`useEffect([aiWorkspace])` 复查「本回合新创建的助手消息」（`aiAutoRunEligibleRef` 在 `beginAiGeneration` 登记），关开关时清空该白名单，避免把历史遗留提案突然跑掉。
+- 排查经验：UI 上出现「自动执行」徽标说明解析数据已进 state（渲染发生在 commit 之后），但动作仍是 `proposed` → 几乎可以断定是「触发逻辑没跑到」，而不是业务判断/高风险拦截。

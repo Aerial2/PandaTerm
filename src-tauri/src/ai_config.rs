@@ -17,10 +17,9 @@ pub const DEFAULT_AI_MODEL: &str = "gpt-4o-mini";
 pub const DEFAULT_AI_REASONING_EFFORT: &str = "none";
 /// 默认 OpenAI 兼容协议
 pub const DEFAULT_AI_API_FORMAT: &str = "openai";
-/// 默认上下文窗口（token）；前端据此换算上下文用量预算
-pub const DEFAULT_AI_CONTEXT_WINDOW: u32 = 128_000;
-/// 默认最大输出 token；0 = 不限制（OpenAI 不带 max_tokens，Claude 走兜底值）
-pub const DEFAULT_AI_MAX_TOKENS: u32 = 0;
+/// 上下文窗口 / 最大输出 token 的「留空」哨兵：0 = 未设置。
+/// 设置页留空即写 0，运行时用默认行为（上下文窗口回落前端默认值，max_tokens 不注入请求体）。
+pub const AI_UNSET_TOKEN_LIMIT: u32 = 0;
 /// Claude Messages API 必须带 max_tokens，未配置时兜底 8192（保持历史行为）
 pub const AI_CLAUDE_FALLBACK_MAX_TOKENS: u32 = 8192;
 pub const MIN_AI_CONTEXT_WINDOW: u32 = 1_000;
@@ -69,10 +68,10 @@ pub fn ai_request_reasoning_effort(effort: &str) -> Option<&str> {
     }
 }
 
-/// 上下文窗口（token）：0 视为未设置 → 回落到默认值
+/// 上下文窗口（token）：0 = 留空（未设置，运行时用默认值），否则需在合法区间内
 pub fn validate_ai_context_window(value: u32) -> Result<u32, String> {
-    if value == 0 {
-        return Ok(DEFAULT_AI_CONTEXT_WINDOW);
+    if value == AI_UNSET_TOKEN_LIMIT {
+        return Ok(AI_UNSET_TOKEN_LIMIT);
     }
     if !(MIN_AI_CONTEXT_WINDOW..=MAX_AI_CONTEXT_WINDOW).contains(&value) {
         return Err(format!(
@@ -256,11 +255,11 @@ fn default_ai_api_format() -> String {
 }
 
 fn default_ai_context_window() -> u32 {
-    DEFAULT_AI_CONTEXT_WINDOW
+    AI_UNSET_TOKEN_LIMIT
 }
 
 fn default_ai_max_tokens() -> u32 {
-    DEFAULT_AI_MAX_TOKENS
+    AI_UNSET_TOKEN_LIMIT
 }
 
 fn default_ai_account_name() -> String {
@@ -300,8 +299,8 @@ pub fn new_default_ai_account() -> AiProviderAccountStore {
         models: vec![DEFAULT_AI_MODEL.to_string()],
         enabled_models: vec![DEFAULT_AI_MODEL.to_string()],
         api_format: DEFAULT_AI_API_FORMAT.to_string(),
-        context_window: DEFAULT_AI_CONTEXT_WINDOW,
-        max_tokens: DEFAULT_AI_MAX_TOKENS,
+        context_window: AI_UNSET_TOKEN_LIMIT,
+        max_tokens: AI_UNSET_TOKEN_LIMIT,
         use_api_key: true,
         api_key_secret_id: None,
     }
@@ -412,8 +411,8 @@ pub fn migrate_ai_config_v1(value: Value) -> Result<AiProviderConfigStore, Strin
         models,
         enabled_models,
         api_format,
-        context_window: DEFAULT_AI_CONTEXT_WINDOW,
-        max_tokens: DEFAULT_AI_MAX_TOKENS,
+        context_window: AI_UNSET_TOKEN_LIMIT,
+        max_tokens: AI_UNSET_TOKEN_LIMIT,
         use_api_key,
         api_key_secret_id,
     };

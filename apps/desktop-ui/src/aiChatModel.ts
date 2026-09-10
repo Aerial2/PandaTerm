@@ -12,7 +12,7 @@ import type {
   AiConversationState,
   AiMessage,
 } from './aiRuntime';
-import { resolveAiModelCatalog } from './aiSettingsModel';
+import { resolveAiEffectiveContextWindow, resolveAiModelCatalog } from './aiSettingsModel';
 
 /** 会话模式选项；后续可在此追加 plan 等 */
 export const AI_MODE_OPTIONS: Array<{ value: AiConversationMode; label: string; hint: string }> = [
@@ -39,6 +39,10 @@ export function normalizeAiReasoningEffort(value?: string | null): AiReasoningEf
 
 export const AI_HISTORY_MESSAGE_LIMIT = 40;
 export const AI_HISTORY_CHAR_BUDGET = 200_000;
+/** 粗略换算：1 token ≈ 3.5 字符（中英混排经验值），仅用于上下文预算 */
+export const AI_CHARS_PER_TOKEN = 3.5;
+/** 后端硬上限（main.rs MAX_AI_TOTAL_CHARS）：前端预算不得超过 */
+export const AI_MAX_REQUEST_CHARS = 200_000;
 export const AI_REQUEST_MESSAGE_CHAR_LIMIT = 30_000;
 export const AI_REQUEST_TRUNCATION_MARKER = '\n\n[...该消息中间内容已裁剪...]\n\n';
 export const AI_AGENT_MAX_CONTINUATIONS = 16;
@@ -208,18 +212,28 @@ export function limitAiRequestMessage(content: string): string {
   return `${content.slice(0, headLength)}${AI_REQUEST_TRUNCATION_MARKER}${content.slice(-(available - headLength))}`;
 }
 
+/**
+ * 依据「上下文窗口」（token）换算可发送的字符预算。
+ * 留空（0）时用默认窗口；上限取后端硬限制（MAX_AI_TOTAL_CHARS）。
+ */
+export function resolveAiContextBudgetChars(contextWindow?: number | null): number {
+  const tokens = resolveAiEffectiveContextWindow(contextWindow);
+  return Math.max(4_000, Math.min(AI_MAX_REQUEST_CHARS, Math.round(tokens * AI_CHARS_PER_TOKEN)));
+}
+
 export function buildAiRequestMessages(
   history: AiMessage[],
   userMessage: AiMessage,
   mode: AiConversationMode,
   mcpToolsCatalog = '',
+  budgetChars = AI_HISTORY_CHAR_BUDGET,
 ): AiChatMessage[] {
   const systemMessage = aiSystemMessage(mode, mcpToolsCatalog);
   const candidates = [...history.filter((message) => message.id !== 'ai-welcome'), userMessage]
     .slice(-AI_HISTORY_MESSAGE_LIMIT)
     .map((message) => ({ role: message.role, content: limitAiRequestMessage(formatAiRequestContent(message)) }))
     .filter((message) => message.content.trim().length > 0);
-  let remaining = AI_HISTORY_CHAR_BUDGET - systemMessage.content.length;
+  let remaining = budgetChars - systemMessage.content.length;
   const selected: AiChatMessage[] = [];
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
     const candidate = candidates[index];
@@ -258,7 +272,10 @@ export function estimateAiContextUsage(options: {
   draft: string;
   pendingContexts: AiContextItem[];
   autoTerminalContext?: AiContextItem | null;
+  /** 模型上下文窗口（token）；未配置时用默认预算 */
+  contextWindow?: number | null;
 }): AiContextUsage {
+  const budgetChars = resolveAiContextBudgetChars(options.contextWindow);
   const mode = options.conversation?.mode ?? 'agent';
   const system = aiSystemMessage(mode);
   const history = (options.conversation?.messages ?? []).filter(
@@ -286,7 +303,7 @@ export function estimateAiContextUsage(options: {
     status: 'complete',
   };
 
-  const request = buildAiRequestMessages(history, userMessage, mode);
+  const request = buildAiRequestMessages(history, userMessage, mode, '', budgetChars);
   const usedChars = request.reduce((sum, message) => sum + message.content.length, 0);
   const systemChars = system.content.length;
   const limitedDraft = draftText || contexts.length > 0
@@ -299,7 +316,7 @@ export function estimateAiContextUsage(options: {
     (sum, item) => sum + item.label.length + (item.preview?.length ?? 0),
     0,
   );
-  const percent = Math.min(100, Math.round((usedChars / AI_HISTORY_CHAR_BUDGET) * 100));
+  const percent = Math.min(100, Math.round((usedChars / budgetChars) * 100));
 
   return {
     systemChars,
@@ -307,7 +324,7 @@ export function estimateAiContextUsage(options: {
     draftChars: draftText.length,
     contextChars,
     usedChars,
-    budgetChars: AI_HISTORY_CHAR_BUDGET,
+    budgetChars,
     percent,
     messageCount: Math.max(0, request.length - 1),
     contextCount: contexts.length,

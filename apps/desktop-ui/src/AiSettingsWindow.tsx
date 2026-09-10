@@ -51,6 +51,8 @@ import {
   type AiConfigDraft,
   type AiSettingsTab,
   AI_API_FORMAT_OPTIONS,
+  AI_DEFAULT_CONTEXT_WINDOW,
+  AI_REASONING_EFFORT_OPTIONS,
   DEFAULT_AI_CONFIG_DRAFT,
   createEmptyMcpServer,
   countEnabledMcpTools,
@@ -65,6 +67,8 @@ import {
   mcpServerStatusDot,
   mcpStatusLabel,
   normalizeAiApiFormat,
+  normalizeAiContextWindow,
+  normalizeAiMaxTokens,
   parseMcpServerJsonText,
   resolveAiModelCatalog,
   resolveAiTestModel,
@@ -755,8 +759,10 @@ export function AiSettingsWindow() {
         model: catalog.model,
         models: catalog.models,
         enabled_models: catalog.enabled_models,
-        reasoning_effort: aiProviderConfig?.reasoning_effort ?? 'none',
+        reasoning_effort: aiConfigDraft.reasoning_effort,
         api_format: aiConfigDraft.api_format,
+        context_window: normalizeAiContextWindow(aiConfigDraft.context_window),
+        max_tokens: normalizeAiMaxTokens(aiConfigDraft.max_tokens),
         use_api_key: true,
       }, apiKey);
       applyAiProviderConfigState(config);
@@ -1116,6 +1122,69 @@ export function AiSettingsWindow() {
                             </button>
                           </div>
                         </label>
+
+                        <div className="ai-settings-divider" />
+
+                        <label className="ai-settings-row ai-settings-row-inline">
+                          <div className="ai-settings-row-copy">
+                            <span>上下文窗口</span>
+                          </div>
+                          <input
+                            className="ai-settings-input ai-settings-input-inline"
+                            type="number"
+                            inputMode="numeric"
+                            min={1000}
+                            step={1000}
+                            value={aiConfigDraft.context_window || ''}
+                            placeholder={`默认 ${AI_DEFAULT_CONTEXT_WINDOW}（token）`}
+                            spellCheck={false}
+                            disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                            onChange={(event) => setAiConfigDraft((current) => ({
+                              ...current,
+                              context_window: Number(event.target.value) || 0,
+                            }))}
+                          />
+                        </label>
+
+                        <div className="ai-settings-divider" />
+
+                        <label className="ai-settings-row ai-settings-row-inline">
+                          <div className="ai-settings-row-copy">
+                            <span>最大输出 Token</span>
+                          </div>
+                          <input
+                            className="ai-settings-input ai-settings-input-inline"
+                            type="number"
+                            inputMode="numeric"
+                            min={0}
+                            step={1024}
+                            value={aiConfigDraft.max_tokens || ''}
+                            placeholder="默认（不限制，交给服务端）"
+                            spellCheck={false}
+                            disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                            onChange={(event) => setAiConfigDraft((current) => ({
+                              ...current,
+                              max_tokens: Number(event.target.value) || 0,
+                            }))}
+                          />
+                        </label>
+
+                        <div className="ai-settings-divider" />
+
+                        <div className="ai-settings-row ai-settings-row-inline">
+                          <div className="ai-settings-row-copy">
+                            <span>默认推理强度</span>
+                          </div>
+                          <div className="ai-settings-select-inline">
+                            <SelectDropdown
+                              value={aiConfigDraft.reasoning_effort}
+                              options={AI_REASONING_EFFORT_OPTIONS}
+                              aria-label="默认推理强度"
+                              disabled={isAiConfigLoading || isAiConfigSaving || isAiModelsSyncing || Boolean(aiProviderConfig?.error)}
+                              onChange={(next) => setAiConfigDraft((current) => ({ ...current, reasoning_effort: next }))}
+                            />
+                          </div>
+                        </div>
 
                         <div className="ai-settings-divider" />
 

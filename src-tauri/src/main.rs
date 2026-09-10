@@ -35,9 +35,8 @@ use ai_config::{
     normalize_enabled_ai_models, save_ai_config, validate_ai_api_format, validate_ai_base_url,
     validate_ai_context_window, validate_ai_max_tokens, validate_ai_model,
     validate_ai_reasoning_effort, AiProviderAccountStore, AiProviderConfigStore,
-    AI_CLAUDE_FALLBACK_MAX_TOKENS, AI_CONFIG_VERSION, DEFAULT_AI_API_FORMAT, DEFAULT_AI_BASE_URL,
-    DEFAULT_AI_CONTEXT_WINDOW, DEFAULT_AI_MAX_TOKENS, DEFAULT_AI_MODEL, MAX_AI_ACCOUNTS,
-    MAX_AI_MODELS,
+    AI_CLAUDE_FALLBACK_MAX_TOKENS, AI_CONFIG_VERSION, AI_UNSET_TOKEN_LIMIT, DEFAULT_AI_API_FORMAT,
+    DEFAULT_AI_BASE_URL, DEFAULT_AI_MODEL, MAX_AI_ACCOUNTS, MAX_AI_MODELS,
 };
 use archive::{extract_command, extract_local_archive};
 use base64::{base64_decode, base64_encode};
@@ -4344,8 +4343,8 @@ async fn add_ai_provider_account(
         models: vec![DEFAULT_AI_MODEL.to_string()],
         enabled_models: vec![DEFAULT_AI_MODEL.to_string()],
         api_format: DEFAULT_AI_API_FORMAT.to_string(),
-        context_window: DEFAULT_AI_CONTEXT_WINDOW,
-        max_tokens: DEFAULT_AI_MAX_TOKENS,
+        context_window: AI_UNSET_TOKEN_LIMIT,
+        max_tokens: AI_UNSET_TOKEN_LIMIT,
         use_api_key: true,
         api_key_secret_id: None,
     };
@@ -6690,8 +6689,8 @@ mod tests {
         assert_eq!(validate_ai_max_tokens(0).expect("unlimited"), 0);
         assert!(validate_ai_max_tokens(u32::MAX).is_err());
         assert_eq!(
-            validate_ai_context_window(0).expect("zero falls back"),
-            DEFAULT_AI_CONTEXT_WINDOW
+            validate_ai_context_window(0).expect("zero stays unset"),
+            AI_UNSET_TOKEN_LIMIT
         );
         assert_eq!(
             validate_ai_context_window(32_000).expect("accept 32k"),

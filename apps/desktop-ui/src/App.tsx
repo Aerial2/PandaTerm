@@ -249,6 +249,7 @@ import {
   isAiAgentContinuationMessage,
   normalizeAiReasoningEffort,
   resolveAiChatModelOptions,
+  resolveAiContextBudgetChars,
   type AiReasoningEffort,
 } from './aiChatModel';
 import {
@@ -439,6 +440,10 @@ export function App() {
     action: AiMcpAction,
   ) => Promise<void>>(async () => undefined);
   const flushAiMessageQueueRef = useRef<() => void>(() => undefined);
+  /** 本次运行中创建的助手消息 id：只有它们才允许自动执行，避免误跑历史会话里遗留的待授权提案 */
+  const aiAutoRunEligibleRef = useRef<Set<string>>(new Set());
+  /** 已派发自动执行的动作 id：幂等，保证同步路径与兜底路径不会重复执行同一条命令 */
+  const aiAutoRunDispatchedRef = useRef<Set<string>>(new Set());
   const [currentPath, setCurrentPath] = useState('');
   const [parentPath, setParentPath] = useState<string | null>(null);
   const [resourceFiles, setResourceFiles] = useState<ResourceFile[]>([]);
@@ -3768,241 +3773,294 @@ export function App() {
     }));
   }
 
+  /** 派发一次低风险自动执行；幂等（同一动作只派发一次，同步路径与兜底路径共用） */
+  function dispatchAiAutoRun(
+    conversationId: string,
+    messageId: string,
+    action: AiTerminalAction | AiMcpAction,
+  ) {
+    if (aiAutoRunDispatchedRef.current.has(action.id)) return;
+    aiAutoRunDispatchedRef.current.add(action.id);
+    // 便于排查「开关似乎没生效」：控制台会打印实际派发的动作
+    console.info('[ai-auto-run] 低风险自动执行', 'command' in action ? action.command : `${action.serverId}/${action.toolName}`);
+    if ('command' in action) {
+      runAiTerminalActionRef.current(conversationId, messageId, action);
+    } else {
+      void runAiMcpActionRef.current(conversationId, messageId, action);
+    }
+  }
+
+  /**
+   * Agent 回合解析（仅「正常完成 + agent 模式」时调用）。
+   *
+   * ⚠️ 必须在 setState 之外**同步**调用：解析产物（协议纠偏、低风险自动执行）要立刻使用，
+   * 而 React 18/19 的 setState updater 不保证同步执行（eagerState 只在 fiber 无 pending update 时生效）。
+   * 之前把解析写在 updater 里、函数返回后立刻读取，结果自动执行与协议纠偏都静默失效。
+   */
+  function parseAiAgentTurn(
+    conversation: AiConversationState,
+    activeRequest: NonNullable<typeof aiActiveRequestRef.current>,
+  ) {
+    const assistantMessageId = activeRequest.assistantMessageId;
+    const assistantMessage = conversation.messages.find((message) => message.id === assistantMessageId);
+    const userMessage = conversation.messages.find((message) => message.id === activeRequest.userMessageId);
+    const responseContent = activeRequest.content || assistantMessage?.content || '';
+    const parsedEdits = parseAiEditResponse(responseContent);
+    const parsedTerminal = parseAiTerminalResponse(parsedEdits.visibleContent);
+    const parsedMcp = parseAiMcpResponse(parsedTerminal.visibleContent);
+    const nativeMapped = mapNativeToolCalls(activeRequest.toolCalls ?? []);
+    const actionErrors = [
+      ...parsedEdits.errors,
+      ...parsedTerminal.errors,
+      ...parsedMcp.errors,
+      ...nativeMapped.errors,
+    ];
+    // 原生 tool_calls 优先；fence 作为兼容回退，再按 identity 去重
+    const mergedTerminalSources = [
+      ...nativeMapped.terminalActions,
+      ...parsedTerminal.actions,
+    ];
+    const mergedMcpSources = [
+      ...nativeMapped.mcpActions,
+      ...parsedMcp.actions,
+    ];
+    const proposals = parsedEdits.proposals.flatMap<AiEditProposal>((proposal) => {
+      const target = userMessage?.contexts.find((context) =>
+        context.kind === 'file' && context.source === proposal.targetSource,
+      );
+      if (!target?.source) {
+        actionErrors.push(`修改提案引用了未授权文件：${proposal.targetSource}`);
+        return [];
+      }
+      return [{
+        id: crypto.randomUUID(),
+        summary: proposal.summary,
+        targetSource: target.source,
+        targetLabel: target.label,
+        status: 'proposed',
+        edits: proposal.edits,
+        isRemote: target.isRemote,
+        terminalId: target.terminalId,
+        createdAt: new Date().toISOString(),
+      }];
+    });
+    const priorTerminalCommandIds = new Set(
+      conversation.messages.flatMap((priorMessage) =>
+        priorMessage.terminalActions.map(({ command }) => terminalCommandIdentity(command)),
+      ),
+    );
+    const acceptedTerminalCommandIds = new Set<string>();
+    const authorizedTerminalContexts = (userMessage?.contexts ?? []).filter((context) =>
+      (context.kind === 'terminal' || context.kind === 'selection')
+      && Boolean(context.source)
+      && Boolean(context.terminalId),
+    );
+    const terminalActions = mergedTerminalSources.flatMap<AiTerminalAction>((action) => {
+      let target = authorizedTerminalContexts.find((context) =>
+        context.source === action.contextSource,
+      );
+      // 仅有一个已授权终端时，容忍 AI 写错/写占位 context_source（如 terminal）
+      if ((!target?.source || !target.terminalId) && authorizedTerminalContexts.length === 1) {
+        target = authorizedTerminalContexts[0];
+      }
+      if (!target?.source || !target.terminalId) {
+        actionErrors.push(`终端动作引用了未授权或不可用终端：${action.contextSource}`);
+        return [];
+      }
+      const commandId = terminalCommandIdentity(action.command);
+      if (priorTerminalCommandIds.has(commandId) || acceptedTerminalCommandIds.has(commandId)) {
+        actionErrors.push('终端动作与本任务中已有提案重复，已停止无进展重试');
+        return [];
+      }
+      const suspiciousRedirection = suspiciousShellRedirection(action.command);
+      if (suspiciousRedirection) {
+        actionErrors.push(`终端动作包含疑似粘连的 shell 重定向“${suspiciousRedirection}”，已拒绝提案`);
+        return [];
+      }
+      acceptedTerminalCommandIds.add(commandId);
+      return [{
+        id: crypto.randomUUID(),
+        summary: action.summary,
+        contextSource: target.source,
+        contextLabel: target.label,
+        command: action.command,
+        timeoutMs: action.timeoutMs,
+        status: 'proposed',
+        isRemote: Boolean(target.isRemote),
+        terminalId: target.terminalId,
+        toolCallId: action.toolCallId,
+        createdAt: new Date().toISOString(),
+      }];
+    });
+    const priorMcpIds = new Set(
+      conversation.messages.flatMap((priorMessage) =>
+        priorMessage.mcpActions.map(({ serverId, toolName, arguments: args }) =>
+          mcpActionIdentity(serverId, toolName, args),
+        ),
+      ),
+    );
+    const acceptedMcpIds = new Set<string>();
+    const mcpActions = mergedMcpSources.flatMap<AiMcpAction>((action) => {
+      const identity = mcpActionIdentity(action.serverId, action.toolName, action.arguments);
+      if (priorMcpIds.has(identity) || acceptedMcpIds.has(identity)) {
+        actionErrors.push('MCP 动作与本任务中已有提案重复，已停止无进展重试');
+        return [];
+      }
+      acceptedMcpIds.add(identity);
+      return [{
+        id: crypto.randomUUID(),
+        summary: action.summary,
+        serverId: action.serverId,
+        toolName: action.toolName,
+        arguments: action.arguments,
+        status: 'proposed',
+        toolCallId: action.toolCallId,
+        createdAt: new Date().toISOString(),
+      }];
+    });
+    const isToolContinuation = userMessage?.contexts.some(({ label }) =>
+      label.startsWith(AI_AGENT_RESULT_LABEL_PREFIX),
+    ) ?? false;
+    const declaresPendingToolWork = /(如果你(?:要我|愿意)|我会(?:直接)?提交|下一条会|需要.*(?:重新执行|再查|继续查)|可以直接再)/u.test(
+      parsedMcp.visibleContent,
+    );
+    const shouldRepairAgentProtocol = !activeRequest.protocolRepairAttempt
+      && isToolContinuation
+      && proposals.length === 0
+      && terminalActions.length === 0
+      && mcpActions.length === 0
+      && declaresPendingToolWork;
+    const errorSuffix = actionErrors.length > 0
+      ? `\n\n动作未全部接受：${actionErrors.join('；')}`
+      : '';
+
+    // 低风险自动执行：每条消息只挑一个动作（终端优先，其次 MCP）
+    let autoRun: null | { messageId: string; terminal?: AiTerminalAction; mcp?: AiMcpAction } = null;
+    if (aiAutoRunEnabledRef.current && !shouldRepairAgentProtocol) {
+      const autoTerminal = terminalActions.find((action) =>
+        action.status === 'proposed' && !isHighRiskTerminalCommand(action.command),
+      );
+      if (autoTerminal) {
+        autoRun = { messageId: assistantMessageId, terminal: autoTerminal };
+      } else {
+        const autoMcp = mcpActions.find((action) => action.status === 'proposed');
+        if (autoMcp) {
+          autoRun = { messageId: assistantMessageId, mcp: autoMcp };
+        }
+      }
+    }
+
+    return {
+      content: `${parsedMcp.visibleContent}${errorSuffix}`.trim(),
+      proposals,
+      terminalActions,
+      mcpActions,
+      shouldRepairAgentProtocol,
+      autoRun,
+    };
+  }
+
   function finishAiStream(
     activeRequest: NonNullable<typeof aiActiveRequestRef.current>,
     status: 'complete' | 'cancelled' | 'error',
     errorMessage?: string,
   ) {
-    let shouldRepairAgentProtocol = false;
-    /** 用对象承载，避免 TS 认为 setState updater 不会同步执行导致 never */
-    const autoRunCapture: {
-      job: null | {
-        messageId: string;
-        terminal?: AiTerminalAction;
-        mcp?: AiMcpAction;
-      };
-    } = { job: null };
+    // 先同步解析（用 ref 里的工作区快照，不依赖 setState updater 的执行时机）
+    const workspace = aiWorkspaceRef.current;
+    const conversation = workspace.conversations.find(({ id }) => id === activeRequest.conversationId);
+    const agentTurn = status === 'complete' && activeRequest.mode === 'agent' && conversation
+      ? parseAiAgentTurn(conversation, activeRequest)
+      : null;
 
-    updateAiConversation(activeRequest.conversationId, (conversation) => {
-      const userMessage = conversation.messages.find((message) => message.id === activeRequest.userMessageId);
-      return {
-        ...conversation,
-        updatedAt: new Date().toISOString(),
-        messages: conversation.messages.map((message) => {
-          if (message.id !== activeRequest.assistantMessageId) return message;
-          if (status === 'complete') {
-            if (activeRequest.mode !== 'agent') {
-              return { ...message, status, proposals: [], terminalActions: [], mcpActions: [] };
-            }
-            const responseContent = activeRequest.content || message.content;
-            const parsedEdits = parseAiEditResponse(responseContent);
-            const parsedTerminal = parseAiTerminalResponse(parsedEdits.visibleContent);
-            const parsedMcp = parseAiMcpResponse(parsedTerminal.visibleContent);
-            const nativeMapped = mapNativeToolCalls(activeRequest.toolCalls ?? []);
-            const actionErrors = [
-              ...parsedEdits.errors,
-              ...parsedTerminal.errors,
-              ...parsedMcp.errors,
-              ...nativeMapped.errors,
-            ];
-            // 原生 tool_calls 优先；fence 作为兼容回退，再按 identity 去重
-            const mergedTerminalSources = [
-              ...nativeMapped.terminalActions,
-              ...parsedTerminal.actions,
-            ];
-            const mergedMcpSources = [
-              ...nativeMapped.mcpActions,
-              ...parsedMcp.actions,
-            ];
-            const proposals = parsedEdits.proposals.flatMap<AiEditProposal>((proposal) => {
-              const target = userMessage?.contexts.find((context) =>
-                context.kind === 'file' && context.source === proposal.targetSource,
-              );
-              if (!target?.source) {
-                actionErrors.push(`修改提案引用了未授权文件：${proposal.targetSource}`);
-                return [];
-              }
-              return [{
-                id: crypto.randomUUID(),
-                summary: proposal.summary,
-                targetSource: target.source,
-                targetLabel: target.label,
-                status: 'proposed',
-                edits: proposal.edits,
-                isRemote: target.isRemote,
-                terminalId: target.terminalId,
-                createdAt: new Date().toISOString(),
-              }];
-            });
-            const priorTerminalCommandIds = new Set(
-              conversation.messages.flatMap((priorMessage) =>
-                priorMessage.terminalActions.map(({ command }) => terminalCommandIdentity(command)),
-              ),
-            );
-            const acceptedTerminalCommandIds = new Set<string>();
-            const authorizedTerminalContexts = (userMessage?.contexts ?? []).filter((context) =>
-              (context.kind === 'terminal' || context.kind === 'selection')
-              && Boolean(context.source)
-              && Boolean(context.terminalId),
-            );
-            const terminalActions = mergedTerminalSources.flatMap<AiTerminalAction>((action) => {
-              let target = authorizedTerminalContexts.find((context) =>
-                context.source === action.contextSource,
-              );
-              // 仅有一个已授权终端时，容忍 AI 写错/写占位 context_source（如 terminal）
-              if ((!target?.source || !target.terminalId) && authorizedTerminalContexts.length === 1) {
-                target = authorizedTerminalContexts[0];
-              }
-              if (!target?.source || !target.terminalId) {
-                actionErrors.push(`终端动作引用了未授权或不可用终端：${action.contextSource}`);
-                return [];
-              }
-              const commandId = terminalCommandIdentity(action.command);
-              if (priorTerminalCommandIds.has(commandId) || acceptedTerminalCommandIds.has(commandId)) {
-                actionErrors.push('终端动作与本任务中已有提案重复，已停止无进展重试');
-                return [];
-              }
-              const suspiciousRedirection = suspiciousShellRedirection(action.command);
-              if (suspiciousRedirection) {
-                actionErrors.push(`终端动作包含疑似粘连的 shell 重定向“${suspiciousRedirection}”，已拒绝提案`);
-                return [];
-              }
-              acceptedTerminalCommandIds.add(commandId);
-              return [{
-                id: crypto.randomUUID(),
-                summary: action.summary,
-                contextSource: target.source,
-                contextLabel: target.label,
-                command: action.command,
-                timeoutMs: action.timeoutMs,
-                status: 'proposed',
-                isRemote: Boolean(target.isRemote),
-                terminalId: target.terminalId,
-                toolCallId: action.toolCallId,
-                createdAt: new Date().toISOString(),
-              }];
-            });
-            const priorMcpIds = new Set(
-              conversation.messages.flatMap((priorMessage) =>
-                priorMessage.mcpActions.map(({ serverId, toolName, arguments: args }) =>
-                  mcpActionIdentity(serverId, toolName, args),
-                ),
-              ),
-            );
-            const acceptedMcpIds = new Set<string>();
-            const mcpActions = mergedMcpSources.flatMap<AiMcpAction>((action) => {
-              const identity = mcpActionIdentity(action.serverId, action.toolName, action.arguments);
-              if (priorMcpIds.has(identity) || acceptedMcpIds.has(identity)) {
-                actionErrors.push('MCP 动作与本任务中已有提案重复，已停止无进展重试');
-                return [];
-              }
-              acceptedMcpIds.add(identity);
-              return [{
-                id: crypto.randomUUID(),
-                summary: action.summary,
-                serverId: action.serverId,
-                toolName: action.toolName,
-                arguments: action.arguments,
-                status: 'proposed',
-                toolCallId: action.toolCallId,
-                createdAt: new Date().toISOString(),
-              }];
-            });
-            const isToolContinuation = userMessage?.contexts.some(({ label }) =>
-              label.startsWith(AI_AGENT_RESULT_LABEL_PREFIX),
-            ) ?? false;
-            const declaresPendingToolWork = /(如果你(?:要我|愿意)|我会(?:直接)?提交|下一条会|需要.*(?:重新执行|再查|继续查)|可以直接再)/u.test(
-              parsedMcp.visibleContent,
-            );
-            shouldRepairAgentProtocol = !activeRequest.protocolRepairAttempt
-              && isToolContinuation
-              && proposals.length === 0
-              && terminalActions.length === 0
-              && mcpActions.length === 0
-              && declaresPendingToolWork;
-            const errorSuffix = actionErrors.length > 0
-              ? `\n\n动作未全部接受：${actionErrors.join('；')}`
-              : '';
+    updateAiConversation(activeRequest.conversationId, (current) => ({
+      ...current,
+      updatedAt: new Date().toISOString(),
+      messages: current.messages.map((message) => {
+        if (message.id !== activeRequest.assistantMessageId) return message;
+        if (agentTurn) {
+          return {
+            ...message,
+            content: agentTurn.content,
+            proposals: agentTurn.proposals,
+            terminalActions: agentTurn.terminalActions,
+            mcpActions: agentTurn.mcpActions,
+            status,
+          };
+        }
+        if (status === 'complete') {
+          return { ...message, status, proposals: [], terminalActions: [], mcpActions: [] };
+        }
+        const content = status === 'error'
+          ? `${message.content}${message.content ? '\n\n' : ''}请求失败：${errorMessage}`
+          : message.content;
+        return { ...message, content, status };
+      }),
+    }));
 
-            // 自动执行：在同一同步解析结果上排队，不依赖尚未 re-render 的 workspace ref
-            if (aiAutoRunEnabledRef.current && !shouldRepairAgentProtocol) {
-              const autoTerminal = terminalActions.find((action) =>
-                action.status === 'proposed' && !isHighRiskTerminalCommand(action.command),
-              );
-              if (autoTerminal) {
-                autoRunCapture.job = { messageId: message.id, terminal: autoTerminal };
-              } else {
-                const autoMcp = mcpActions.find((action) => action.status === 'proposed');
-                if (autoMcp) {
-                  autoRunCapture.job = { messageId: message.id, mcp: autoMcp };
-                }
-              }
-            }
-
-            return {
-              ...message,
-              content: `${parsedMcp.visibleContent}${errorSuffix}`.trim(),
-              proposals,
-              terminalActions,
-              mcpActions,
-              status,
-            };
-          }
-          const content = status === 'error'
-            ? `${message.content}${message.content ? '\n\n' : ''}请求失败：${errorMessage}`
-            : message.content;
-          return { ...message, content, status };
-        }),
-      };
-    });
     if (aiActiveRequestRef.current?.requestId === activeRequest.requestId) {
       aiActiveRequestRef.current = null;
       setIsAiGenerating(false);
     }
-    if (shouldRepairAgentProtocol) {
-      window.setTimeout(() => {
-        if (aiActiveRequestRef.current) return;
-        const workspace = aiWorkspaceRef.current;
-        if (workspace.activeConversationId !== activeRequest.conversationId) return;
-        const conversation = workspace.conversations.find(({ id }) => id === activeRequest.conversationId);
-        if (!conversation || conversation.mode !== 'agent') return;
-        const userMessage = conversation.messages.find(({ id }) => id === activeRequest.userMessageId);
-        if (!userMessage) return;
-        const baseMessages = conversation.messages.filter(({ id }) => id !== activeRequest.assistantMessageId);
-        const repairMessage: AiMessage = {
-          ...userMessage,
-          content: `${userMessage.content}\n\n协议纠偏：上一回复表示仍需工具，却未提交 tool call。请立即调用 run_terminal_command 或 call_mcp_tool（无 tools 时用 pandaterm-terminal / pandaterm-mcp 代码块）；不要再次询问。`,
-        };
-        beginAiGeneration(conversation, baseMessages, repairMessage, true);
-      }, 0);
+    // 协议纠偏：上一回复声称还要调工具却没提交，补一次请求把它拉回来
+    if (agentTurn?.shouldRepairAgentProtocol) {
+      if (aiActiveRequestRef.current) return;
+      if (!conversation || workspace.activeConversationId !== activeRequest.conversationId) return;
+      if (conversation.mode !== 'agent') return;
+      const userMessage = conversation.messages.find(({ id }) => id === activeRequest.userMessageId);
+      if (!userMessage) return;
+      const baseMessages = conversation.messages.filter(({ id }) => id !== activeRequest.assistantMessageId);
+      const repairMessage: AiMessage = {
+        ...userMessage,
+        content: `${userMessage.content}\n\n协议纠偏：上一回复表示仍需工具，却未提交 tool call。请立即调用 run_terminal_command 或 call_mcp_tool（无 tools 时用 pandaterm-terminal / pandaterm-mcp 代码块）；不要再次询问。`,
+      };
+      beginAiGeneration(conversation, baseMessages, repairMessage, true);
       return;
     }
-    // 低风险自动执行：用解析阶段捕获的动作对象，绕过 ref 时序问题
-    if (autoRunCapture.job) {
-      const job = autoRunCapture.job;
-      window.setTimeout(() => {
-        if (job.terminal) {
-          runAiTerminalActionRef.current(
-            activeRequest.conversationId,
-            job.messageId,
-            job.terminal,
-          );
-          return;
-        }
-        if (job.mcp) {
-          void runAiMcpActionRef.current(
-            activeRequest.conversationId,
-            job.messageId,
-            job.mcp,
-          );
-        }
-      }, 0);
+    // 低风险自动执行（同步派发，不再依赖 setState 的执行时机）
+    const job = agentTurn?.autoRun;
+    if (job?.terminal) {
+      dispatchAiAutoRun(activeRequest.conversationId, job.messageId, job.terminal);
+    } else if (job?.mcp) {
+      dispatchAiAutoRun(activeRequest.conversationId, job.messageId, job.mcp);
     }
     // 生成结束：冲刷排队消息（续跑/自动执行中若又起请求，队列会等下一轮）
     window.setTimeout(() => flushAiMessageQueueRef.current(), 40);
   }
 
   finishAiStreamRef.current = finishAiStream;
+
+  /**
+   * 低风险自动执行的兜底：主路径在 finishAiStream 里同步派发；
+   * 万一解析产物没赶上（setState 批处理/时序意外），这里在状态提交后再检查一次。
+   * 只认本回合新创建的助手消息（aiAutoRunEligibleRef），不会误跑历史会话里遗留的待授权提案；
+   * 派发经 dispatchAiAutoRun 去重，绝不会重复执行同一条命令。
+   */
+  useEffect(() => {
+    if (!aiAutoRunEnabled) {
+      // 关闭状态下不保留待办：否则用户「先提案、后开开关」会突然把旧命令跑掉
+      if (aiAutoRunEligibleRef.current.size > 0) aiAutoRunEligibleRef.current.clear();
+      return;
+    }
+    if (aiActiveRequestRef.current || isAiGenerating) return;
+    if (!activeAiConversation || activeAiConversation.mode !== 'agent') return;
+    if (aiAutoRunEligibleRef.current.size === 0) return;
+    for (const messageId of [...aiAutoRunEligibleRef.current]) {
+      const message = activeAiConversation.messages.find(({ id }) => id === messageId);
+      if (!message) {
+        aiAutoRunEligibleRef.current.delete(messageId);
+        continue;
+      }
+      if (message.status === 'streaming') continue;
+      aiAutoRunEligibleRef.current.delete(messageId);
+      if (message.status !== 'complete') continue;
+      const terminal = message.terminalActions.find((action) =>
+        action.status === 'proposed' && !isHighRiskTerminalCommand(action.command),
+      );
+      const mcp = terminal ? undefined : message.mcpActions.find((action) => action.status === 'proposed');
+      if (terminal) dispatchAiAutoRun(activeAiConversation.id, message.id, terminal);
+      else if (mcp) dispatchAiAutoRun(activeAiConversation.id, message.id, mcp);
+    }
+  }, [aiWorkspace, aiAutoRunEnabled, isAiGenerating, activeAiConversation]);
 
   function toggleLeftActivity(panel: 'files' | 'monitor' | 'processes' | 'ai') {
     // VSCode 风格：再次点击已激活的图标则收起侧边栏
@@ -4894,6 +4952,8 @@ export function App() {
     };
     const userIndex = baseMessages.findIndex((message) => message.id === userMessage.id);
     const history = userIndex >= 0 ? baseMessages.slice(0, userIndex) : baseMessages;
+    // 本回合的助手消息允许被「低风险自动执行」兜底逻辑处理
+    aiAutoRunEligibleRef.current.add(assistantMessage.id);
     aiActiveRequestRef.current = {
       requestId,
       conversationId: conversation.id,
@@ -4921,7 +4981,13 @@ export function App() {
         }
       }
       if (aiActiveRequestRef.current?.requestId !== requestId) return;
-      const requestMessages = buildAiRequestMessages(history, userMessage, conversation.mode, mcpCatalog);
+      const requestMessages = buildAiRequestMessages(
+        history,
+        userMessage,
+        conversation.mode,
+        mcpCatalog,
+        resolveAiContextBudgetChars(aiProviderConfig?.context_window),
+      );
       try {
         await streamAiChat(requestId, requestMessages, conversation.mode);
       } catch (error) {
@@ -7216,7 +7282,13 @@ export function App() {
                             <span>{action.contextLabel} · {action.isRemote ? '远程' : '本地'} · {Math.round(action.timeoutMs / 1000)}s</span>
                           </div>
                           {isHighRiskTerminalCommand(action.command) && <em>高风险</em>}
-                          {aiAutoRunEnabled && action.status === 'proposed' && !isHighRiskTerminalCommand(action.command) && (
+                          {/* 与 finishAiStream 的自动执行选择保持一致：每条消息只自动跑第一个低风险终端动作 */}
+                          {aiAutoRunEnabled
+                            && action.status === 'proposed'
+                            && !isHighRiskTerminalCommand(action.command)
+                            && message.terminalActions.find((item) =>
+                              item.status === 'proposed' && !isHighRiskTerminalCommand(item.command),
+                            )?.id === action.id && (
                             <em className="ai-action-auto">自动执行</em>
                           )}
                         </div>
@@ -7267,7 +7339,13 @@ export function App() {
                             <strong>{action.summary}</strong>
                             <span>MCP · {action.serverId}/{action.toolName}</span>
                           </div>
-                          {aiAutoRunEnabled && action.status === 'proposed' && (
+                          {/* 仅在没有低风险终端动作时，第一条 MCP 动作才会被自动执行 */}
+                          {aiAutoRunEnabled
+                            && action.status === 'proposed'
+                            && !message.terminalActions.some((item) =>
+                              item.status === 'proposed' && !isHighRiskTerminalCommand(item.command),
+                            )
+                            && message.mcpActions.find((item) => item.status === 'proposed')?.id === action.id && (
                             <em className="ai-action-auto">自动执行</em>
                           )}
                         </div>
@@ -7434,6 +7512,7 @@ export function App() {
                         draft: aiInput,
                         pendingContexts: pendingAiContexts,
                         autoTerminalContext,
+                        contextWindow: aiProviderConfig?.context_window,
                       });
                       const contextRingRadius = 7;
                       const contextRingCircumference = 2 * Math.PI * contextRingRadius;

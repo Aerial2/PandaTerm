@@ -11,6 +11,12 @@ export type AiConfigDraft = {
   models: string[];
   enabled_models: string[];
   api_format: AiApiFormat;
+  /** 模型上下文窗口（token） */
+  context_window: number;
+  /** 最大输出 token；0 = 不限制 */
+  max_tokens: number;
+  /** 全局默认推理强度 */
+  reasoning_effort: string;
   use_api_key: boolean;
 };
 
@@ -23,6 +29,9 @@ export const DEFAULT_AI_CONFIG_DRAFT: AiConfigDraft = {
   models: ['gpt-4o-mini'],
   enabled_models: ['gpt-4o-mini'],
   api_format: 'openai',
+  context_window: 0,
+  max_tokens: 0,
+  reasoning_effort: 'none',
   use_api_key: true,
 };
 
@@ -31,10 +40,51 @@ export const AI_API_FORMAT_OPTIONS: readonly SelectOption<AiApiFormat>[] = [
   { value: 'claude', label: 'Claude', description: 'Anthropic messages' },
 ] as const;
 
+/** 与 Rust 侧 ai_config.rs 的边界常量保持一致 */
+export const MIN_AI_CONTEXT_WINDOW = 1_000;
+export const MAX_AI_CONTEXT_WINDOW = 2_000_000;
+export const MAX_AI_OUTPUT_TOKENS = 1_000_000;
+/**
+ * 留空（0）时实际生效的上下文窗口。
+ * 依据 2026 主流旗舰模型：GPT-5.x 全线 400K，Claude 4.5 为 200K（Sonnet 可扩 1M），Gemini 系 ~1M。
+ */
+export const AI_DEFAULT_CONTEXT_WINDOW = 200_000;
+
+export const AI_REASONING_EFFORT_OPTIONS: readonly SelectOption<string>[] = [
+  { value: 'none', label: '默认', description: '请求不带推理强度' },
+  { value: 'minimal', label: '最低', description: 'Minimal' },
+  { value: 'low', label: '低', description: 'Low' },
+  { value: 'medium', label: '中', description: 'Medium' },
+  { value: 'high', label: '高', description: 'High' },
+  { value: 'xhigh', label: '最高', description: 'Extra High' },
+] as const;
+
 export function normalizeAiApiFormat(raw?: string | null): AiApiFormat {
   const value = (raw ?? '').trim().toLowerCase();
   if (value === 'claude' || value === 'anthropic') return 'claude';
   return 'openai';
+}
+
+/** 上下文窗口：<=0（留空）保持 0 = 未设置，运行时用 AI_DEFAULT_CONTEXT_WINDOW */
+export function normalizeAiContextWindow(value?: number | null): number {
+  const next = Math.round(Number(value));
+  if (!Number.isFinite(next) || next <= 0) return 0;
+  if (next < MIN_AI_CONTEXT_WINDOW) return MIN_AI_CONTEXT_WINDOW;
+  if (next > MAX_AI_CONTEXT_WINDOW) return MAX_AI_CONTEXT_WINDOW;
+  return next;
+}
+
+/** 实际生效的上下文窗口：留空时回落默认值 */
+export function resolveAiEffectiveContextWindow(value?: number | null): number {
+  const next = normalizeAiContextWindow(value);
+  return next > 0 ? next : AI_DEFAULT_CONTEXT_WINDOW;
+}
+
+/** 最大输出 token：<=0（留空）保持 0 = 未设置（请求不注入，交由服务端按模型上限） */
+export function normalizeAiMaxTokens(value?: number | null): number {
+  const next = Math.round(Number(value));
+  if (!Number.isFinite(next) || next <= 0) return 0;
+  return Math.min(next, MAX_AI_OUTPUT_TOKENS);
 }
 
 /** 测试耗时展示：<1s 用 ms，否则用 s */
@@ -187,6 +237,9 @@ export function isAiConfigDraftDirty(
   if (draftCatalog.model !== savedCatalog.model) return true;
   if (draftCatalog.models.join('\0') !== savedCatalog.models.join('\0')) return true;
   if (draftCatalog.enabled_models.join('\0') !== savedCatalog.enabled_models.join('\0')) return true;
+  if (normalizeAiContextWindow(draft.context_window) !== normalizeAiContextWindow(saved.context_window)) return true;
+  if (normalizeAiMaxTokens(draft.max_tokens) !== normalizeAiMaxTokens(saved.max_tokens)) return true;
+  if (normalizeAiReasoningEffort(draft.reasoning_effort ?? 'none') !== normalizeAiReasoningEffort(saved.reasoning_effort)) return true;
   return false;
 }
 
@@ -201,6 +254,9 @@ export function aiConfigToDraft(config: AiProviderConfig): AiConfigDraft {
     models: catalog.models,
     enabled_models: catalog.enabled_models,
     api_format: normalizeAiApiFormat(config.api_format),
+    context_window: normalizeAiContextWindow(config.context_window),
+    max_tokens: normalizeAiMaxTokens(config.max_tokens),
+    reasoning_effort: normalizeAiReasoningEffort(config.reasoning_effort),
     use_api_key: true,
   };
 }
@@ -222,6 +278,8 @@ export function aiConfigToProviderState(config: AiProviderConfig): AiProviderCon
     enabled_models: catalog.enabled_models,
     reasoning_effort: normalizeAiReasoningEffort(config.reasoning_effort),
     api_format: normalizeAiApiFormat(config.api_format),
+    context_window: normalizeAiContextWindow(config.context_window),
+    max_tokens: normalizeAiMaxTokens(config.max_tokens),
     use_api_key: true,
     api_key_configured: Boolean(config.api_key_configured),
     api_key: null,
