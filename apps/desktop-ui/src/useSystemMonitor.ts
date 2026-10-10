@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type RefObject } from 'react';
 import { getSystemMonitor, getProcessList, type ProcessInfo, type SystemMonitorData } from './api';
 import { setStatusMessage } from './appShellStore';
 import type { WorkspaceTab } from './terminalLayout';
+import { appendMonitorSample, createMonitorSample, type MonitorSample, type NetworkBaseline } from './monitorHistory';
 
 type LeftActivity = 'files' | 'monitor' | 'processes' | 'ai' | null;
 export type ProcessSortKey = 'cpu' | 'memory' | 'name';
@@ -12,13 +13,22 @@ interface UseSystemMonitorParams {
   leftActivity: LeftActivity;
   // 当前工作区 pane（读 ref 保证异步回调拿到实时目标，而非闭包旧值）
   activePaneTabRef: RefObject<WorkspaceTab | null>;
+  activePaneTab: WorkspaceTab | null;
   // 由 App 注入：判断 pane 是本地还是远程终端
   isLocalResourceTab: (tab: WorkspaceTab | null) => boolean;
 }
 
-// 系统监控域：CPU/内存/磁盘采样 + 进程列表，各自串行轮询、按 generation 防串扰。
-export function useSystemMonitor({ leftActivity, activePaneTabRef, isLocalResourceTab }: UseSystemMonitorParams) {
-  const [monitorData, setMonitorData] = useState<SystemMonitorData | null>(null);
+// 系统监控域：CPU/内存/磁盘/网络采样 + 进程列表，各自串行轮询、按 generation 防串扰。
+export function useSystemMonitor({ leftActivity, activePaneTabRef, activePaneTab, isLocalResourceTab }: UseSystemMonitorParams) {
+  const monitorTargetKey = JSON.stringify([activePaneTab?.id ?? null, isLocalResourceTab(activePaneTab), activePaneTab?.terminalId ?? null]);
+  const [monitorSnapshot, setMonitorSnapshot] = useState<{
+    targetKey: string;
+    data: SystemMonitorData | null;
+    history: MonitorSample[];
+  }>({ targetKey: monitorTargetKey, data: null, history: [] });
+  const monitorData = monitorSnapshot.targetKey === monitorTargetKey ? monitorSnapshot.data : null;
+  const monitorHistory = monitorSnapshot.targetKey === monitorTargetKey ? monitorSnapshot.history : [];
+  const networkBaselineRef = useRef<NetworkBaseline | null>(null);
   const [isLoadingMonitor, setIsLoadingMonitor] = useState(false);
   const monitorRequestGenerationRef = useRef(0);
   const [processList, setProcessList] = useState<ProcessInfo[]>([]);
@@ -43,7 +53,8 @@ export function useSystemMonitor({ leftActivity, activePaneTabRef, isLocalResour
     const tab = activePaneTabRef.current;
     const local = isLocalResourceTab(tab);
     if (!local && !tab?.terminalId) {
-      setMonitorData(null);
+      setMonitorSnapshot({ targetKey: monitorTargetKey, data: null, history: [] });
+      networkBaselineRef.current = null;
       setIsLoadingMonitor(false);
       setStatusMessage('远程终端尚未连接，无法获取系统监控数据');
       return;
@@ -63,7 +74,18 @@ export function useSystemMonitor({ leftActivity, activePaneTabRef, isLocalResour
     try {
       const data = await getSystemMonitor(terminalId);
       if (isCurrentTarget()) {
-        setMonitorData(data);
+        const timestamp = performance.now();
+        const sample = createMonitorSample(data, timestamp, networkBaselineRef.current);
+        networkBaselineRef.current = {
+          timestamp,
+          received: data.network_rx_bytes,
+          transmitted: data.network_tx_bytes,
+        };
+        setMonitorSnapshot((previous) => ({
+          targetKey: monitorTargetKey,
+          data,
+          history: appendMonitorSample(previous.targetKey === monitorTargetKey ? previous.history : [], sample),
+        }));
       }
     } catch (error) {
       if (isCurrentTarget()) {
@@ -115,6 +137,7 @@ export function useSystemMonitor({ leftActivity, activePaneTabRef, isLocalResour
   // Poll serially so a slow SSH sample cannot overlap with the next request.
   useEffect(() => {
     if (leftActivity !== 'monitor') return;
+    networkBaselineRef.current = null;
     let cancelled = false;
     let timeoutId: number | null = null;
     const poll = async () => {
@@ -125,9 +148,10 @@ export function useSystemMonitor({ leftActivity, activePaneTabRef, isLocalResour
     return () => {
       cancelled = true;
       monitorRequestGenerationRef.current++;
+      networkBaselineRef.current = null;
       if (timeoutId !== null) window.clearTimeout(timeoutId);
     };
-  }, [leftActivity]);
+  }, [leftActivity, monitorTargetKey]);
 
   useEffect(() => {
     if (leftActivity !== 'processes') return;
@@ -147,6 +171,7 @@ export function useSystemMonitor({ leftActivity, activePaneTabRef, isLocalResour
 
   return {
     monitorData,
+    monitorHistory,
     isLoadingMonitor,
     processList,
     isLoadingProcesses,

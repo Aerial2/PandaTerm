@@ -15,6 +15,8 @@ pub struct SystemMonitorData {
     uptime_seconds: u64,
     cpu_count: u32,
     cpu_usage_percent: f64,
+    #[serde(default)]
+    cpu_core_usage_percent: Vec<f64>,
     memory_total_bytes: u64,
     memory_used_bytes: u64,
     memory_available_bytes: u64,
@@ -62,10 +64,12 @@ CPU_MODEL=$(grep '^model name' /proc/cpuinfo 2>/dev/null | head -1 | sed 's/mode
 
 # CPU usage: sample over 1 second
 # Use a single awk read per sample point to avoid inconsistent timestamps.
-# idle = $5 (idle) + $6 (iowait); total = sum of all numeric columns.
-CPU_SAMPLE1=$(awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; print idle" "total}' /proc/stat)
+# Exclude guest/guest_nice: Linux already accounts those ticks in user/nice.
+CPU_SAMPLE1=$(awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=9;i++) total+=$i; print idle" "total}' /proc/stat)
+CPU_CORE_SAMPLE1=$(awk '/^cpu[0-9]+ /{idle=$5+$6; total=0; for(i=2;i<=9;i++) total+=$i; printf "%s %s %s\n", substr($1,4), idle, total}' /proc/stat)
 sleep 1
-CPU_SAMPLE2=$(awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; print idle" "total}' /proc/stat)
+CPU_SAMPLE2=$(awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=9;i++) total+=$i; print idle" "total}' /proc/stat)
+CPU_CORE_SAMPLE2=$(awk '/^cpu[0-9]+ /{idle=$5+$6; total=0; for(i=2;i<=9;i++) total+=$i; printf "%s %s %s\n", substr($1,4), idle, total}' /proc/stat)
 CPU_IDLE1=$(echo "$CPU_SAMPLE1" | awk '{print $1}')
 CPU_TOTAL1=$(echo "$CPU_SAMPLE1" | awk '{print $2}')
 CPU_IDLE2=$(echo "$CPU_SAMPLE2" | awk '{print $1}')
@@ -77,6 +81,13 @@ if [ "$DIFF_TOTAL" -gt 0 ]; then
 else
   CPU_USAGE="0.0"
 fi
+# Emit one comma-separated value per logical processor; malformed/zero deltas are 0.
+CPU_CORE_USAGE=$(awk -v first="$CPU_CORE_SAMPLE1" -v second="$CPU_CORE_SAMPLE2" '
+  BEGIN {
+    n=split(first, a, "\n"); for(i=1;i<=n;i++){split(a[i],f," "); if(f[1]!="") {idle1[f[1]]=f[2]; total1[f[1]]=f[3]; order[++count]=f[1]}}
+    n=split(second, b, "\n"); for(i=1;i<=n;i++){split(b[i],f," "); if(f[1]!="") {idle2[f[1]]=f[2]; total2[f[1]]=f[3]}}
+    for(i=1;i<=count;i++){id=order[i]; dt=total2[id]-total1[id]; di=idle2[id]-idle1[id]; usage=(dt>0 ? (1-di/dt)*100 : 0); if(usage<0) usage=0; if(usage>100) usage=100; printf "%s%.1f", (i==1 ? "" : ","), usage}
+  }')
 
 # Memory
 MEM_TOTAL=$(awk '/^MemTotal/{print $2*1024}' /proc/meminfo 2>/dev/null || echo 0)
@@ -99,10 +110,10 @@ LOAD1=$(echo "$LOAD" | awk '{print $1}')
 LOAD5=$(echo "$LOAD" | awk '{print $2}')
 LOAD15=$(echo "$LOAD" | awk '{print $3}')
 
-# Network (first non-lo interface)
-NET_IF=$(ls /sys/class/net/ 2>/dev/null | grep -v lo | head -1 || echo eth0)
-NET_RX=$(cat /sys/class/net/$NET_IF/statistics/rx_bytes 2>/dev/null || echo 0)
-NET_TX=$(cat /sys/class/net/$NET_IF/statistics/tx_bytes 2>/dev/null || echo 0)
+# Network: aggregate all non-loopback interfaces from /proc/net/dev.
+NET_TOTALS=$(awk -F: 'NR>2 {name=$1; gsub(/[[:space:]]/, "", name); if(name!="lo" && name!="") {split($2, fields, " "); rx+=fields[1]; tx+=fields[9]}} END {printf "%.0f %.0f", rx+0, tx+0}' /proc/net/dev 2>/dev/null || echo "0 0")
+NET_RX=$(echo "$NET_TOTALS" | awk '{print $1}')
+NET_TX=$(echo "$NET_TOTALS" | awk '{print $2}')
 
 # Process count
 PROCS=$(ps aux 2>/dev/null | wc -l || echo 0)
@@ -115,6 +126,7 @@ echo "kernel=$KERNEL"
 echo "uptime=$UPTIME"
 echo "cpu_count=$CPU_COUNT"
 echo "cpu_usage=$CPU_USAGE"
+echo "cpu_core_usage=$CPU_CORE_USAGE"
 echo "cpu_model=$CPU_MODEL"
 echo "mem_total=$MEM_TOTAL"
 echo "mem_available=$MEM_AVAILABLE"
@@ -160,6 +172,12 @@ pub fn parse_process_list(output: &str) -> Vec<ProcessInfo> {
     processes
 }
 
+fn parse_cpu_core_usage(value: Option<&String>) -> Vec<f64> {
+    value
+        .map(|raw| raw.split(',').filter_map(|item| item.trim().parse::<f64>().ok()).filter(|item| item.is_finite()).map(|item| item.clamp(0.0, 100.0)).collect())
+        .unwrap_or_default()
+}
+
 pub fn parse_system_monitor(output: &str) -> SystemMonitorData {
     let mut lines = output.lines().peekable();
 
@@ -182,7 +200,8 @@ pub fn parse_system_monitor(output: &str) -> SystemMonitorData {
         kernel_version: values.get("kernel").cloned().unwrap_or_default(),
         uptime_seconds: values.get("uptime").and_then(|v| v.parse().ok()).unwrap_or(0),
         cpu_count: values.get("cpu_count").and_then(|v| v.parse().ok()).unwrap_or(1),
-        cpu_usage_percent: values.get("cpu_usage").and_then(|v| v.parse::<f64>().ok()).map(|v| v.clamp(0.0, 100.0)).unwrap_or(0.0),
+        cpu_usage_percent: values.get("cpu_usage").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 100.0)).unwrap_or(0.0),
+        cpu_core_usage_percent: parse_cpu_core_usage(values.get("cpu_core_usage")),
         memory_total_bytes: values.get("mem_total").and_then(|v| v.parse().ok()).unwrap_or(0),
         memory_used_bytes: values.get("mem_used").and_then(|v| v.parse().ok()).unwrap_or(0),
         memory_available_bytes: values.get("mem_available").and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -394,7 +413,7 @@ pub fn collect_local_monitor(slot: &mut Option<sysinfo::System>) -> SystemMonito
 
     let networks = Networks::new_with_refreshed_list();
     let (net_rx, net_tx) = networks.iter().fold((0u64, 0u64), |(rx, tx), (_, data)| {
-        (rx + data.received(), tx + data.transmitted())
+        (rx.saturating_add(data.total_received()), tx.saturating_add(data.total_transmitted()))
     });
 
     let disks = Disks::new_with_refreshed_list();
@@ -413,6 +432,7 @@ pub fn collect_local_monitor(slot: &mut Option<sysinfo::System>) -> SystemMonito
         uptime_seconds: System::uptime(),
         cpu_count: sys.cpus().len() as u32,
         cpu_usage_percent: sys.global_cpu_usage().clamp(0.0_f32, 100.0_f32) as f64,
+        cpu_core_usage_percent: sys.cpus().iter().map(|cpu| (cpu.cpu_usage() as f64).clamp(0.0, 100.0)).collect(),
         memory_total_bytes: sys.total_memory(),
         memory_used_bytes: sys.used_memory(),
         memory_available_bytes: sys.available_memory(),
@@ -428,5 +448,30 @@ pub fn collect_local_monitor(slot: &mut Option<sysinfo::System>) -> SystemMonito
         network_rx_bytes: net_rx,
         network_tx_bytes: net_tx,
         processes: sys.processes().len() as u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_core_field_defaults_to_empty() {
+        let data = parse_system_monitor("MONITOR_RESULT\ncpu_usage=50\n");
+        assert!(data.cpu_core_usage_percent.is_empty());
+    }
+
+    #[test]
+    fn core_values_are_parsed_and_clamped() {
+        let data = parse_system_monitor("MONITOR_RESULT\ncpu_usage=101\ncpu_core_usage=-5,25.5,150,NaN,inf\n");
+        assert_eq!(data.cpu_usage_percent, 100.0);
+        assert_eq!(data.cpu_core_usage_percent, vec![0.0, 25.5, 100.0]);
+    }
+
+    #[test]
+    fn network_totals_preserve_large_counters() {
+        let data = parse_system_monitor("MONITOR_RESULT\nnet_rx=98765432100\nnet_tx=12345678900\n");
+        assert_eq!(data.network_rx_bytes, 98_765_432_100);
+        assert_eq!(data.network_tx_bytes, 12_345_678_900);
     }
 }

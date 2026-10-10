@@ -180,6 +180,7 @@ import {
 } from './api';
 import type { AiChatStreamEvent, AiProviderConfig, ArchiveFormat, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, TerminalStatusEvent } from './api';
 import { useSystemMonitor } from './useSystemMonitor';
+import { CpuMonitorCharts, NetworkMonitorCharts } from './MonitorCharts';
 import { useMediaViewer } from './useMediaViewer';
 import { useUploadConflict } from './useUploadConflict';
 import { RdpView } from './RdpView';
@@ -1269,6 +1270,7 @@ export function App() {
 
   const {
     monitorData,
+    monitorHistory,
     isLoadingMonitor,
     processList,
     isLoadingProcesses,
@@ -1277,7 +1279,7 @@ export function App() {
     toggleProcessSort,
     processSearch,
     setProcessSearch,
-  } = useSystemMonitor({ leftActivity, activePaneTabRef, isLocalResourceTab });
+  } = useSystemMonitor({ leftActivity, activePaneTabRef, activePaneTab, isLocalResourceTab });
 
   const {
     mediaViewer,
@@ -6958,18 +6960,8 @@ export function App() {
               </div>
             ) : monitorData ? (
               <div className="side-panel-content">
-                <div className="monitor-section">
-                  <div className="monitor-section-header">
-                    <Cpu size={14} />
-                    <span>CPU</span>
-                    <span className="monitor-value">{Math.max(0, Math.min(100, monitorData.cpu_usage_percent)).toFixed(1)}%</span>
-                  </div>
-                  <div className="monitor-bar-container">
-                    <div className="monitor-bar" style={{ width: `${Math.max(0, Math.min(monitorData.cpu_usage_percent, 100))}%`, background: monitorData.cpu_usage_percent > 80 ? '#e06c75' : monitorData.cpu_usage_percent > 60 ? '#d19a66' : '#98c379' }} />
-                  </div>
-                  <div className="monitor-detail">{monitorData.cpu_model}</div>
-                  <div className="monitor-detail">{monitorData.cpu_count} 核心 · 负载 {monitorData.load_avg_1min.toFixed(2)} / {monitorData.load_avg_5min.toFixed(2)} / {monitorData.load_avg_15min.toFixed(2)}</div>
-                </div>
+                <CpuMonitorCharts data={monitorData} history={monitorHistory} />
+                <NetworkMonitorCharts history={monitorHistory} />
 
                 <div className="monitor-section">
                   <div className="monitor-section-header">

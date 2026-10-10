@@ -1058,6 +1058,7 @@ export interface SystemMonitorData {
   uptime_seconds: number;
   cpu_count: number;
   cpu_usage_percent: number;
+  cpu_core_usage_percent?: number[];
   memory_total_bytes: number;
   memory_used_bytes: number;
   memory_available_bytes: number;

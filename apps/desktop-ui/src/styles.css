@@ -2267,6 +2267,129 @@ button:disabled {
   color: var(--accent-blue);
 }
 
+.monitor-chart-axis {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+
+.monitor-chart-view {
+  display: flex;
+  gap: 4px;
+  margin: 4px 0;
+}
+
+.monitor-chart-view button {
+  padding: 3px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.monitor-chart-view button[aria-pressed="true"] {
+  border-color: var(--accent-blue);
+  background: rgba(97, 175, 239, 0.12);
+  color: var(--accent-blue);
+}
+
+.monitor-chart-view button:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+.monitor-line-chart {
+  --chart-color: #289fc4;
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  height: 110px;
+  border: 1px solid var(--chart-color);
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+.monitor-line-chart.is-upload {
+  --chart-color: #a882d3;
+}
+
+.monitor-chart-grid line {
+  stroke: var(--border-subtle);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.monitor-chart-area {
+  fill: var(--chart-color);
+  fill-opacity: 0.18;
+}
+
+.monitor-chart-line {
+  stroke: var(--chart-color);
+  stroke-width: 1.2;
+  stroke-linejoin: round;
+  fill: none;
+}
+
+.monitor-cpu-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(68px, 1fr));
+  gap: 4px;
+}
+
+.monitor-cpu-cell {
+  position: relative;
+  min-width: 0;
+}
+
+.monitor-line-chart.is-compact {
+  height: 60px;
+}
+
+.monitor-cpu-label {
+  position: absolute;
+  top: 3px;
+  left: 4px;
+  color: var(--text-muted);
+  font-size: 9px;
+  pointer-events: none;
+}
+
+.monitor-network-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 5px;
+}
+
+.monitor-network-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: #289fc4;
+  font-size: 11px;
+}
+
+.monitor-network-header strong {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-weight: 500;
+}
+
+.monitor-network-chart.is-upload .monitor-network-header {
+  color: #a882d3;
+}
+
+.monitor-network-chart .monitor-line-chart {
+  height: 80px;
+}
+
 .monitor-bar-container {
   width: 100%;
   height: 8px;
