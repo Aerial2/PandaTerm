@@ -106,8 +106,6 @@ import {
   Bot,
   Cpu,
   CornerDownLeft,
-  HardDrive,
-  MemoryStick,
   Paperclip,
   Sparkles,
   Square,
@@ -180,7 +178,7 @@ import {
 } from './api';
 import type { AiChatStreamEvent, AiProviderConfig, ArchiveFormat, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, TerminalStatusEvent } from './api';
 import { useSystemMonitor } from './useSystemMonitor';
-import { CpuMonitorCharts, NetworkMonitorCharts } from './MonitorCharts';
+import { CapacityMonitorCharts, CpuMonitorCharts, NetworkMonitorCharts } from './MonitorCharts';
 import { useMediaViewer } from './useMediaViewer';
 import { useUploadConflict } from './useUploadConflict';
 import { RdpView } from './RdpView';
@@ -6963,48 +6961,7 @@ export function App() {
                 <CpuMonitorCharts data={monitorData} history={monitorHistory} />
                 <NetworkMonitorCharts history={monitorHistory} />
 
-                <div className="monitor-section">
-                  <div className="monitor-section-header">
-                    <MemoryStick size={14} />
-                    <span>内存</span>
-                    <span className="monitor-value">{((monitorData.memory_used_bytes / monitorData.memory_total_bytes) * 100).toFixed(1)}%</span>
-                  </div>
-                  <div className="monitor-bar-container">
-                    <div className="monitor-bar" style={{ width: `${Math.min((monitorData.memory_used_bytes / monitorData.memory_total_bytes) * 100, 100)}%`, background: (monitorData.memory_used_bytes / monitorData.memory_total_bytes) * 100 > 80 ? '#e06c75' : (monitorData.memory_used_bytes / monitorData.memory_total_bytes) * 100 > 60 ? '#d19a66' : '#98c379' }} />
-                  </div>
-                  <div className="monitor-detail">{formatBytes(monitorData.memory_used_bytes)} / {formatBytes(monitorData.memory_total_bytes)}</div>
-                  <div className="monitor-detail">可用 {formatBytes(monitorData.memory_available_bytes)}</div>
-                </div>
-
-                <div className="monitor-section">
-                  <div className="monitor-section-header">
-                    <HardDrive size={14} />
-                    <span>磁盘</span>
-                    <span className="monitor-value">{((monitorData.disk_used_bytes / monitorData.disk_total_bytes) * 100).toFixed(1)}%</span>
-                  </div>
-                  <div className="monitor-bar-container">
-                    <div className="monitor-bar" style={{ width: `${Math.min((monitorData.disk_used_bytes / monitorData.disk_total_bytes) * 100, 100)}%`, background: (monitorData.disk_used_bytes / monitorData.disk_total_bytes) * 100 > 80 ? '#e06c75' : (monitorData.disk_used_bytes / monitorData.disk_total_bytes) * 100 > 60 ? '#d19a66' : '#98c379' }} />
-                  </div>
-                  <div className="monitor-detail">{formatBytes(monitorData.disk_used_bytes)} / {formatBytes(monitorData.disk_total_bytes)}</div>
-                  <div className="monitor-detail">可用 {formatBytes(monitorData.disk_available_bytes)}</div>
-                </div>
-
-                <div className="monitor-section">
-                  <div className="monitor-section-header">
-                    <span>交换空间</span>
-                    {monitorData.swap_total_bytes > 0 && <span className="monitor-value">{((monitorData.swap_used_bytes / monitorData.swap_total_bytes) * 100).toFixed(1)}%</span>}
-                  </div>
-                  {monitorData.swap_total_bytes > 0 ? (
-                    <>
-                      <div className="monitor-bar-container">
-                        <div className="monitor-bar" style={{ width: `${Math.min((monitorData.swap_used_bytes / monitorData.swap_total_bytes) * 100, 100)}%`, background: (monitorData.swap_used_bytes / monitorData.swap_total_bytes) * 100 > 80 ? '#e06c75' : (monitorData.swap_used_bytes / monitorData.swap_total_bytes) * 100 > 60 ? '#d19a66' : '#98c379' }} />
-                      </div>
-                      <div className="monitor-detail">{formatBytes(monitorData.swap_used_bytes)} / {formatBytes(monitorData.swap_total_bytes)}</div>
-                    </>
-                  ) : (
-                    <div className="monitor-detail">未启用交换空间</div>
-                  )}
-                </div>
+                <CapacityMonitorCharts data={monitorData} formatBytes={formatBytes} />
 
                 <div className="monitor-info-grid">
                   <div className="monitor-info-item">
