@@ -48,8 +48,8 @@ pub(crate) fn save_known_hosts(hosts: &HashMap<String, String>) -> Result<(), St
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("known_hosts 目录创建失败：{e}"))?;
     }
-    let content = serde_json::to_string_pretty(hosts)
-        .map_err(|e| format!("known_hosts 序列化失败：{e}"))?;
+    let content =
+        serde_json::to_string_pretty(hosts).map_err(|e| format!("known_hosts 序列化失败：{e}"))?;
     crate::storage::atomic_write_text(&path, &content)
         .map_err(|e| format!("known_hosts 写入失败：{e}"))
 }
@@ -76,9 +76,7 @@ pub(crate) fn check_fingerprint(
     match hosts.get(host_port) {
         Some(known) if known == fingerprint => Ok(FingerprintCheck::Trusted),
         Some(known) => {
-            eprintln!(
-                "[HostKey] key mismatch for {host_port}: known={known} now={fingerprint}"
-            );
+            eprintln!("[HostKey] key mismatch for {host_port}: known={known} now={fingerprint}");
             Err(format!(
                 "主机密钥已变更（{host_port}），可能存在中间人风险。若确认服务器已重装，请删除 ~/.pandaterm/known_hosts.json 后重试"
             ))

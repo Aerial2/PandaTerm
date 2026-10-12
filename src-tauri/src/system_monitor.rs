@@ -147,16 +147,23 @@ echo "procs=$PROCS"
 pub fn parse_process_list(output: &str) -> Vec<ProcessInfo> {
     let mut processes = Vec::new();
     for line in output.lines() {
-        if line == "END_PROCESS_LIST" { break; }
+        if line == "END_PROCESS_LIST" {
+            break;
+        }
         let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 7 || parts[0] != "P" { continue; }
+        if parts.len() < 7 || parts[0] != "P" {
+            continue;
+        }
         let pid = parts[1].parse::<u32>().ok().unwrap_or(0);
         let name = parts[2].to_string();
         let status = parts[3].to_string();
         let cpu = parts[4].parse::<f64>().ok().unwrap_or(0.0);
         let mem_bytes = parts[5].parse::<u64>().ok().unwrap_or(0);
         // 第 8 列是端口（可选）：旧服务器/无权限时缺失，留空即可
-        let ports = parts.get(7).map(|value| value.to_string()).unwrap_or_default();
+        let ports = parts
+            .get(7)
+            .map(|value| value.to_string())
+            .unwrap_or_default();
 
         processes.push(ProcessInfo {
             pid,
@@ -174,7 +181,13 @@ pub fn parse_process_list(output: &str) -> Vec<ProcessInfo> {
 
 fn parse_cpu_core_usage(value: Option<&String>) -> Vec<f64> {
     value
-        .map(|raw| raw.split(',').filter_map(|item| item.trim().parse::<f64>().ok()).filter(|item| item.is_finite()).map(|item| item.clamp(0.0, 100.0)).collect())
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|item| item.trim().parse::<f64>().ok())
+                .filter(|item| item.is_finite())
+                .map(|item| item.clamp(0.0, 100.0))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -183,7 +196,9 @@ pub fn parse_system_monitor(output: &str) -> SystemMonitorData {
 
     // Find the MONITOR_RESULT marker
     for line in lines.by_ref() {
-        if line.trim() == "MONITOR_RESULT" { break; }
+        if line.trim() == "MONITOR_RESULT" {
+            break;
+        }
     }
 
     let mut values: HashMap<String, String> = HashMap::new();
@@ -198,25 +213,78 @@ pub fn parse_system_monitor(output: &str) -> SystemMonitorData {
         os_name: values.get("os_name").cloned().unwrap_or_default(),
         os_version: values.get("os_version").cloned().unwrap_or_default(),
         kernel_version: values.get("kernel").cloned().unwrap_or_default(),
-        uptime_seconds: values.get("uptime").and_then(|v| v.parse().ok()).unwrap_or(0),
-        cpu_count: values.get("cpu_count").and_then(|v| v.parse().ok()).unwrap_or(1),
-        cpu_usage_percent: values.get("cpu_usage").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 100.0)).unwrap_or(0.0),
+        uptime_seconds: values
+            .get("uptime")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        cpu_count: values
+            .get("cpu_count")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1),
+        cpu_usage_percent: values
+            .get("cpu_usage")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 100.0))
+            .unwrap_or(0.0),
         cpu_core_usage_percent: parse_cpu_core_usage(values.get("cpu_core_usage")),
-        memory_total_bytes: values.get("mem_total").and_then(|v| v.parse().ok()).unwrap_or(0),
-        memory_used_bytes: values.get("mem_used").and_then(|v| v.parse().ok()).unwrap_or(0),
-        memory_available_bytes: values.get("mem_available").and_then(|v| v.parse().ok()).unwrap_or(0),
-        swap_total_bytes: values.get("swap_total").and_then(|v| v.parse().ok()).unwrap_or(0),
-        swap_used_bytes: values.get("swap_used").and_then(|v| v.parse().ok()).unwrap_or(0),
-        disk_total_bytes: values.get("disk_total").and_then(|v| v.parse().ok()).unwrap_or(0),
-        disk_used_bytes: values.get("disk_used").and_then(|v| v.parse().ok()).unwrap_or(0),
-        disk_available_bytes: values.get("disk_avail").and_then(|v| v.parse().ok()).unwrap_or(0),
-        load_avg_1min: values.get("load1").and_then(|v| v.parse().ok()).unwrap_or(0.0),
-        load_avg_5min: values.get("load5").and_then(|v| v.parse().ok()).unwrap_or(0.0),
-        load_avg_15min: values.get("load15").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+        memory_total_bytes: values
+            .get("mem_total")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        memory_used_bytes: values
+            .get("mem_used")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        memory_available_bytes: values
+            .get("mem_available")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        swap_total_bytes: values
+            .get("swap_total")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        swap_used_bytes: values
+            .get("swap_used")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        disk_total_bytes: values
+            .get("disk_total")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        disk_used_bytes: values
+            .get("disk_used")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        disk_available_bytes: values
+            .get("disk_avail")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        load_avg_1min: values
+            .get("load1")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
+        load_avg_5min: values
+            .get("load5")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
+        load_avg_15min: values
+            .get("load15")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
         cpu_model: values.get("cpu_model").cloned().unwrap_or_default(),
-        network_rx_bytes: values.get("net_rx").and_then(|v| v.parse().ok()).unwrap_or(0),
-        network_tx_bytes: values.get("net_tx").and_then(|v| v.parse().ok()).unwrap_or(0),
-        processes: values.get("procs").and_then(|v| v.parse().ok()).unwrap_or(0),
+        network_rx_bytes: values
+            .get("net_rx")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        network_tx_bytes: values
+            .get("net_tx")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        processes: values
+            .get("procs")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
     }
 }
 
@@ -319,14 +387,14 @@ fn collect_local_pid_ports() -> std::collections::HashMap<u32, String> {
 }
 
 pub fn collect_local_processes(slot: &mut Option<sysinfo::System>) -> Vec<ProcessInfo> {
-    use sysinfo::{ProcessesToUpdate, ProcessRefreshKind};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
 
     let sys = match slot.as_mut() {
         Some(s) => s,
         None => {
             // 兜底：正常路径由 main.rs 的 ensure_local_sys_monitor 预先播种
             // （不持锁等待）。此处仅处理极端竞态，做两次连续刷新即可，不再睡眠。
-            use sysinfo::{System, CpuRefreshKind, RefreshKind};
+            use sysinfo::{CpuRefreshKind, RefreshKind, System};
             let mut s = System::new_with_specifics(
                 RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
             );
@@ -351,7 +419,8 @@ pub fn collect_local_processes(slot: &mut Option<sysinfo::System>) -> Vec<Proces
     // 端口映射：尽力而为，失败时为空表，端口列留空
     let port_map = collect_local_pid_ports();
 
-    let processes: Vec<ProcessInfo> = sys.processes()
+    let processes: Vec<ProcessInfo> = sys
+        .processes()
         .values()
         .filter(|p| p.cpu_usage() > 0.01 || p.memory() > 1024 * 1024)
         .map(|p| ProcessInfo {
@@ -390,7 +459,7 @@ pub fn collect_local_processes(slot: &mut Option<sysinfo::System>) -> Vec<Proces
 }
 
 pub fn collect_local_monitor(slot: &mut Option<sysinfo::System>) -> SystemMonitorData {
-    use sysinfo::{System, Networks, Disks, CpuRefreshKind, RefreshKind};
+    use sysinfo::{CpuRefreshKind, Disks, Networks, RefreshKind, System};
 
     let sys = match slot.as_mut() {
         Some(s) => {
@@ -413,16 +482,20 @@ pub fn collect_local_monitor(slot: &mut Option<sysinfo::System>) -> SystemMonito
 
     let networks = Networks::new_with_refreshed_list();
     let (net_rx, net_tx) = networks.iter().fold((0u64, 0u64), |(rx, tx), (_, data)| {
-        (rx.saturating_add(data.total_received()), tx.saturating_add(data.total_transmitted()))
+        (
+            rx.saturating_add(data.total_received()),
+            tx.saturating_add(data.total_transmitted()),
+        )
     });
 
     let disks = Disks::new_with_refreshed_list();
-    let (disk_total, disk_used, disk_avail) = disks.iter().fold((0u64, 0u64, 0u64), |(t, u, a), disk| {
-        let total = disk.total_space();
-        let avail = disk.available_space();
-        let used = total - avail;
-        (t + total, u + used, a + avail)
-    });
+    let (disk_total, disk_used, disk_avail) =
+        disks.iter().fold((0u64, 0u64, 0u64), |(t, u, a), disk| {
+            let total = disk.total_space();
+            let avail = disk.available_space();
+            let used = total - avail;
+            (t + total, u + used, a + avail)
+        });
 
     SystemMonitorData {
         hostname: System::host_name().unwrap_or_default(),
@@ -432,7 +505,11 @@ pub fn collect_local_monitor(slot: &mut Option<sysinfo::System>) -> SystemMonito
         uptime_seconds: System::uptime(),
         cpu_count: sys.cpus().len() as u32,
         cpu_usage_percent: sys.global_cpu_usage().clamp(0.0_f32, 100.0_f32) as f64,
-        cpu_core_usage_percent: sys.cpus().iter().map(|cpu| (cpu.cpu_usage() as f64).clamp(0.0, 100.0)).collect(),
+        cpu_core_usage_percent: sys
+            .cpus()
+            .iter()
+            .map(|cpu| (cpu.cpu_usage() as f64).clamp(0.0, 100.0))
+            .collect(),
         memory_total_bytes: sys.total_memory(),
         memory_used_bytes: sys.used_memory(),
         memory_available_bytes: sys.available_memory(),
@@ -444,7 +521,11 @@ pub fn collect_local_monitor(slot: &mut Option<sysinfo::System>) -> SystemMonito
         load_avg_1min: 0.0, // sysinfo doesn't provide load avg on Windows
         load_avg_5min: 0.0,
         load_avg_15min: 0.0,
-        cpu_model: sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_default(),
+        cpu_model: sys
+            .cpus()
+            .first()
+            .map(|c| c.brand().to_string())
+            .unwrap_or_default(),
         network_rx_bytes: net_rx,
         network_tx_bytes: net_tx,
         processes: sys.processes().len() as u32,
@@ -463,7 +544,9 @@ mod tests {
 
     #[test]
     fn core_values_are_parsed_and_clamped() {
-        let data = parse_system_monitor("MONITOR_RESULT\ncpu_usage=101\ncpu_core_usage=-5,25.5,150,NaN,inf\n");
+        let data = parse_system_monitor(
+            "MONITOR_RESULT\ncpu_usage=101\ncpu_core_usage=-5,25.5,150,NaN,inf\n",
+        );
         assert_eq!(data.cpu_usage_percent, 100.0);
         assert_eq!(data.cpu_core_usage_percent, vec![0.0, 25.5, 100.0]);
     }

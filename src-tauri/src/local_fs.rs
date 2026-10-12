@@ -195,8 +195,7 @@ pub async fn read_local_file_preview(path: String) -> Result<LocalFilePreview, S
         .take(LOCAL_FILE_PREVIEW_LIMIT)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    let content = String::from_utf8(bytes)
-        .map_err(|_| "暂不支持预览二进制文件".to_string())?;
+    let content = String::from_utf8(bytes).map_err(|_| "暂不支持预览二进制文件".to_string())?;
 
     Ok(LocalFilePreview {
         path: format_path(canonical_file.clone()),
@@ -231,8 +230,7 @@ pub async fn read_local_file_full(path: String) -> Result<LocalFilePreview, Stri
     }
 
     let bytes = fs::read(&canonical_file).map_err(|error| error.to_string())?;
-    let content = String::from_utf8(bytes)
-        .map_err(|_| "暂不支持编辑二进制文件".to_string())?;
+    let content = String::from_utf8(bytes).map_err(|_| "暂不支持编辑二进制文件".to_string())?;
 
     Ok(LocalFilePreview {
         path: format_path(canonical_file.clone()),
@@ -249,8 +247,13 @@ pub async fn read_local_file_full(path: String) -> Result<LocalFilePreview, Stri
 /// Parse the structured output produced by the remote `find` listing command.
 pub(crate) fn parse_remote_listing(text: &str) -> Result<LocalDirectoryListing, String> {
     let mut lines = text.lines();
-    let path_line = lines.next().ok_or_else(|| "远程目录响应格式异常".to_string())?;
-    let path = path_line.strip_prefix("P:").unwrap_or(path_line).to_string();
+    let path_line = lines
+        .next()
+        .ok_or_else(|| "远程目录响应格式异常".to_string())?;
+    let path = path_line
+        .strip_prefix("P:")
+        .unwrap_or(path_line)
+        .to_string();
     let parent_line = lines.next().unwrap_or("");
     let parent = parent_line
         .strip_prefix("D:")

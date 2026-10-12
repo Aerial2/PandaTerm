@@ -134,11 +134,7 @@ pub fn normalize_enabled_ai_models(
     }
 
     let mut normalized = Vec::new();
-    let source = if enabled.is_empty() {
-        models
-    } else {
-        enabled
-    };
+    let source = if enabled.is_empty() { models } else { enabled };
     for model in source {
         let model = validate_ai_model(model)?;
         if catalog.contains(model.as_str()) && !normalized.iter().any(|item| item == &model) {

@@ -1,11 +1,14 @@
 import type {
   AiConversation,
+  AiToolCall,
+  AiUsage,
   AiStoredAction,
   AiStoredEditAction,
   AiStoredMcpAction,
   AiStoredMessage,
   AiStoredTerminalAction,
 } from './api';
+import { aiTreePath, migrateAiTree, syncAiTree, type AiTree } from './aiConversationTree';
 import type { AiEditProposal } from './aiEditProposal';
 import type { AiMcpAction } from './aiMcpAction';
 import type { AiTerminalAction } from './aiTerminalAction';
@@ -25,8 +28,16 @@ export type AiMessageStatus = 'complete' | 'streaming' | 'cancelled' | 'error';
 
 export type AiMessage = {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'tool';
   content: string;
+  toolCalls?: AiToolCall[];
+  toolCallId?: string;
+  agentId?: string;
+  accountId?: string;
+  model?: string;
+  stepIndex?: number;
+  usage?: AiUsage;
+  phase?: string;
   contexts: AiContextItem[];
   proposals: AiEditProposal[];
   terminalActions: AiTerminalAction[];
@@ -44,7 +55,26 @@ export type AiConversationState = {
   createdAt: string;
   updatedAt: string;
   messages: AiMessage[];
+  tree?: AiTree<AiMessage>;
 };
+
+export function syncAiConversationState(conversation: AiConversationState, previous = conversation): AiConversationState {
+  const sourceTree = conversation.tree !== previous.tree ? conversation.tree : previous.tree;
+  const tree = syncAiTree(sourceTree ?? migrateAiTree(previous.messages), conversation.messages);
+  return { ...conversation, tree };
+}
+
+/** Preserve late results on inactive branches without switching the active path. */
+export function updateAiConversationMessage(
+  conversation: AiConversationState,
+  messageId: string,
+  updater: (message: AiMessage) => AiMessage,
+): AiConversationState {
+  const tree = migrateAiTree(conversation.messages, conversation.tree);
+  const updatedTree = { ...tree, nodes: tree.nodes.map((node) => node.id === messageId
+    ? { ...node, message: updater(node.message) } : node) };
+  return { ...conversation, tree: updatedTree, messages: aiTreePath(updatedTree) };
+}
 
 const INTERRUPTED_ACTION_ERROR = 'PandaTerm 在动作执行期间退出，执行结果未知。请检查目标状态后再决定是否重试。';
 const INTERRUPTED_EDIT_ERROR = 'PandaTerm 在文件操作期间退出，未确认修改是否完成。请重新读取文件后审阅。';
@@ -75,6 +105,7 @@ function toStoredEditAction(proposal: AiEditProposal): AiStoredEditAction {
     terminal_id: proposal.terminalId ?? null,
     error: proposal.error ?? null,
     continued: Boolean(proposal.continued),
+    tool_call_id: proposal.toolCallId ?? null,
     created_at: proposal.createdAt,
   };
 }
@@ -127,25 +158,53 @@ function toStoredActions(message: AiMessage): AiStoredAction[] {
   ];
 }
 
+function toStoredMessage(message: AiMessage): AiStoredMessage {
+  return {
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    tool_calls: message.toolCalls,
+    tool_call_id: message.toolCallId,
+    agent_id: message.agentId,
+    account_id: message.accountId,
+    model: message.model,
+    step_index: message.stepIndex,
+    usage: message.usage,
+    phase: message.phase,
+    contexts: message.contexts.map(({ kind, label, source }) => ({ kind, label, source: source ?? null })),
+    actions: toStoredActions(message),
+    created_at: message.createdAt,
+    status: message.status === 'streaming' ? 'cancelled' : message.status,
+  };
+}
+
 export function toStoredAiConversation(conversation: AiConversationState): AiConversation {
+  const tree = migrateAiTree(conversation.messages, conversation.tree);
+  // Pending assistant placeholders are not persisted; keep the latest durable ancestor active.
+  const nodes = tree.nodes.filter(({ message }) => message.status !== 'streaming');
+  const ids = new Set(nodes.map(({ id }) => id));
+  const byId = new Map(tree.nodes.map((node) => [node.id, node]));
+  const durableParent = (id: string | null): string | null => {
+    const seen = new Set<string>();
+    while (id && !ids.has(id)) {
+      if (seen.has(id)) return null;
+      seen.add(id);
+      id = byId.get(id)?.parent_id ?? null;
+    }
+    return id;
+  };
+  const storedTree = {
+    nodes: nodes.map((node) => ({ ...node, parent_id: durableParent(node.parent_id), message: toStoredMessage(node.message) })),
+    active_leaf_id: durableParent(tree.active_leaf_id),
+  };
   return {
     id: conversation.id,
     title: conversation.title,
     mode: conversation.mode,
     created_at: conversation.createdAt,
     updated_at: conversation.updatedAt,
-    messages: conversation.messages.flatMap<AiStoredMessage>((message) => {
-      if (message.status === 'streaming') return [];
-      return [{
-        id: message.id,
-        role: message.role,
-        content: message.content,
-        contexts: message.contexts.map(({ kind, label, source }) => ({ kind, label, source: source ?? null })),
-        actions: toStoredActions(message),
-        created_at: message.createdAt,
-        status: message.status,
-      }];
-    }),
+    messages: aiTreePath(storedTree),
+    tree: storedTree,
   };
 }
 
@@ -167,6 +226,7 @@ function fromStoredEditAction(action: AiStoredEditAction): AiEditProposal {
         ? STALE_EDIT_REVIEW_ERROR
         : action.error ?? undefined,
     continued: action.continued,
+    toolCallId: action.tool_call_id ?? undefined,
     createdAt: action.created_at,
   };
 }
@@ -225,26 +285,39 @@ function fromStoredActions(actions: AiStoredAction[] | undefined) {
   return restored;
 }
 
+function fromStoredMessage(message: AiStoredMessage): AiMessage {
+  return {
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    toolCalls: message.tool_calls,
+    toolCallId: message.tool_call_id,
+    agentId: message.agent_id,
+    accountId: message.account_id,
+    model: message.model,
+    stepIndex: message.step_index,
+    usage: message.usage,
+    phase: message.phase,
+    contexts: (message.contexts ?? []).map(({ kind, label, source }) => ({ kind, label, source: source ?? undefined, preview: '' })),
+    ...fromStoredActions(message.actions),
+    createdAt: message.created_at,
+    status: message.status,
+  };
+}
+
 export function fromStoredAiConversation(conversation: AiConversation): AiConversationState {
+  const storedTree = conversation.tree ?? migrateAiTree(conversation.messages);
+  const tree = {
+    nodes: storedTree.nodes.map((node) => ({ ...node, id: node.message.id, message: fromStoredMessage(node.message) })),
+    active_leaf_id: storedTree.active_leaf_id,
+  };
   return {
     id: conversation.id,
     title: conversation.title,
     mode: conversation.mode ?? 'ask',
     createdAt: conversation.created_at,
     updatedAt: conversation.updated_at,
-    messages: conversation.messages.map((message) => ({
-      id: message.id,
-      role: message.role,
-      content: message.content,
-      contexts: message.contexts.map(({ kind, label, source }) => ({
-        kind,
-        label,
-        source: source ?? undefined,
-        preview: '',
-      })),
-      ...fromStoredActions(message.actions),
-      createdAt: message.created_at,
-      status: message.status,
-    })),
+    messages: aiTreePath(tree),
+    tree,
   };
 }

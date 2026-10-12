@@ -130,7 +130,6 @@ import {
   saveMcpConfig,
   reconnectMcpServer,
   listMcpTools,
-  callMcpTool,
   listMcpImportCandidates,
   importMcpServersFromPath,
   exportMcpServersCursorJson,
@@ -139,7 +138,8 @@ import {
   listAiConversations,
   saveAiConversation,
   deleteAiConversation,
-  runAiTerminalCommand,
+  executeAiTool,
+  cancelAiTool,
   type McpServerConfig,
   type McpConfigSnapshot,
   type McpImportCandidate,
@@ -149,8 +149,6 @@ import {
   readRemoteFileFull,
   writeLocalFile,
   writeRemoteFile,
-  writeLocalFileChecked,
-  writeRemoteFileChecked,
   uploadFile,
   uploadLocalFile,
   cancelTransfer,
@@ -219,6 +217,8 @@ import {
 import {
   createAiConversationState,
   fromStoredAiConversation,
+  syncAiConversationState,
+  updateAiConversationMessage,
   toStoredAiConversation,
   type AiContextItem,
   type AiContextKind,
@@ -279,6 +279,10 @@ import {
   AI_API_FORMAT_OPTIONS,
   normalizeAiApiFormat,
 } from './aiSettingsModel';
+import { aiTreeLeaves, aiTreePath, migrateAiTree, switchAiTree } from './aiConversationTree';
+import { acceptAiStreamEvent, parseAiStreamEvent, type AiStreamCursor } from './aiProtocol';
+import { hasPendingAiTools } from './aiToolHistory';
+import { prepareAiToolContinuation } from './aiAgentContinuation';
 import { SelectDropdown } from './SelectDropdown';
 import {
   clampFloatingMenuLeft,
@@ -424,6 +428,9 @@ export function App() {
     content: string;
     toolCalls: AiNativeToolCall[];
     protocolRepairAttempt: boolean;
+    agentId: string;
+    stepIndex?: number;
+    cursor: AiStreamCursor;
   } | null>(null);
   const finishAiStreamRef = useRef<(
     activeRequest: NonNullable<typeof aiActiveRequestRef.current>,
@@ -446,6 +453,8 @@ export function App() {
   /** 已派发自动执行的动作 id：幂等，保证同步路径与兜底路径不会重复执行同一条命令 */
   const aiAutoRunDispatchedRef = useRef<Set<string>>(new Set());
   const [currentPath, setCurrentPath] = useState('');
+  /** Tool calls that the user cancelled; late adapter completions must not revive them. */
+  const aiCancelledToolCallsRef = useRef<Set<string>>(new Set());
   const [parentPath, setParentPath] = useState<string | null>(null);
   const [resourceFiles, setResourceFiles] = useState<ResourceFile[]>([]);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
@@ -3756,10 +3765,60 @@ export function App() {
   useEffect(() => {
     let disposed = false;
     let removeListener: (() => void) | null = null;
-    void listen<AiChatStreamEvent>('ai-chat-stream', ({ payload }) => {
+    void listen<unknown>('ai-chat-stream', ({ payload: rawPayload }) => {
       if (disposed) return;
       const activeRequest = aiActiveRequestRef.current;
-      if (!activeRequest || payload.request_id !== activeRequest.requestId) return;
+      const payload = parseAiStreamEvent(rawPayload);
+      if (!activeRequest || !payload || !acceptAiStreamEvent(activeRequest.cursor, payload)) return;
+      if (payload.usage || payload.phase || payload.model) {
+        updateAiConversation(activeRequest.conversationId, (conversation) => ({
+          ...conversation,
+          messages: conversation.messages.map((message) => message.id === activeRequest.assistantMessageId
+            ? {
+                ...message,
+                agentId: payload.agent_id ?? message.agentId,
+                stepIndex: payload.step_index ?? message.stepIndex,
+                usage: payload.usage ?? message.usage,
+                phase: payload.phase ?? message.phase,
+                model: payload.model ?? message.model,
+              }
+            : message),
+        }));
+      }
+      if (payload.tool_calls?.length) activeRequest.toolCalls = payload.tool_calls;
+      if (payload.kind === 'tool_result' && payload.tool_result) {
+        const result = payload.tool_result;
+        updateAiConversation(activeRequest.conversationId, (conversation) => {
+          const source = conversation.messages.find((message) =>
+            [...message.terminalActions, ...message.mcpActions, ...message.proposals].some((action) =>
+              (action.toolCallId ?? action.id) === result.tool_call_id,
+            ));
+          if (!source) return conversation;
+          const expected = source.terminalActions.some((action) => (action.toolCallId ?? action.id) === result.tool_call_id)
+            ? 'run_terminal_command'
+            : source.mcpActions.some((action) => (action.toolCallId ?? action.id) === result.tool_call_id)
+              ? 'call_mcp_tool'
+              : 'propose_file_edit';
+          if (result.name !== expected) return conversation;
+          const failed = result.is_error || result.status !== 'completed';
+          const statusFor = <T extends 'completed' | 'rejected' | 'cancelled' | 'error'>(completed: T, rejected: T): T =>
+            result.status === 'cancelled' ? 'cancelled' as T : failed ? (result.status === 'denied' ? rejected : 'error' as T) : completed;
+          const proposalStatus = result.status === 'cancelled'
+            ? 'cancelled' as const
+            : failed
+              ? (result.status === 'denied' ? 'rejected' as const : 'error' as const)
+              : 'applied' as const;
+          return updateAiConversationMessage(conversation, source.id, (message) => ({
+            ...message,
+            terminalActions: message.terminalActions.map((action) => (action.toolCallId ?? action.id) === result.tool_call_id
+              ? { ...action, status: statusFor('completed', 'rejected'), output: result.content, error: failed ? result.content : undefined } : action),
+            mcpActions: message.mcpActions.map((action) => (action.toolCallId ?? action.id) === result.tool_call_id
+              ? { ...action, status: statusFor('completed', 'rejected'), content: result.content, isError: result.is_error, error: failed ? result.content : undefined } : action),
+            proposals: message.proposals.map((proposal) => (proposal.toolCallId ?? proposal.id) === result.tool_call_id
+              ? { ...proposal, status: proposalStatus, error: failed ? result.content : undefined } : proposal),
+          }));
+        });
+      }
       if (payload.kind === 'delta' && payload.delta) {
         activeRequest.content += payload.delta;
         updateAiConversation(activeRequest.conversationId, (conversation) => ({
@@ -3799,12 +3858,16 @@ export function App() {
     conversationId: string,
     updater: (conversation: AiConversationState) => AiConversationState,
   ) {
-    setAiWorkspace((current) => ({
+    const current = aiWorkspaceRef.current;
+    const next = {
       ...current,
       conversations: current.conversations.map((conversation) => conversation.id === conversationId
-        ? updater(conversation)
+        ? syncAiConversationState(updater(conversation), conversation)
         : conversation),
-    }));
+    };
+    // Commit the snapshot synchronously: tool completion may immediately start continuation.
+    aiWorkspaceRef.current = next;
+    setAiWorkspace(next);
   }
 
   /** 派发一次低风险自动执行；幂等（同一动作只派发一次，同步路径与兜底路径共用） */
@@ -3858,7 +3921,11 @@ export function App() {
       ...nativeMapped.mcpActions,
       ...parsedMcp.actions,
     ];
-    const proposals = parsedEdits.proposals.flatMap<AiEditProposal>((proposal) => {
+    const seenEdits = new Set<string>();
+    const proposals = [...nativeMapped.proposals, ...parsedEdits.proposals].flatMap<AiEditProposal>((proposal) => {
+      const identity = JSON.stringify([proposal.targetSource, proposal.edits]);
+      if (seenEdits.has(identity)) return [];
+      seenEdits.add(identity);
       const target = userMessage?.contexts.find((context) =>
         context.kind === 'file' && context.source === proposal.targetSource,
       );
@@ -3873,14 +3940,20 @@ export function App() {
         targetLabel: target.label,
         status: 'proposed',
         edits: proposal.edits,
+        toolCallId: proposal.toolCallId,
         isRemote: target.isRemote,
         terminalId: target.terminalId,
         createdAt: new Date().toISOString(),
       }];
     });
+    const currentTaskMessages = conversation.messages.filter((message) =>
+      message.id === activeRequest.userMessageId
+      || message.id === activeRequest.assistantMessageId
+      || (message.agentId === activeRequest.agentId && message.stepIndex === activeRequest.stepIndex),
+    );
     const priorTerminalCommandIds = new Set(
-      conversation.messages.flatMap((priorMessage) =>
-        priorMessage.terminalActions.map(({ command }) => terminalCommandIdentity(command)),
+      currentTaskMessages.flatMap((priorMessage) =>
+        priorMessage.terminalActions.map(({ command, terminalId }) => `${terminalId ?? ''}:${terminalCommandIdentity(command)}`),
       ),
     );
     const acceptedTerminalCommandIds = new Set<string>();
@@ -3901,7 +3974,7 @@ export function App() {
         actionErrors.push(`终端动作引用了未授权或不可用终端：${action.contextSource}`);
         return [];
       }
-      const commandId = terminalCommandIdentity(action.command);
+      const commandId = `${target.terminalId}:${terminalCommandIdentity(action.command)}`;
       if (priorTerminalCommandIds.has(commandId) || acceptedTerminalCommandIds.has(commandId)) {
         actionErrors.push('终端动作与本任务中已有提案重复，已停止无进展重试');
         return [];
@@ -3927,7 +4000,7 @@ export function App() {
       }];
     });
     const priorMcpIds = new Set(
-      conversation.messages.flatMap((priorMessage) =>
+      currentTaskMessages.flatMap((priorMessage) =>
         priorMessage.mcpActions.map(({ serverId, toolName, arguments: args }) =>
           mcpActionIdentity(serverId, toolName, args),
         ),
@@ -3952,9 +4025,7 @@ export function App() {
         createdAt: new Date().toISOString(),
       }];
     });
-    const isToolContinuation = userMessage?.contexts.some(({ label }) =>
-      label.startsWith(AI_AGENT_RESULT_LABEL_PREFIX),
-    ) ?? false;
+    const isToolContinuation = Boolean(userMessage && isAiAgentContinuationMessage(userMessage));
     const declaresPendingToolWork = /(如果你(?:要我|愿意)|我会(?:直接)?提交|下一条会|需要.*(?:重新执行|再查|继续查)|可以直接再)/u.test(
       parsedMcp.visibleContent,
     );
@@ -4018,6 +4089,7 @@ export function App() {
             proposals: agentTurn.proposals,
             terminalActions: agentTurn.terminalActions,
             mcpActions: agentTurn.mcpActions,
+            toolCalls: activeRequest.toolCalls,
             status,
           };
         }
@@ -4056,6 +4128,9 @@ export function App() {
       dispatchAiAutoRun(activeRequest.conversationId, job.messageId, job.terminal);
     } else if (job?.mcp) {
       dispatchAiAutoRun(activeRequest.conversationId, job.messageId, job.mcp);
+    } else if (status === 'complete') {
+      // Calls rejected during parameter/context validation still need a paired error and continuation.
+      continueResolvedAiTools(activeRequest.conversationId, activeRequest.assistantMessageId);
     }
     // 生成结束：冲刷排队消息（续跑/自动执行中若又起请求，队列会等下一轮）
     window.setTimeout(() => flushAiMessageQueueRef.current(), 40);
@@ -4973,6 +5048,13 @@ export function App() {
     protocolRepairAttempt = false,
   ) {
     const requestId = crypto.randomUUID();
+    const continuing = isAiAgentContinuationMessage(userMessage) || protocolRepairAttempt;
+    const prior = [...baseMessages].reverse().find((message) => message.agentId);
+    const agentId = continuing ? userMessage.agentId ?? prior?.agentId ?? crypto.randomUUID() : crypto.randomUUID();
+    const accountId = continuing ? userMessage.accountId ?? prior?.accountId ?? aiProviderConfig?.account_id ?? aiProviderConfig?.active_account_id : aiProviderConfig?.account_id ?? aiProviderConfig?.active_account_id;
+    const model = continuing ? userMessage.model ?? prior?.model ?? aiProviderConfig?.model : aiProviderConfig?.model;
+    userMessage = { ...userMessage, agentId, accountId, model };
+    baseMessages = baseMessages.map((message) => message.id === userMessage.id ? userMessage : message);
     const assistantMessage: AiMessage = {
       id: crypto.randomUUID(),
       role: 'assistant',
@@ -4983,6 +5065,9 @@ export function App() {
       mcpActions: [],
       createdAt: new Date().toISOString(),
       status: 'streaming',
+      agentId,
+      accountId,
+      model,
     };
     const userIndex = baseMessages.findIndex((message) => message.id === userMessage.id);
     const history = userIndex >= 0 ? baseMessages.slice(0, userIndex) : baseMessages;
@@ -4997,6 +5082,9 @@ export function App() {
       content: '',
       toolCalls: [],
       protocolRepairAttempt,
+      agentId,
+      stepIndex: continuing ? userMessage.stepIndex ?? prior?.stepIndex : undefined,
+      cursor: { requestId, agentId },
     };
     updateAiConversation(conversation.id, (current) => ({
       ...current,
@@ -5015,15 +5103,21 @@ export function App() {
         }
       }
       if (aiActiveRequestRef.current?.requestId !== requestId) return;
-      const requestMessages = buildAiRequestMessages(
-        history,
-        userMessage,
-        conversation.mode,
-        mcpCatalog,
-        resolveAiContextBudgetChars(aiProviderConfig?.context_window),
-      );
       try {
-        await streamAiChat(requestId, requestMessages, conversation.mode);
+        const requestMessages = buildAiRequestMessages(
+          history,
+          userMessage,
+          conversation.mode,
+          mcpCatalog,
+          resolveAiContextBudgetChars(aiProviderConfig?.context_window),
+        );
+        await streamAiChat(requestId, requestMessages, conversation.mode, {
+          conversation_id: conversation.id,
+          agent_id: agentId,
+          step_index: continuing ? userMessage.stepIndex ?? prior?.stepIndex : undefined,
+          account_id: accountId,
+          model,
+        });
       } catch (error) {
         const activeRequest = aiActiveRequestRef.current;
         if (activeRequest?.requestId === requestId) {
@@ -5133,14 +5227,11 @@ export function App() {
     updater: (action: AiTerminalAction) => AiTerminalAction,
   ) {
     updateAiConversation(conversationId, (conversation) => ({
-      ...conversation,
+      ...updateAiConversationMessage(conversation, messageId, (message) => ({
+        ...message,
+        terminalActions: message.terminalActions.map((action) => action.id === actionId ? updater(action) : action),
+      })),
       updatedAt: new Date().toISOString(),
-      messages: conversation.messages.map((message) => message.id === messageId
-        ? {
-          ...message,
-          terminalActions: message.terminalActions.map((action) => action.id === actionId ? updater(action) : action),
-        }
-        : message),
     }));
   }
 
@@ -5149,7 +5240,11 @@ export function App() {
     messageId: string,
     action: AiTerminalAction,
   ) {
-    if (!['proposed', 'timeout', 'error'].includes(action.status)) return;
+    const conversation = aiWorkspaceRef.current.conversations.find(({ id }) => id === conversationId);
+    const sourceMessage = conversation?.messages.find(({ id }) => id === messageId);
+    const currentAction = sourceMessage?.terminalActions.find(({ id }) => id === action.id);
+    if (!currentAction || !['proposed', 'timeout', 'error'].includes(currentAction.status)) return;
+    action = currentAction;
     updateAiTerminalAction(conversationId, messageId, action.id, (current) => ({
       ...current,
       status: 'running',
@@ -5159,19 +5254,40 @@ export function App() {
       error: undefined,
     }));
     try {
-      const result = await runAiTerminalCommand({
-        terminal_id: action.terminalId,
-        is_remote: action.isRemote,
-        command: action.command,
+      const result = await executeAiTool({
+        tool_id: action.id,
+        tool_call_id: action.toolCallId ?? action.id,
+        name: 'run_terminal_command',
+        approved: true,
+        arguments: { terminal_id: action.terminalId, is_remote: action.isRemote, command: action.command, timeout_ms: action.timeoutMs },
         timeout_ms: action.timeoutMs,
+        conversation_id: conversationId,
+        agent_id: sourceMessage?.agentId ?? undefined,
+        step_index: sourceMessage?.stepIndex ?? undefined,
       });
+      // Unified terminal content is a JSON result; tolerate plain-text tool adapters.
+      let terminalResult: { output?: string; exit_code?: number | null; truncated?: boolean; timed_out?: boolean } = {};
+      try { terminalResult = JSON.parse(result.content); } catch { terminalResult = { output: result.content }; }
+      // Cancellation wins over a late adapter completion: the native result is no
+      // longer authoritative for the UI action after the user cancelled it.
+      const wasCancelled = aiCancelledToolCallsRef.current.delete(action.toolCallId ?? action.id);
       const completedAction: AiTerminalAction = {
         ...action,
-        status: result.timed_out ? 'timeout' : 'completed',
-        output: result.output,
-        exitCode: result.exit_code,
-        truncated: result.truncated,
-        error: result.timed_out ? result.output : undefined,
+        status: wasCancelled
+          ? 'cancelled'
+          : result.status === 'denied' || result.status === 'rejected'
+            ? 'rejected'
+            : result.status === 'cancelled'
+              ? 'cancelled'
+              : result.status === 'timeout' || terminalResult?.timed_out
+                ? 'timeout'
+                : result.is_error || result.status !== 'completed' ? 'error' : 'completed',
+        output: terminalResult?.output ?? result.content,
+        exitCode: terminalResult?.exit_code,
+        truncated: terminalResult?.truncated,
+        error: wasCancelled
+          ? '用户取消执行此工具；执行结果未知。'
+          : result.is_error || result.status !== 'completed' ? terminalResult?.output ?? result.content : undefined,
       };
       updateAiTerminalAction(conversationId, messageId, action.id, () => completedAction);
       continueAgentAfterTerminal(conversationId, messageId, completedAction);
@@ -5181,11 +5297,48 @@ export function App() {
         status: 'error',
         error: error instanceof Error ? error.message : String(error),
       }));
+      continueResolvedAiTools(conversationId, messageId);
     }
   }
   runAiTerminalActionRef.current = (conversationId, messageId, action) => {
     void runAiTerminalAction(conversationId, messageId, action);
   };
+
+  async function cancelAiAction(action: AiTerminalAction | AiMcpAction) {
+    const conversation = activeAiConversation;
+    const source = conversation?.messages.find((message) =>
+      [...message.terminalActions, ...message.mcpActions].some((item) => item.id === action.id),
+    );
+    const toolCallId = action.toolCallId ?? action.id;
+    aiCancelledToolCallsRef.current.add(toolCallId);
+    try {
+      await cancelAiTool(toolCallId, {
+        tool_id: action.id,
+        conversation_id: conversation?.id,
+        agent_id: source?.agentId,
+        step_index: source?.stepIndex,
+      });
+      if (conversation) {
+        if ('command' in action) {
+          updateAiTerminalAction(conversation.id, source?.id ?? '', action.id, (current) => ({
+            ...current,
+            status: 'cancelled',
+            error: '用户取消执行此工具；执行结果未知。',
+          }));
+        } else {
+          updateAiMcpAction(conversation.id, source?.id ?? '', action.id, (current) => ({
+            ...current,
+            status: 'cancelled',
+            isError: true,
+            error: '用户取消执行此工具；执行结果未知。',
+          }));
+        }
+        continueResolvedAiTools(conversation.id, source?.id ?? '');
+      }
+    } catch (error) {
+      setAiConversationError(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   function rejectAiTerminalAction(messageId: string, action: AiTerminalAction) {
     if (!activeAiConversation || action.status === 'running' || action.status === 'completed') return;
@@ -5193,8 +5346,9 @@ export function App() {
       ...current,
       status: 'rejected',
       output: undefined,
-      error: undefined,
+      error: '用户拒绝执行此工具',
     }));
+    continueResolvedAiTools(activeAiConversation.id, messageId);
   }
 
   function updateAiMcpAction(
@@ -5204,14 +5358,11 @@ export function App() {
     updater: (action: AiMcpAction) => AiMcpAction,
   ) {
     updateAiConversation(conversationId, (conversation) => ({
-      ...conversation,
+      ...updateAiConversationMessage(conversation, messageId, (message) => ({
+        ...message,
+        mcpActions: message.mcpActions.map((action) => action.id === actionId ? updater(action) : action),
+      })),
       updatedAt: new Date().toISOString(),
-      messages: conversation.messages.map((message) => message.id === messageId
-        ? {
-          ...message,
-          mcpActions: message.mcpActions.map((action) => action.id === actionId ? updater(action) : action),
-        }
-        : message),
     }));
   }
 
@@ -5220,7 +5371,11 @@ export function App() {
     messageId: string,
     action: AiMcpAction,
   ) {
-    if (!['proposed', 'error'].includes(action.status)) return;
+    const conversation = aiWorkspaceRef.current.conversations.find(({ id }) => id === conversationId);
+    const sourceMessage = conversation?.messages.find(({ id }) => id === messageId);
+    const currentAction = sourceMessage?.mcpActions.find(({ id }) => id === action.id);
+    if (!currentAction || !['proposed', 'error'].includes(currentAction.status)) return;
+    action = currentAction;
     updateAiMcpAction(conversationId, messageId, action.id, (current) => ({
       ...current,
       status: 'running',
@@ -5229,28 +5384,39 @@ export function App() {
       error: undefined,
     }));
     try {
-      const result = await callMcpTool({
-        server_id: action.serverId,
-        tool_name: action.toolName,
-        arguments: action.arguments,
+      const result = await executeAiTool({
+        tool_id: action.id,
+        tool_call_id: action.toolCallId ?? action.id,
+        name: 'call_mcp_tool',
+        approved: true,
+        arguments: { server: action.serverId, tool: action.toolName, arguments: action.arguments },
+        conversation_id: conversationId,
+        agent_id: sourceMessage?.agentId ?? undefined,
+        step_index: sourceMessage?.stepIndex ?? undefined,
       });
+      const wasCancelled = aiCancelledToolCallsRef.current.delete(action.toolCallId ?? action.id);
       const completedAction: AiMcpAction = {
         ...action,
-        status: result.is_error ? 'error' : 'completed',
+        status: wasCancelled
+          ? 'cancelled'
+          : result.status === 'denied' || result.status === 'rejected'
+            ? 'rejected'
+            : result.status === 'cancelled'
+              ? 'cancelled'
+              : result.is_error || result.status !== 'completed' ? 'error' : 'completed',
         content: result.content,
-        isError: result.is_error,
-        error: result.is_error ? result.content : undefined,
+        isError: wasCancelled || result.is_error,
+        error: wasCancelled ? '用户取消执行此工具；执行结果未知。' : result.is_error ? result.content : undefined,
       };
       updateAiMcpAction(conversationId, messageId, action.id, () => completedAction);
-      if (!result.is_error) {
-        continueAgentAfterMcp(conversationId, messageId, completedAction);
-      }
+      continueAgentAfterMcp(conversationId, messageId, completedAction);
     } catch (error) {
       updateAiMcpAction(conversationId, messageId, action.id, (current) => ({
         ...current,
         status: 'error',
         error: error instanceof Error ? error.message : String(error),
       }));
+      continueResolvedAiTools(conversationId, messageId);
     }
   }
   runAiMcpActionRef.current = runAiMcpAction;
@@ -5261,118 +5427,47 @@ export function App() {
       ...current,
       status: 'rejected',
       content: undefined,
-      error: undefined,
+      error: '用户拒绝执行此工具',
     }));
+    continueResolvedAiTools(activeAiConversation.id, messageId);
+  }
+
+  function continueResolvedAiTools(conversationId: string, messageId: string) {
+    const workspace = aiWorkspaceRef.current;
+    if (workspace.activeConversationId !== conversationId || aiActiveRequestRef.current) return;
+    const conversation = workspace.conversations.find((current) => current.id === conversationId);
+    if (!conversation || conversation.mode !== 'agent' || !canContinueAiAgent(conversation)) return;
+    const source = conversation.messages.find((message) => message.id === messageId);
+    if (!source) return; // Completion on an inactive branch must never change the active path.
+    const lastTask = [...conversation.messages].reverse().find((message) => message.role === 'user' && !isAiAgentContinuationMessage(message));
+    if (source.agentId && lastTask?.agentId && source.agentId !== lastTask.agentId) return;
+    if (hasPendingAiTools(source)) {
+      if (aiAutoRunEnabledRef.current && !source.terminalActions.some((action) => action.status === 'running') && !source.mcpActions.some((action) => action.status === 'running')) {
+        const terminal = source.terminalActions.find((action) => action.status === 'proposed' && !isHighRiskTerminalCommand(action.command));
+        const mcp = terminal ? undefined : source.mcpActions.find((action) => action.status === 'proposed');
+        if (terminal) dispatchAiAutoRun(conversationId, messageId, terminal);
+        else if (mcp) dispatchAiAutoRun(conversationId, messageId, mcp);
+      }
+      return; // All calls in one assistant message need results before the next model request.
+    }
+    const continuation = prepareAiToolContinuation(conversation, messageId);
+    if (!continuation) return;
+    beginAiGeneration(conversation, [...continuation.baseMessages, continuation.resultMessage], continuation.resultMessage);
   }
 
   function continueAgentAfterMcp(conversationId: string, messageId: string, action: AiMcpAction) {
-    const workspace = aiWorkspaceRef.current;
-    if (workspace.activeConversationId !== conversationId || aiActiveRequestRef.current) return;
-    const conversation = workspace.conversations.find((current) => current.id === conversationId);
-    if (!conversation || conversation.mode !== 'agent' || action.status !== 'completed' || action.continued) return;
-    if (!canContinueAiAgent(conversation)) return;
-    const output = action.content?.trim() || 'MCP 工具未产生输出';
-    const baseMessages = conversation.messages.map((message) => message.id === messageId
-      ? {
-        ...message,
-        mcpActions: message.mcpActions.map((current) => current.id === action.id
-          ? { ...action, continued: true }
-          : current),
-      }
-      : message);
-    const userMessage: AiMessage = {
-      id: crypto.randomUUID(),
-      role: 'user',
-      content: buildAgentContinuationPrompt('mcp'),
-      contexts: [{
-        kind: 'terminal',
-        label: `${AI_AGENT_RESULT_LABEL_PREFIX}MCP 结果：${action.summary}`,
-        source: `mcp:${action.serverId}/${action.toolName}`,
-        preview: `tool_action_id: ${action.id}\nserver: ${action.serverId}\ntool: ${action.toolName}\narguments: ${JSON.stringify(action.arguments)}\nis_error: false\noutput:\n${output.slice(-8000)}`,
-      }],
-      proposals: [],
-      terminalActions: [],
-      mcpActions: [],
-      createdAt: new Date().toISOString(),
-      status: 'complete',
-    };
-    beginAiGeneration(conversation, [...baseMessages, userMessage], userMessage);
+    if (action.continued) return;
+    continueResolvedAiTools(conversationId, messageId);
   }
 
   function continueAgentAfterTerminal(conversationId: string, messageId: string, action: AiTerminalAction) {
-    const workspace = aiWorkspaceRef.current;
-    if (workspace.activeConversationId !== conversationId || aiActiveRequestRef.current) return;
-    const conversation = workspace.conversations.find((current) => current.id === conversationId);
-    if (!conversation || conversation.mode !== 'agent' || !['completed', 'timeout'].includes(action.status) || action.continued) return;
-    if (!canContinueAiAgent(conversation)) return;
-    const output = action.output?.trim() || '命令未产生输出';
-    const baseMessages = conversation.messages.map((message) => message.id === messageId
-      ? {
-        ...message,
-        terminalActions: message.terminalActions.map((current) => current.id === action.id
-          ? { ...action, continued: true }
-          : current),
-      }
-      : message);
-    const userMessage: AiMessage = {
-      id: crypto.randomUUID(),
-      role: 'user',
-      content: buildAgentContinuationPrompt('terminal'),
-      contexts: [{
-        kind: 'terminal',
-        label: `${AI_AGENT_RESULT_LABEL_PREFIX}工具结果：${action.summary}`,
-        source: action.contextSource,
-        preview: `tool_action_id: ${action.id}\ncommand: ${action.command}\nexit_code: ${action.exitCode ?? 'unknown'}\ntimed_out: ${action.status === 'timeout'}\ntruncated: ${Boolean(action.truncated)}\noutput:\n${output.slice(-8000)}`,
-        isRemote: action.isRemote,
-        terminalId: action.terminalId,
-      }],
-      proposals: [],
-      terminalActions: [],
-      mcpActions: [],
-      createdAt: new Date().toISOString(),
-      status: 'complete',
-    };
-    beginAiGeneration(conversation, [...baseMessages, userMessage], userMessage);
+    if (action.continued) return;
+    continueResolvedAiTools(conversationId, messageId);
   }
 
   function continueAgentAfterEdit(messageId: string, proposal: AiEditProposal) {
-    if (!activeAiConversation || activeAiConversation.mode !== 'agent' || proposal.status !== 'applied' || proposal.continued || isAiGenerating) return;
-    if (!canContinueAiAgent(activeAiConversation)) return;
-    const conversation = activeAiConversation;
-    setConfirmDialog({
-      title: '将修改结果发送给 Agent',
-      message: `通知 AI“${proposal.summary}”已经应用到“${proposal.targetLabel}”，由它判断任务是否完成或提出下一步。`,
-      confirmLabel: '发送并继续',
-      onConfirm: () => {
-        const baseMessages = conversation.messages.map((message) => message.id === messageId
-          ? {
-            ...message,
-            proposals: message.proposals.map((current) => current.id === proposal.id
-              ? { ...current, continued: true }
-              : current),
-          }
-          : message);
-        const userMessage: AiMessage = {
-          id: crypto.randomUUID(),
-          role: 'user',
-          content: buildAgentContinuationPrompt('edit'),
-          contexts: [{
-            kind: 'file',
-            label: `${AI_AGENT_RESULT_LABEL_PREFIX}修改结果：${proposal.targetLabel}`,
-            source: proposal.targetSource,
-            preview: `applied: true\nsummary: ${proposal.summary}\ntarget: ${proposal.targetSource}`,
-            isRemote: proposal.isRemote,
-            terminalId: proposal.terminalId,
-          }],
-          proposals: [],
-          terminalActions: [],
-          mcpActions: [],
-          createdAt: new Date().toISOString(),
-          status: 'complete',
-        };
-        beginAiGeneration(conversation, [...baseMessages, userMessage], userMessage);
-      },
-    });
+    if (!activeAiConversation || proposal.continued) return;
+    continueResolvedAiTools(activeAiConversation.id, messageId);
   }
 
   function updateAiProposal(
@@ -5382,11 +5477,11 @@ export function App() {
     updater: (proposal: AiEditProposal) => AiEditProposal,
   ) {
     updateAiConversation(conversationId, (conversation) => ({
-      ...conversation,
+      ...updateAiConversationMessage(conversation, messageId, (message) => ({
+        ...message,
+        proposals: message.proposals.map((proposal) => proposal.id === proposalId ? updater(proposal) : proposal),
+      })),
       updatedAt: new Date().toISOString(),
-      messages: conversation.messages.map((message) => message.id === messageId
-        ? { ...message, proposals: message.proposals.map((proposal) => proposal.id === proposalId ? updater(proposal) : proposal) }
-        : message),
     }));
   }
 
@@ -5421,6 +5516,7 @@ export function App() {
             status: 'error',
             error: error instanceof Error ? error.message : String(error),
           }));
+          continueResolvedAiTools(conversationId, messageId);
         }
       },
     });
@@ -5433,8 +5529,9 @@ export function App() {
       status: 'rejected',
       baseContent: undefined,
       nextContent: undefined,
-      error: undefined,
+      error: '用户拒绝执行此工具',
     }));
+    continueResolvedAiTools(activeAiConversation.id, messageId);
   }
 
   function applyAiEditProposal(messageId: string, proposal: AiEditProposal) {
@@ -5449,11 +5546,25 @@ export function App() {
       onConfirm: async () => {
         updateAiProposal(conversationId, messageId, proposal.id, (current) => ({ ...current, status: 'applying', error: undefined }));
         try {
-          if (proposal.isRemote) {
-            if (!proposal.terminalId) throw new Error('目标终端已经不可用');
-            await writeRemoteFileChecked(proposal.terminalId, proposal.targetSource, baseContent, nextContent);
-          } else {
-            await writeLocalFileChecked(proposal.targetSource, baseContent, nextContent);
+          const sourceMessage = aiWorkspaceRef.current.conversations
+            .find(({ id }) => id === conversationId)?.messages.find(({ id }) => id === messageId);
+          const result = await executeAiTool({
+            tool_id: proposal.id,
+            tool_call_id: proposal.toolCallId ?? proposal.id,
+            name: 'propose_file_edit',
+            approved: true,
+            arguments: {
+              path: proposal.targetSource,
+              terminal_id: proposal.isRemote ? proposal.terminalId : undefined,
+              original_content: baseContent,
+              new_content: nextContent,
+            },
+            conversation_id: conversationId,
+            agent_id: sourceMessage?.agentId ?? undefined,
+            step_index: sourceMessage?.stepIndex ?? undefined,
+          });
+          if (result.status === 'denied' || result.status === 'rejected' || result.is_error || result.status !== 'completed') {
+            throw new Error(result.content || `文件修改未完成（${result.status}）`);
           }
           setEditorTabs((current) => current.map((tab) => {
             const matchesTarget = tab.path === proposal.targetSource
@@ -5470,6 +5581,7 @@ export function App() {
             error: undefined,
           }));
           setStatusMessage(`AI 修改已应用：${proposal.targetSource}`);
+          continueResolvedAiTools(conversationId, messageId);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const stale = message.includes('AI_EDIT_STALE:');
@@ -5480,6 +5592,7 @@ export function App() {
             nextContent: undefined,
             error: message.replace('AI_EDIT_STALE:', ''),
           }));
+          continueResolvedAiTools(conversationId, messageId);
         }
       },
     });
@@ -5489,10 +5602,13 @@ export function App() {
     if (isAiGenerating || !activeAiConversation) return;
     const assistantIndex = activeAiConversation.messages.findIndex((message) => message.id === assistantMessageId);
     if (assistantIndex <= 0) return;
-    const baseMessages = activeAiConversation.messages.slice(0, assistantIndex);
-    const userMessage = [...baseMessages].reverse().find((message) => message.role === 'user');
-    if (!userMessage) return;
-    beginAiGeneration(activeAiConversation, baseMessages, userMessage);
+    const prefix = activeAiConversation.messages.slice(0, assistantIndex);
+    const previousMessage = prefix[prefix.length - 1];
+    if (!previousMessage) return;
+    const requestMessage = previousMessage.role === 'user'
+      ? { ...previousMessage, id: crypto.randomUUID() }
+      : previousMessage;
+    beginAiGeneration(activeAiConversation, [...prefix.slice(0, -1), requestMessage], requestMessage);
   }
 
   function beginEditUserMessage(message: AiMessage) {
@@ -5523,6 +5639,7 @@ export function App() {
     if (original.role !== 'user') return;
     const updatedUserMessage: AiMessage = {
       ...original,
+      id: crypto.randomUUID(),
       content,
       createdAt: new Date().toISOString(),
     };
@@ -5532,6 +5649,16 @@ export function App() {
     ];
     cancelEditUserMessage();
     beginAiGeneration(activeAiConversation, baseMessages, updatedUserMessage);
+  }
+
+  function switchAiBranch(leafId: string | null) {
+    if (!activeAiConversation || aiActiveRequestRef.current) return;
+    updateAiConversation(activeAiConversation.id, (conversation) => {
+      const tree = switchAiTree(migrateAiTree(conversation.messages, conversation.tree), leafId);
+      return { ...conversation, tree, messages: aiTreePath(tree), updatedAt: new Date().toISOString() };
+    });
+    setPendingAiContexts([]);
+    cancelEditUserMessage();
   }
 
   function setActiveAiConversationMode(mode: AiConversationMode) {
@@ -5591,6 +5718,7 @@ export function App() {
       title: '新对话',
       updatedAt: new Date().toISOString(),
       messages: [],
+      tree: { nodes: [], active_leaf_id: null },
     }));
     setPendingAiContexts([]);
     cancelEditUserMessage();
@@ -7085,6 +7213,23 @@ export function App() {
               })}
             </div>
 
+            {activeAiConversation && (() => {
+              const tree = migrateAiTree(activeAiConversation.messages, activeAiConversation.tree);
+              const leaves = aiTreeLeaves(tree);
+              if (leaves.length < 2 && (!tree.active_leaf_id || leaves.some(({ id }) => id === tree.active_leaf_id))) return null;
+              return (
+                <div className="ai-session-tabs" aria-label="会话分支">
+                  {leaves.map((leaf, index) => (
+                    <button type="button" key={leaf.id}
+                      className={tree.active_leaf_id === leaf.id ? 'ai-session-tab active' : 'ai-session-tab'}
+                      disabled={isAiGenerating} title={leaf.content.slice(0, 120) || '工具回复分支'}
+                      onClick={() => switchAiBranch(leaf.id)}>
+                      分支 {index + 1}
+                    </button>
+                  ))}
+                </div>
+              );
+            })()}
             {aiConversationError && <div className="ai-conversation-error">{aiConversationError}</div>}
 
             <div ref={aiMessageListRef} className="ai-message-list">
@@ -7110,15 +7255,26 @@ export function App() {
               ) : aiMessages.map((message) => {
                 const isUser = message.role === 'user';
                 const isEditingUser = isUser && editingUserMessageId === message.id;
-                const isContinuation = isUser && isAiAgentContinuationMessage(message);
+                const isContinuation = isAiAgentContinuationMessage(message);
                 if (isContinuation) return null;
                 return (
                 <article key={message.id} className={`ai-message ${message.role} ${message.status}${isEditingUser ? ' editing' : ''}`}>
                   <div className="ai-message-body">
+                    {message.status !== 'streaming' && (
+                      <button type="button" className="ai-header-button" disabled={isAiGenerating}
+                        title="保留现有回复，从此消息建立新分支"
+                        onClick={() => switchAiBranch(message.id)}>从此处分支</button>
+                    )}
                     {(message.status === 'cancelled' || message.status === 'error') && (
                       <div className="ai-message-status">
                         {message.status === 'cancelled' && <em>已停止</em>}
                         {message.status === 'error' && <em>失败</em>}
+                      </div>
+                    )}
+                    {message.role === 'assistant' && (message.phase || message.usage) && (
+                      <div className="ai-message-status">
+                        {message.phase ? <span>{message.phase}</span> : null}
+                        {message.usage ? <span>输入 {message.usage.input_tokens} · 输出 {message.usage.output_tokens} · 总计 {message.usage.total_tokens} tokens</span> : null}
                       </div>
                     )}
                     {message.contexts.length > 0 && (
@@ -7296,7 +7452,7 @@ export function App() {
                           {!['running', 'completed', 'rejected'].includes(action.status) && (
                             <button type="button" onClick={() => rejectAiTerminalAction(message.id, action)}>拒绝</button>
                           )}
-                          {action.status === 'running' && <span>正在隔离执行…</span>}
+                          {action.status === 'running' && <><span>正在隔离执行…</span><button type="button" onClick={() => void cancelAiAction(action)}>取消执行</button></>}
                           {action.status === 'completed' && (
                             <>
                               {activeAiConversation?.mode === 'agent' && !action.continued && canContinueAiAgent(activeAiConversation) && !isAiGenerating && (
@@ -7353,7 +7509,7 @@ export function App() {
                           {!['running', 'completed', 'rejected'].includes(action.status) && (
                             <button type="button" onClick={() => rejectAiMcpAction(message.id, action)}>拒绝</button>
                           )}
-                          {action.status === 'running' && <span>正在调用 MCP…</span>}
+                          {action.status === 'running' && <><span>正在调用 MCP…</span><button type="button" onClick={() => void cancelAiAction(action)}>取消调用</button></>}
                           {action.status === 'completed' && (
                             <>
                               <span className="success">已完成{action.isError ? '（工具报错）' : ''}</span>

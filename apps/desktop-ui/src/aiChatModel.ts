@@ -6,6 +6,7 @@
  * 角色 → 信任边界 → 模式 → 工具策略 → 回复风格。
  */
 import type { AiChatMessage, AiProviderConfig } from './api';
+import { aiToolRequestGroup } from './aiToolHistory';
 import type {
   AiContextItem,
   AiConversationMode,
@@ -84,7 +85,7 @@ const AI_AGENT_INSTRUCTIONS = `## 模式：Agent（工具循环）
 ### 工作循环（必须遵守）
 1. **观察**：只根据当前消息与 workspace_context_json 判断已知事实。
 2. **行动**：若缺关键事实或需改系统状态 → **本回合立即**提交 tool call / 工具代码块；不要只写“我将执行…”。
-3. **收敛**：工具结果会作为带 \`${AI_AGENT_RESULT_LABEL_PREFIX}\` 前缀标签的上下文自动回传；收到后直接继续或给出最终结论，**禁止**再问“是否继续/是否授权”。
+3. **收敛**：工具结果以原生 tool 角色回传；收到后直接继续或给出最终结论，**禁止**再问“是否继续/是否授权”。
 4. **一步一事**：每回合最多提出完成**当前步骤**必需的动作；不要一次堆叠无关命令。
 
 ### 授权与 UI（关键）
@@ -101,7 +102,9 @@ const AI_AGENT_INSTRUCTIONS = `## 模式：Agent（工具循环）
 - 禁止：交互式、需密码提示、长时间驻留、无超时保障的 tail -f 类命令。
 - 失败后重试：必须修改导致失败的参数/语法，禁止原样重试。
 
-### 文件 — pandaterm-edit 代码块（严格 JSON）
+### 文件 — propose_file_edit
+参数：summary, target_source, edits（每项 search/replace）；优先使用原生 tool call。
+无 function tools 时使用 pandaterm-edit 代码块（严格 JSON）。
 仅当用户明确要求修改**已授权** kind=file 上下文时：
 \`\`\`pandaterm-edit
 {"summary":"修改摘要","target_source":"上下文中的精确 source","edits":[{"search":"必须唯一匹配的原文","replace":"替换文本"}]}
@@ -164,6 +167,7 @@ export function resolveAiChatModelOptions(config: Pick<AiProviderConfig, 'model'
 }
 
 export function isAiAgentContinuationMessage(message: Pick<AiMessage, 'role' | 'contexts'>): boolean {
+  if (message.role === 'tool') return true;
   if (message.role !== 'user') return false;
   return message.contexts.some(({ label }) => label.startsWith(AI_AGENT_RESULT_LABEL_PREFIX));
 }
@@ -183,7 +187,7 @@ export function aiAgentContinuationCount(messages: AiMessage[]): number {
   let count = 0;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (message.role !== 'user') continue;
+    if (message.role === 'assistant') continue;
     if (!isAiAgentContinuationMessage(message)) break;
     count += 1;
   }
@@ -230,16 +234,20 @@ export function buildAiRequestMessages(
 ): AiChatMessage[] {
   const systemMessage = aiSystemMessage(mode, mcpToolsCatalog);
   const candidates = [...history.filter((message) => message.id !== 'ai-welcome'), userMessage]
-    .slice(-AI_HISTORY_MESSAGE_LIMIT)
-    .map((message) => ({ role: message.role, content: limitAiRequestMessage(formatAiRequestContent(message)) }))
-    .filter((message) => message.content.trim().length > 0);
+    .filter((message) => !isAiAgentContinuationMessage(message))
+    .map((message): AiChatMessage[] => {
+      const content = limitAiRequestMessage(formatAiRequestContent(message));
+      return message.role === 'assistant' ? aiToolRequestGroup(message, content).map((entry) => ({ ...entry, content: limitAiRequestMessage(entry.content) })) : [{ role: message.role, content }];
+    })
+    .filter((group) => group.length > 0);
   let remaining = budgetChars - systemMessage.content.length;
   const selected: AiChatMessage[] = [];
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
-    const candidate = candidates[index];
-    if (candidate.content.length > remaining && selected.length > 0) break;
-    selected.unshift(candidate);
-    remaining -= candidate.content.length;
+    const group = candidates[index];
+    const cost = group.reduce((sum, candidate) => sum + candidate.content.length + JSON.stringify(candidate.tool_calls ?? []).length, 0);
+    if ((cost > remaining || selected.length + group.length > AI_HISTORY_MESSAGE_LIMIT) && selected.length > 0) break;
+    selected.unshift(...group);
+    remaining -= cost;
   }
   return [systemMessage, ...selected];
 }

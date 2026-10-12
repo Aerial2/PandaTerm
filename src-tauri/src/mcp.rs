@@ -295,7 +295,9 @@ impl Default for SessionSlot {
 /// MCP 服务器可能把环境变量/凭据打到 stderr：落日志前对疑似敏感行整行脱敏，
 /// 避免 token / api key / password 进入后端日志与前端错误提示。
 fn redact_mcp_log_line(line: &str) -> String {
-    const SENSITIVE: [&str; 6] = ["token", "api_key", "apikey", "api-key", "secret", "password"];
+    const SENSITIVE: [&str; 6] = [
+        "token", "api_key", "apikey", "api-key", "secret", "password",
+    ];
     let lowered = line.to_lowercase();
     if SENSITIVE.iter().any(|key| lowered.contains(key)) {
         return "[已脱敏：疑似包含凭据]".to_string();
@@ -436,7 +438,12 @@ pub fn save_mcp_config(path: &Path, store: &McpConfigStore) -> Result<(), String
 
 fn cursor_server_to_config(id: String, entry: CursorMcpServer) -> McpServerConfig {
     let url = entry.url.unwrap_or_default();
-    let transport = match entry.transport.as_deref().map(str::to_ascii_lowercase).as_deref() {
+    let transport = match entry
+        .transport
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         Some("sse") => McpTransport::Sse,
         Some("streamable-http") | Some("http") => McpTransport::StreamableHttp,
         Some("stdio") => McpTransport::Stdio,
@@ -459,7 +466,9 @@ fn cursor_server_to_config(id: String, entry: CursorMcpServer) -> McpServerConfi
     }
 }
 
-pub fn normalize_mcp_servers(servers: Vec<McpServerConfig>) -> Result<Vec<McpServerConfig>, String> {
+pub fn normalize_mcp_servers(
+    servers: Vec<McpServerConfig>,
+) -> Result<Vec<McpServerConfig>, String> {
     if servers.len() > MAX_MCP_SERVERS {
         return Err(format!("最多配置 {MAX_MCP_SERVERS} 个 MCP 服务器"));
     }
@@ -659,8 +668,7 @@ pub fn list_mcp_import_candidates() -> Vec<McpImportCandidate> {
         push(
             "claude-desktop",
             "Claude Desktop",
-            home
-                .join("AppData")
+            home.join("AppData")
                 .join("Roaming")
                 .join("Claude")
                 .join("claude_desktop_config.json"),
@@ -669,8 +677,7 @@ pub fn list_mcp_import_candidates() -> Vec<McpImportCandidate> {
         push(
             "claude-desktop-macos",
             "Claude Desktop (macOS)",
-            home
-                .join("Library")
+            home.join("Library")
                 .join("Application Support")
                 .join("Claude")
                 .join("claude_desktop_config.json"),
@@ -679,8 +686,7 @@ pub fn list_mcp_import_candidates() -> Vec<McpImportCandidate> {
         push(
             "claude-desktop-linux",
             "Claude Desktop (Linux)",
-            home
-                .join(".config")
+            home.join(".config")
                 .join("Claude")
                 .join("claude_desktop_config.json"),
         );
@@ -691,7 +697,11 @@ pub fn list_mcp_import_candidates() -> Vec<McpImportCandidate> {
         push(
             "cursor-appdata",
             "Cursor AppData",
-            appdata.join("Cursor").join("User").join("globalStorage").join("mcp.json"),
+            appdata
+                .join("Cursor")
+                .join("User")
+                .join("globalStorage")
+                .join("mcp.json"),
         );
         push(
             "claude-desktop-appdata",
@@ -730,8 +740,8 @@ pub fn import_mcp_servers_from_path(path: &str) -> Result<McpImportPreview, Stri
     if !path_buf.is_file() {
         return Err(format!("文件不存在：{path}"));
     }
-    let content = std::fs::read_to_string(&path_buf)
-        .map_err(|error| format!("MCP 配置读取失败：{error}"))?;
+    let content =
+        std::fs::read_to_string(&path_buf).map_err(|error| format!("MCP 配置读取失败：{error}"))?;
     // Claude Desktop 使用 mcpServers 字段，与 Cursor 相同；也兼容我们的 store。
     let store = parse_mcp_config_content(&content)?;
     if store.servers.is_empty() {
@@ -888,12 +898,20 @@ fn build_mcp_process_path() -> Option<OsString> {
         if let Ok(userprofile) = env::var("USERPROFILE") {
             let home = PathBuf::from(userprofile);
             dirs.push(home.join(".local").join("bin"));
-            dirs.push(home.join("AppData").join("Roaming").join("Python").join("Scripts"));
+            dirs.push(
+                home.join("AppData")
+                    .join("Roaming")
+                    .join("Python")
+                    .join("Scripts"),
+            );
             dirs.push(home.join(".cargo").join("bin"));
         }
         for ver in ["Python313", "Python312", "Python311", "Python310"] {
             if let Ok(local) = env::var("LOCALAPPDATA") {
-                let base = PathBuf::from(&local).join("Programs").join("Python").join(ver);
+                let base = PathBuf::from(&local)
+                    .join("Programs")
+                    .join("Python")
+                    .join(ver);
                 dirs.push(base.clone());
                 dirs.push(base.join("Scripts"));
             }
@@ -1102,7 +1120,14 @@ fn append_mcp_stderr_hint(base: String, stderr_tail: &str) -> String {
     if trimmed.is_empty() {
         return base;
     }
-    let hint: String = trimmed.chars().rev().take(1200).collect::<String>().chars().rev().collect();
+    let hint: String = trimmed
+        .chars()
+        .rev()
+        .take(1200)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     let hint = hint.trim();
     if hint.is_empty() {
         base
@@ -1111,10 +1136,7 @@ fn append_mcp_stderr_hint(base: String, stderr_tail: &str) -> String {
     }
 }
 
-fn snapshot_server(
-    config: &McpServerConfig,
-    slot: Option<&SessionSlot>,
-) -> McpServerSnapshot {
+fn snapshot_server(config: &McpServerConfig, slot: Option<&SessionSlot>) -> McpServerSnapshot {
     let (status, error, tools) = if !config.enabled {
         ("disabled".to_string(), None, Vec::new())
     } else if let Some(slot) = slot {
@@ -1148,7 +1170,8 @@ fn snapshot_server(
 // 写入统一使用 NDJSON；读取同时兼容少数旧实现的 Content-Length 帧。
 
 fn encode_mcp_message(body: &Value) -> Result<Vec<u8>, String> {
-    let mut json = serde_json::to_vec(body).map_err(|error| format!("MCP 请求序列化失败：{error}"))?;
+    let mut json =
+        serde_json::to_vec(body).map_err(|error| format!("MCP 请求序列化失败：{error}"))?;
     // 规范要求消息不得嵌入换行；serde 默认紧凑序列化已满足
     if json.iter().any(|b| *b == b'\n' || *b == b'\r') {
         return Err("MCP 请求 JSON 含非法换行".to_string());
@@ -1218,7 +1241,10 @@ async fn read_mcp_message(reader: &mut BufReader<ChildStdout>) -> Result<Value, 
             Ok(value) => return Ok(value),
             Err(_) => {
                 // 个别服务器会把日志误打到 stdout，跳过非 JSON 行
-                eprintln!("[MCP] skip non-json stdio line: {}", trimmed.chars().take(200).collect::<String>());
+                eprintln!(
+                    "[MCP] skip non-json stdio line: {}",
+                    trimmed.chars().take(200).collect::<String>()
+                );
                 continue;
             }
         }
@@ -1307,7 +1333,10 @@ impl McpRuntime {
         }
     }
 
-    pub async fn connect_server(&self, config: &McpServerConfig) -> Result<McpServerSnapshot, String> {
+    pub async fn connect_server(
+        &self,
+        config: &McpServerConfig,
+    ) -> Result<McpServerSnapshot, String> {
         self.disconnect_server(&config.id).await;
         if !config.enabled {
             let mut sessions = self.sessions.lock().await;
@@ -1420,7 +1449,10 @@ impl McpRuntime {
                 .env
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case("PYTHONIOENCODING"));
-            let has_utf8 = config.env.keys().any(|k| k.eq_ignore_ascii_case("PYTHONUTF8"));
+            let has_utf8 = config
+                .env
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("PYTHONUTF8"));
             if !has_ioencoding {
                 command.env("PYTHONIOENCODING", "utf-8");
             }
@@ -1522,7 +1554,8 @@ impl McpRuntime {
                                         .response_tx
                                         .send(Err(McpCallFailure::Application(text)));
                                 } else {
-                                    let result = message.get("result").cloned().unwrap_or(Value::Null);
+                                    let result =
+                                        message.get("result").cloned().unwrap_or(Value::Null);
                                     let _ = entry.response_tx.send(Ok(result));
                                 }
                             }
@@ -1917,18 +1950,15 @@ async fn http_jsonrpc_request(
         HeaderValue::from_static(MCP_HTTP_PROTOCOL_VERSION),
     );
     for (key, value) in &session.headers {
-        let name = HeaderName::from_bytes(key.as_bytes())
-            .map_err(|_| format!("无效 header 名：{key}"))?;
-        let header_value = HeaderValue::from_str(value)
-            .map_err(|_| format!("无效 header 值：{key}"))?;
+        let name =
+            HeaderName::from_bytes(key.as_bytes()).map_err(|_| format!("无效 header 名：{key}"))?;
+        let header_value =
+            HeaderValue::from_str(value).map_err(|_| format!("无效 header 值：{key}"))?;
         headers.insert(name, header_value);
     }
     if let Some(session_id) = session.session_id.as_ref() {
         if let Ok(value) = HeaderValue::from_str(session_id) {
-            headers.insert(
-                HeaderName::from_static("mcp-session-id"),
-                value,
-            );
+            headers.insert(HeaderName::from_static("mcp-session-id"), value);
         }
     }
 
@@ -1991,7 +2021,10 @@ async fn http_jsonrpc_request(
     }
 
     let request_id = request_id.ok_or_else(|| "MCP 请求缺少 id".to_string())?;
-    if content_type.contains("text/event-stream") || text.trim_start().starts_with("event:") || text.contains("\ndata:") {
+    if content_type.contains("text/event-stream")
+        || text.trim_start().starts_with("event:")
+        || text.contains("\ndata:")
+    {
         parse_sse_jsonrpc_result(&text, &request_id).map(Some)
     } else {
         parse_jsonrpc_result(&text, &request_id).map(Some)
@@ -2179,7 +2212,10 @@ fn parse_tool_call_result(value: Value) -> CallMcpToolResult {
     };
     let mut content = content;
     if content.chars().count() > MAX_CALL_RESULT_CHARS {
-        content = content.chars().take(MAX_CALL_RESULT_CHARS).collect::<String>()
+        content = content
+            .chars()
+            .take(MAX_CALL_RESULT_CHARS)
+            .collect::<String>()
             + "\n\n[...MCP 结果已截断...]";
     }
     CallMcpToolResult { content, is_error }
@@ -2193,7 +2229,10 @@ pub fn format_mcp_tools_for_agent(catalog: &[Value]) -> String {
         return String::new();
     }
     let mut lines = Vec::new();
-    lines.push("已连接的 MCP 工具（仅可在 Agent 模式通过 pandaterm-mcp 代码块调用，须用户授权）：".to_string());
+    lines.push(
+        "已连接的 MCP 工具（仅可在 Agent 模式通过 pandaterm-mcp 代码块调用，须用户授权）："
+            .to_string(),
+    );
     for item in catalog.iter().take(80) {
         let server = item.get("server").and_then(Value::as_str).unwrap_or("?");
         let tool = item.get("tool").and_then(Value::as_str).unwrap_or("?");
@@ -2243,13 +2282,13 @@ mod tests {
 
     #[test]
     fn append_mcp_stderr_hint_includes_tail() {
-        let msg = append_mcp_stderr_hint("MCP 进程已退出".into(), "  'C:\\Program' is not recognized  ");
+        let msg = append_mcp_stderr_hint(
+            "MCP 进程已退出".into(),
+            "  'C:\\Program' is not recognized  ",
+        );
         assert!(msg.contains("MCP 进程已退出"));
         assert!(msg.contains("C:\\Program"));
-        assert_eq!(
-            append_mcp_stderr_hint("ok".into(), "   "),
-            "ok"
-        );
+        assert_eq!(append_mcp_stderr_hint("ok".into(), "   "), "ok");
     }
 
     #[cfg(windows)]
@@ -2284,7 +2323,8 @@ mod tests {
             assert!(args.iter().any(|a| a == "call"), "args={args:?}");
             assert!(!args.iter().any(|a| a == "/S"), "must not use /S: {args:?}");
             assert!(
-                args.iter().any(|a| a.ends_with("npx.cmd") || a.ends_with("npx.CMD")),
+                args.iter()
+                    .any(|a| a.ends_with("npx.cmd") || a.ends_with("npx.CMD")),
                 "args={args:?}"
             );
         }
@@ -2297,7 +2337,10 @@ mod tests {
             name: "Filesystem".into(),
             transport: McpTransport::Stdio,
             command: "npx".into(),
-            args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+            args: vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-filesystem".into(),
+            ],
             env: HashMap::new(),
             cwd: None,
             url: String::new(),
@@ -2390,31 +2433,34 @@ mod tests {
             enabled: false,
             disabled_tools: Vec::new(),
         }];
-        let imported = vec![McpServerConfig {
-            id: "memory".into(),
-            name: "memory".into(),
-            transport: McpTransport::Stdio,
-            command: "npx".into(),
-            args: vec!["-y".into()],
-            env: HashMap::new(),
-            cwd: None,
-            url: String::new(),
-            headers: HashMap::new(),
-            enabled: true,
-            disabled_tools: Vec::new(),
-        }, McpServerConfig {
-            id: "fs".into(),
-            name: "fs".into(),
-            transport: McpTransport::Stdio,
-            command: "npx".into(),
-            args: Vec::new(),
-            env: HashMap::new(),
-            cwd: None,
-            url: String::new(),
-            headers: HashMap::new(),
-            enabled: false,
-            disabled_tools: Vec::new(),
-        }];
+        let imported = vec![
+            McpServerConfig {
+                id: "memory".into(),
+                name: "memory".into(),
+                transport: McpTransport::Stdio,
+                command: "npx".into(),
+                args: vec!["-y".into()],
+                env: HashMap::new(),
+                cwd: None,
+                url: String::new(),
+                headers: HashMap::new(),
+                enabled: true,
+                disabled_tools: Vec::new(),
+            },
+            McpServerConfig {
+                id: "fs".into(),
+                name: "fs".into(),
+                transport: McpTransport::Stdio,
+                command: "npx".into(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                url: String::new(),
+                headers: HashMap::new(),
+                enabled: false,
+                disabled_tools: Vec::new(),
+            },
+        ];
         let (merged, added, updated) =
             merge_mcp_server_imports(existing.clone(), imported.clone()).expect("merge");
         assert_eq!(added, 1);
@@ -2464,7 +2510,10 @@ mod tests {
         let exported = export_mcp_servers_cursor_json(&servers).expect("export");
         let reimported = parse_mcp_config_content(&exported).expect("reimport");
         assert_eq!(reimported.servers.len(), 2);
-        assert!(reimported.servers.iter().any(|s| s.id == "memory" && s.command == "npx"));
+        assert!(reimported
+            .servers
+            .iter()
+            .any(|s| s.id == "memory" && s.command == "npx"));
         assert!(reimported
             .servers
             .iter()
@@ -2478,14 +2527,16 @@ mod tests {
         let result = parse_jsonrpc_result(json_body, &id).expect("json");
         assert_eq!(result["tools"][0]["name"], "a");
 
-        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let sse =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
         let sse_result = parse_sse_jsonrpc_result(sse, &id).expect("sse");
         assert_eq!(sse_result["ok"], true);
     }
 
     #[test]
     fn encode_mcp_message_uses_ndjson() {
-        let frame = encode_mcp_message(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).expect("encode");
+        let frame = encode_mcp_message(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+            .expect("encode");
         let text = String::from_utf8(frame).expect("utf8");
         assert!(text.ends_with('\n'));
         assert!(!text.contains("Content-Length"));

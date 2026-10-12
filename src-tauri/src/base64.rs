@@ -30,11 +30,20 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     const TABLE: &[u8; 256] = &{
         let mut t = [255u8; 256];
         let mut i = 0;
-        while i < 26 { t[(b'A' + i as u8) as usize] = i as u8; i += 1; }
+        while i < 26 {
+            t[(b'A' + i as u8) as usize] = i as u8;
+            i += 1;
+        }
         let mut i = 0;
-        while i < 26 { t[(b'a' + i as u8) as usize] = (26 + i) as u8; i += 1; }
+        while i < 26 {
+            t[(b'a' + i as u8) as usize] = (26 + i) as u8;
+            i += 1;
+        }
         let mut i = 0;
-        while i < 10 { t[(b'0' + i as u8) as usize] = (52 + i) as u8; i += 1; }
+        while i < 10 {
+            t[(b'0' + i as u8) as usize] = (52 + i) as u8;
+            i += 1;
+        }
         t[b'+' as usize] = 62;
         t[b'/' as usize] = 63;
         t
@@ -68,8 +77,16 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
             return Err("base64 填充位置无效".to_string());
         }
 
-        let v2 = if has_pad2 { 0 } else { TABLE[chunk[2] as usize] };
-        let v3 = if has_pad3 { 0 } else { TABLE[chunk[3] as usize] };
+        let v2 = if has_pad2 {
+            0
+        } else {
+            TABLE[chunk[2] as usize]
+        };
+        let v3 = if has_pad3 {
+            0
+        } else {
+            TABLE[chunk[3] as usize]
+        };
         if v2 == 255 || v3 == 255 {
             return Err("无效的 base64 字符".to_string());
         }
@@ -83,10 +100,7 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
             return Err("base64 填充位无效".to_string());
         }
 
-        let n = ((v0 as u32) << 18)
-            | ((v1 as u32) << 12)
-            | ((v2 as u32) << 6)
-            | (v3 as u32);
+        let n = ((v0 as u32) << 18) | ((v1 as u32) << 12) | ((v2 as u32) << 6) | (v3 as u32);
         out.push((n >> 16) as u8);
         if !has_pad2 {
             out.push((n >> 8) as u8);

@@ -117,6 +117,35 @@ async fn run_unix_shell_command(
     Ok((body, next_cwd, output.status.success()))
 }
 
+/// One-shot AI execution remains on the async runtime: dropping this future
+/// requests termination of the direct shell child (never a detached spawn_blocking
+/// worker). Descendant processes and side effects cannot be rolled back.
+pub(crate) async fn run_ai_shell_command(command: &str) -> Result<std::process::Output, String> {
+    let mut process = if cfg!(target_os = "windows") {
+        let mut process = Command::new("powershell.exe");
+        process
+            .arg("-NoLogo")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(command);
+        process
+    } else {
+        let mut process = Command::new("/bin/sh");
+        process.arg("-lc").arg(command);
+        process
+    };
+    process
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    process
+        .output()
+        .await
+        .map_err(|error| format!("启动本地命令失败：{error}"))
+}
+
 pub(crate) fn local_pty_size(cols: Option<u16>, rows: Option<u16>) -> PtySize {
     PtySize {
         rows: rows.unwrap_or(32).max(1),
@@ -149,5 +178,56 @@ pub(crate) fn local_pty_command(cwd: &Path) -> CommandBuilder {
         });
         command.cwd(cwd);
         command
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod ai_shell_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn dropping_ai_execution_terminates_the_direct_shell_child() {
+        let marker =
+            std::env::temp_dir().join(format!("pandaterm-ai-pid-{}.txt", uuid::Uuid::new_v4()));
+        let quoted = marker.to_string_lossy().replace('\'', "''");
+        let command = format!(
+            "[System.IO.File]::WriteAllText('{quoted}', [string]$PID); Start-Sleep -Seconds 30"
+        );
+        let task = tokio::spawn(async move { run_ai_shell_command(&command).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                task.abort();
+                let _ = task.await;
+                let _ = std::fs::remove_file(&marker);
+                panic!("test child did not publish its PID");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        task.abort();
+        let _ = task.await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let check = run_ai_shell_command(&format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}")).await.unwrap();
+            if check.status.success() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = run_ai_shell_command(&format!(
+                    "Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"
+                ))
+                .await;
+                let _ = std::fs::remove_file(&marker);
+                panic!("direct AI shell child survived future cancellation");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = std::fs::remove_file(marker);
     }
 }

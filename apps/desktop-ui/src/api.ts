@@ -446,9 +446,15 @@ export type AiProviderConfig = {
   error?: string | null;
 };
 
+export type AiToolCall = { id: string; name: string; arguments: string };
+
 export type AiChatMessage = {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  tool_calls?: AiToolCall[];
+  tool_call_id?: string;
+  name?: string;
+  is_error?: boolean;
 };
 
 export type AiChatResponse = {
@@ -456,18 +462,29 @@ export type AiChatResponse = {
   model: string;
 };
 
+export type AiUsage = {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
+};
+
 export type AiChatStreamEvent = {
   request_id: string;
-  kind: 'started' | 'delta' | 'completed' | 'cancelled' | 'error';
+  protocol?: 'pandaterm.ai.v1' | string;
+  agent_id?: string | null;
+  step_id?: string | null;
+  step_index?: number | null;
+  sequence?: number | null;
+  phase?: string | null;
+  kind: 'started' | 'delta' | 'usage' | 'phase' | 'tool_result' | 'completed' | 'cancelled' | 'error';
   delta?: string | null;
   model?: string | null;
   message?: string | null;
-  /** Agent 模式流式结束后附带的 OpenAI tool_calls */
-  tool_calls?: Array<{
-    id: string;
-    name: string;
-    arguments: string;
-  }> | null;
+  usage?: AiUsage | null;
+  tool_result?: AiToolExecutionResult | null;
+  tool_calls?: AiToolCall[] | null;
 };
 
 export type AiStoredContext = {
@@ -482,12 +499,13 @@ export type AiStoredEditAction = {
   summary: string;
   target_source: string;
   target_label: string;
-  status: 'proposed' | 'reading' | 'ready' | 'applying' | 'applied' | 'rejected' | 'stale' | 'error';
+  status: 'proposed' | 'reading' | 'ready' | 'applying' | 'applied' | 'rejected' | 'cancelled' | 'stale' | 'error';
   edits: Array<{ search: string; replace: string }>;
   is_remote: boolean;
   terminal_id?: string | null;
   error?: string | null;
   continued: boolean;
+  tool_call_id?: string | null;
   created_at: string;
 };
 
@@ -499,7 +517,7 @@ export type AiStoredTerminalAction = {
   context_label: string;
   command: string;
   timeout_ms: number;
-  status: 'proposed' | 'running' | 'completed' | 'rejected' | 'timeout' | 'error';
+  status: 'proposed' | 'running' | 'completed' | 'rejected' | 'timeout' | 'cancelled' | 'error';
   is_remote: boolean;
   terminal_id: string;
   output?: string | null;
@@ -518,7 +536,7 @@ export type AiStoredMcpAction = {
   server_id: string;
   tool_name: string;
   arguments: Record<string, unknown>;
-  status: 'proposed' | 'running' | 'completed' | 'rejected' | 'error';
+  status: 'proposed' | 'running' | 'completed' | 'rejected' | 'cancelled' | 'error';
   content?: string | null;
   is_error: boolean;
   error?: string | null;
@@ -531,8 +549,16 @@ export type AiStoredAction = AiStoredEditAction | AiStoredTerminalAction | AiSto
 
 export type AiStoredMessage = {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'tool';
   content: string;
+  tool_calls?: AiToolCall[];
+  tool_call_id?: string;
+  agent_id?: string;
+  account_id?: string;
+  model?: string;
+  step_index?: number;
+  usage?: AiUsage;
+  phase?: string;
   contexts: AiStoredContext[];
   actions?: AiStoredAction[];
   created_at: string;
@@ -546,7 +572,54 @@ export type AiConversation = {
   created_at: string;
   updated_at: string;
   messages: AiStoredMessage[];
+  tree?: {
+    nodes: Array<{ id: string; parent_id: string | null; message: AiStoredMessage }>;
+    active_leaf_id: string | null;
+  };
 };
+
+export type AiToolExecutionResult = {
+  /** Stable UI action identity; native provider call identity is tool_call_id. */
+  tool_id?: string | null;
+  tool_call_id: string;
+  name: string;
+  status: string;
+  content: string;
+  is_error: boolean;
+  conversation_id?: string | null;
+  agent_id?: string | null;
+  step_index?: number | null;
+};
+
+export type AiToolExecutionMetadata = {
+  tool_id?: string;
+  conversation_id?: string;
+  agent_id?: string;
+  step_index?: number;
+};
+
+export async function executeAiTool(request: {
+  tool_id?: string;
+  tool_call_id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  approved: boolean;
+  timeout_ms?: number;
+} & AiToolExecutionMetadata): Promise<AiToolExecutionResult> {
+  if (!request.approved) throw new Error('工具执行尚未获得授权');
+  return await invoke<AiToolExecutionResult>('execute_ai_tool', { request });
+}
+
+export async function cancelAiTool(toolCallId: string, metadata?: AiToolExecutionMetadata): Promise<AiToolExecutionResult | void> {
+  const request: Record<string, unknown> = {
+    toolCallId,
+    conversationId: metadata?.conversation_id ?? null,
+    agentId: metadata?.agent_id ?? null,
+    stepIndex: metadata?.step_index ?? null,
+  };
+  if (metadata?.tool_id) request.toolId = metadata.tool_id;
+  return await invoke<AiToolExecutionResult | void>('cancel_ai_tool', request);
+}
 
 export type AiTerminalCommandResult = {
   output: string;
@@ -776,12 +849,18 @@ export async function streamAiChat(
   requestId: string,
   messages: AiChatMessage[],
   mode?: 'ask' | 'agent' | null,
+  options?: { conversation_id?: string; agent_id?: string; step_index?: number; account_id?: string; model?: string },
 ): Promise<void> {
   await invoke('ai_chat_stream', {
     request: {
       request_id: requestId,
       messages,
       mode: mode ?? null,
+      conversation_id: options?.conversation_id ?? null,
+      agent_id: options?.agent_id ?? null,
+      step_index: options?.step_index ?? null,
+      account_id: options?.account_id ?? null,
+      model: options?.model ?? null,
     },
   });
 }

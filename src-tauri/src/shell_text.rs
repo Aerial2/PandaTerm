@@ -55,7 +55,9 @@ impl Default for StreamDecoder {
 
 impl StreamDecoder {
     pub fn new() -> Self {
-        Self { pending: Vec::new() }
+        Self {
+            pending: Vec::new(),
+        }
     }
 
     /// 喂入一块原始字节，返回当前可安全上屏的文本（可能为空）。
@@ -181,9 +183,6 @@ mod tests {
     fn one_shot_decode_shell_text_still_works() {
         assert_eq!(decode_shell_text("hello".as_bytes()), "hello");
         assert_eq!(decode_shell_text("中文".as_bytes()), "中文");
-        assert_eq!(
-            normalize_shell_text(decode_shell_text(b"a\r\nb")),
-            "a\nb"
-        );
+        assert_eq!(normalize_shell_text(decode_shell_text(b"a\r\nb")), "a\nb");
     }
 }

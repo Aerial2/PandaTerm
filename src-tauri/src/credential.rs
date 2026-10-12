@@ -89,8 +89,8 @@ pub fn save_credential_vault(vault: &CredentialVault) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("凭据目录创建失败：{error}"))?;
     }
-    let content = serde_json::to_string_pretty(vault)
-        .map_err(|error| format!("凭据序列化失败：{error}"))?;
+    let content =
+        serde_json::to_string_pretty(vault).map_err(|error| format!("凭据序列化失败：{error}"))?;
     atomic_write_text(&path, &content).map_err(|error| format!("凭据保存失败：{error}"))
 }
 
@@ -130,8 +130,12 @@ pub fn resolve_credential(state: &CredentialVaultState, id: &str) -> Result<Stri
         .entries
         .get(id)
         .ok_or_else(|| format!("未找到连接凭据：{id}"))?;
-    unprotect_secret(protected, vault_master_password(state)?, &credential_context(id))
-        .map_err(|error| format!("凭据解密失败：{error}"))
+    unprotect_secret(
+        protected,
+        vault_master_password(state)?,
+        &credential_context(id),
+    )
+    .map_err(|error| format!("凭据解密失败：{error}"))
 }
 
 pub fn store_credential(

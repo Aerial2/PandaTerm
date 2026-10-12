@@ -742,10 +742,7 @@ fn connect(
     // 服务器重装）直接中止建连。全程发生在把凭据交给 CredSSP 之前，MITM 拿不到密码。
     // 键加 "rdp:" 前缀与 SSH 记录分区。
     let fingerprint = public_key_fingerprint(&server_public_key);
-    let host_key = format!(
-        "rdp:{}",
-        crate::format_host_port(&server_name, port)
-    );
+    let host_key = format!("rdp:{}", crate::format_host_port(&server_name, port));
     crate::ensure_host_key_trusted_blocking(app, &host_key, &fingerprint, "RDP")?;
 
     eprintln!("[RDP] TLS 握手成功，开始 CredSSP/NLA 认证");
@@ -1282,14 +1279,19 @@ pub fn run_session(
     input_rx: mpsc::Receiver<RdpInputEvent>,
 ) {
     let config = build_config(&params);
-    let (connection_result, framed) =
-        match connect(&app, config, params.host.clone(), params.port, channel.clone()) {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = ready.send(Err(error));
-                return;
-            }
-        };
+    let (connection_result, framed) = match connect(
+        &app,
+        config,
+        params.host.clone(),
+        params.port,
+        channel.clone(),
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
 
     // 握手期间标签可能已被关闭（StrictMode 双触发 / 用户提前关标签）。
     // 此时立刻丢弃 framed 关闭 TCP，让服务器尽快回收会话，避免残留。

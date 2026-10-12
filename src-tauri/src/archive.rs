@@ -60,12 +60,7 @@ pub fn extract_local_archive(archive_path: &str, dest_dir: &str) -> Result<Strin
                 dest_dir.replace('\'', "''")
             );
             std::process::Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    &ps_script,
-                ])
+                .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
                 .output()
         } else if lower.ends_with(".tar.gz")
             || lower.ends_with(".tgz")

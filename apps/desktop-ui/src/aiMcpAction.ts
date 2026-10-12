@@ -3,6 +3,7 @@ export type AiMcpActionStatus =
   | 'running'
   | 'completed'
   | 'rejected'
+  | 'cancelled'
   | 'error';
 
 export type AiMcpAction = {

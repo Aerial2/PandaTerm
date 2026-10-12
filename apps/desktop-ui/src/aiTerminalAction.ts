@@ -4,6 +4,7 @@ export type AiTerminalActionStatus =
   | 'completed'
   | 'rejected'
   | 'timeout'
+  | 'cancelled'
   | 'error';
 
 export type AiTerminalAction = {

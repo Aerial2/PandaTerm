@@ -1,4 +1,4 @@
-﻿//! Session persistence + credential resolution domain: load/save the session
+//! Session persistence + credential resolution domain: load/save the session
 //! store (JSON), merge imported Xshell sessions, run the one-time legacy
 //! credential migration into the vault, and resolve stored secret ids back to
 //! plaintext for outbound connections.
@@ -35,8 +35,7 @@ pub(crate) fn save_persistent_sessions(sessions: &[Session]) -> Result<(), Strin
 
     let content = serde_json::to_string_pretty(sessions)
         .map_err(|error| format!("连接配置序列化失败：{error}"))?;
-    atomic_write_text(&path, &content)
-        .map_err(|error| format!("连接配置保存失败：{error}"))
+    atomic_write_text(&path, &content).map_err(|error| format!("连接配置保存失败：{error}"))
 }
 
 fn same_session_identity(left: &Session, right: &Session) -> bool {
@@ -141,7 +140,10 @@ pub(crate) fn load_secure_state() -> (Vec<Session>, CredentialVaultState, Option
     (sessions, credentials, session_store_error)
 }
 
-pub(crate) fn resolved_session(session: &Session, credentials: &CredentialVaultState) -> Result<Session, String> {
+pub(crate) fn resolved_session(
+    session: &Session,
+    credentials: &CredentialVaultState,
+) -> Result<Session, String> {
     let mut resolved = session.clone();
     match &mut resolved.auth {
         AuthType::Password { secret_id } => {

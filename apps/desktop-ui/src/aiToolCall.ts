@@ -1,4 +1,5 @@
 import { normalizeTerminalCommand } from './aiTerminalAction';
+import { parseAiEditArguments, type ParsedAiEditResponse } from './aiEditProposal';
 
 export type AiNativeToolCall = {
   id: string;
@@ -23,6 +24,7 @@ export type MappedNativeMcpAction = {
 };
 
 export type MappedNativeToolActions = {
+  proposals: ParsedAiEditResponse['proposals'];
   terminalActions: MappedNativeTerminalAction[];
   mcpActions: MappedNativeMcpAction[];
   errors: string[];
@@ -52,6 +54,7 @@ function parseArgumentsObject(raw: string): Record<string, unknown> {
  * 兼容 fence 协议；两侧结果在 finish 时合并去重。
  */
 export function mapNativeToolCalls(toolCalls: AiNativeToolCall[]): MappedNativeToolActions {
+  const proposals: ParsedAiEditResponse['proposals'] = [];
   const terminalActions: MappedNativeTerminalAction[] = [];
   const mcpActions: MappedNativeMcpAction[] = [];
   const errors: string[] = [];
@@ -64,6 +67,14 @@ export function mapNativeToolCalls(toolCalls: AiNativeToolCall[]): MappedNativeT
     }
     try {
       const args = parseArgumentsObject(call.arguments || '{}');
+      if (proposals.length + terminalActions.length + mcpActions.length >= MAX_ACTIONS) {
+        errors.push(`单条回复最多允许 ${MAX_ACTIONS} 个工具动作`);
+        continue;
+      }
+      if (name === 'propose_file_edit') {
+        proposals.push({ ...parseAiEditArguments(args), toolCallId: call.id || undefined });
+        continue;
+      }
       if (name === 'run_terminal_command') {
         if (terminalActions.length + mcpActions.length >= MAX_ACTIONS) {
           errors.push(`单条回复最多允许 ${MAX_ACTIONS} 个工具动作`);
@@ -120,5 +131,5 @@ export function mapNativeToolCalls(toolCalls: AiNativeToolCall[]): MappedNativeT
     }
   }
 
-  return { terminalActions, mcpActions, errors };
+  return { proposals, terminalActions, mcpActions, errors };
 }

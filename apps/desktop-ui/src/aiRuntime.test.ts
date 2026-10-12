@@ -3,8 +3,10 @@ import type { AiConversation } from './api';
 import {
   fromStoredAiConversation,
   toStoredAiConversation,
+  updateAiConversationMessage,
   type AiConversationState,
 } from './aiRuntime';
+import { aiTreePath, branchAiTree, migrateAiTree, switchAiTree } from './aiConversationTree';
 
 const conversation = (): AiConversationState => ({
   id: '2e9b8336-8fb7-4268-8eb8-84113cf716a4',
@@ -101,6 +103,41 @@ describe('AI runtime persistence', () => {
     expect(restored.messages[0].terminalActions[0].status).toBe('error');
     expect(restored.messages[0].mcpActions[0].status).toBe('error');
     expect(restored.messages[0].terminalActions[0].error).toContain('执行结果未知');
+  });
+
+  it('round-trips inactive branches, actions and pinned request metadata', () => {
+    const current = conversation();
+    const original = { ...current.messages[0], agentId: 'agent', accountId: 'account', model: 'model', usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 } };
+    original.proposals[0].toolCallId = 'edit-call';
+    const tree = branchAiTree(migrateAiTree([original]), null, [{ ...original, id: 'assistant-2', content: 'other branch' }]);
+    const restored = fromStoredAiConversation(toStoredAiConversation({ ...current, tree, messages: aiTreePath(tree) }));
+    expect(restored.messages.map(({ id }) => id)).toEqual(['assistant-2']);
+    expect(restored.tree?.nodes).toHaveLength(2);
+    expect(aiTreePath(switchAiTree(restored.tree!, 'assistant-1'))[0]).toMatchObject({
+      agentId: 'agent', accountId: 'account', model: 'model', usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+      proposals: [{ toolCallId: 'edit-call' }],
+    });
+  });
+
+  it('keeps late inactive-branch action results without changing the active projection', () => {
+    const current = conversation();
+    const tree = branchAiTree(migrateAiTree(current.messages), null, [{ ...current.messages[0], id: 'other' }]);
+    const updated = updateAiConversationMessage({ ...current, tree, messages: aiTreePath(tree) }, 'assistant-1', (message) => ({ ...message, content: 'late result' }));
+    expect(updated.messages[0].id).toBe('other');
+    expect(aiTreePath(updated.tree!, 'assistant-1')[0].content).toBe('late result');
+    expect(fromStoredAiConversation(toStoredAiConversation(updated)).tree?.nodes).toHaveLength(2);
+  });
+
+  it('skips streaming placeholders and reconnects durable descendants to durable ancestors', () => {
+    const current = conversation();
+    const ancestor = current.messages[0];
+    const streaming = { ...ancestor, id: 'stream', status: 'streaming' as const };
+    const descendant = { ...ancestor, id: 'descendant' };
+    const stored = toStoredAiConversation({ ...current, messages: [ancestor, streaming, descendant] });
+    expect(stored.tree?.nodes.map(({ id, parent_id }) => [id, parent_id])).toEqual([[ancestor.id, null], ['descendant', ancestor.id]]);
+    expect(stored.messages.map(({ id }) => id)).toEqual([ancestor.id, 'descendant']);
+    const activeStreaming = toStoredAiConversation({ ...current, messages: [ancestor, streaming] });
+    expect(activeStreaming.tree?.active_leaf_id).toBe(ancestor.id);
   });
 
   it('loads legacy conversations that do not contain actions', () => {

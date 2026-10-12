@@ -10,6 +10,7 @@ export type AiEditProposalStatus =
   | 'applying'
   | 'applied'
   | 'rejected'
+  | 'cancelled'
   | 'stale'
   | 'error';
 
@@ -26,6 +27,7 @@ export type AiEditProposal = {
   terminalId?: string;
   error?: string;
   continued?: boolean;
+  toolCallId?: string;
   createdAt: string;
 };
 
@@ -41,6 +43,7 @@ export type ParsedAiEditResponse = {
     summary: string;
     targetSource: string;
     edits: AiEditOperation[];
+    toolCallId?: string;
   }>;
   errors: string[];
 };
@@ -50,6 +53,27 @@ const MAX_PROPOSALS = 5;
 const MAX_OPERATIONS = 20;
 const MAX_BLOCK_LENGTH = 256_000;
 const MAX_OPERATION_LENGTH = 100_000;
+
+export function parseAiEditArguments(value: unknown): ParsedAiEditResponse['proposals'][number] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('修改参数必须是对象');
+  const parsed = value as ParsedProposal;
+  if (typeof parsed.summary !== 'string' || !parsed.summary.trim()) throw new Error('缺少 summary');
+  if (typeof parsed.target_source !== 'string' || !parsed.target_source.trim()) throw new Error('缺少 target_source');
+  if (!Array.isArray(parsed.edits) || parsed.edits.length === 0 || parsed.edits.length > MAX_OPERATIONS) {
+    throw new Error(`edits 数量必须为 1-${MAX_OPERATIONS}`);
+  }
+  const edits = parsed.edits.map((operation, index) => {
+    if (!operation || typeof operation !== 'object') throw new Error(`第 ${index + 1} 个 edit 无效`);
+    const candidate = operation as Record<string, unknown>;
+    if (typeof candidate.search !== 'string' || candidate.search.length === 0) throw new Error(`第 ${index + 1} 个 edit 缺少 search`);
+    if (typeof candidate.replace !== 'string') throw new Error(`第 ${index + 1} 个 edit 缺少 replace`);
+    if (candidate.search.length > MAX_OPERATION_LENGTH || candidate.replace.length > MAX_OPERATION_LENGTH) {
+      throw new Error(`第 ${index + 1} 个 edit 过大`);
+    }
+    return { search: candidate.search, replace: candidate.replace };
+  });
+  return { summary: parsed.summary.trim().slice(0, 500), targetSource: parsed.target_source.trim(), edits };
+}
 
 export function parseAiEditResponse(content: string): ParsedAiEditResponse {
   const proposals: ParsedAiEditResponse['proposals'] = [];
@@ -67,33 +91,7 @@ export function parseAiEditResponse(content: string): ParsedAiEditResponse {
       continue;
     }
     try {
-      const parsed = JSON.parse(block) as ParsedProposal;
-      if (typeof parsed.summary !== 'string' || !parsed.summary.trim()) {
-        throw new Error('缺少 summary');
-      }
-      if (typeof parsed.target_source !== 'string' || !parsed.target_source.trim()) {
-        throw new Error('缺少 target_source');
-      }
-      if (!Array.isArray(parsed.edits) || parsed.edits.length === 0 || parsed.edits.length > MAX_OPERATIONS) {
-        throw new Error(`edits 数量必须为 1-${MAX_OPERATIONS}`);
-      }
-      const edits = parsed.edits.map((operation, index) => {
-        if (!operation || typeof operation !== 'object') throw new Error(`第 ${index + 1} 个 edit 无效`);
-        const candidate = operation as Record<string, unknown>;
-        if (typeof candidate.search !== 'string' || candidate.search.length === 0) {
-          throw new Error(`第 ${index + 1} 个 edit 缺少 search`);
-        }
-        if (typeof candidate.replace !== 'string') throw new Error(`第 ${index + 1} 个 edit 缺少 replace`);
-        if (candidate.search.length > MAX_OPERATION_LENGTH || candidate.replace.length > MAX_OPERATION_LENGTH) {
-          throw new Error(`第 ${index + 1} 个 edit 过大`);
-        }
-        return { search: candidate.search, replace: candidate.replace };
-      });
-      proposals.push({
-        summary: parsed.summary.trim().slice(0, 500),
-        targetSource: parsed.target_source.trim(),
-        edits,
-      });
+      proposals.push(parseAiEditArguments(JSON.parse(block)));
     } catch (error) {
       errors.push(`修改提案格式无效：${error instanceof Error ? error.message : String(error)}`);
     }
