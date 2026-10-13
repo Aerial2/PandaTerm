@@ -295,7 +295,14 @@ fn collect_local_pid_ports() -> std::collections::HashMap<u32, String> {
     use std::process::Command;
 
     let output = if cfg!(windows) {
-        Command::new("netstat").args(["-ano", "-p", "tcp"]).output()
+        let mut command = Command::new("netstat");
+        command.args(["-ano", "-p", "tcp"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        command.output()
     } else {
         Command::new("sh")
             .arg("-c")

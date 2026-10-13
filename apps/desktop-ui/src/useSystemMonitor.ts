@@ -28,6 +28,7 @@ export function useSystemMonitor({ leftActivity, activePaneTabRef, activePaneTab
   const monitorData = monitorSnapshot.targetKey === monitorTargetKey ? monitorSnapshot.data : null;
   const monitorHistory = monitorSnapshot.targetKey === monitorTargetKey ? monitorSnapshot.history : [];
   const networkBaselineRef = useRef<NetworkBaseline | null>(null);
+  const monitorBaselineTargetRef = useRef<string | null>(null);
   const [isLoadingMonitor, setIsLoadingMonitor] = useState(false);
   const monitorRequestGenerationRef = useRef(0);
   const [processList, setProcessList] = useState<ProcessInfo[]>([]);
@@ -133,10 +134,17 @@ export function useSystemMonitor({ leftActivity, activePaneTabRef, activePaneTab
     }
   }
 
+  // A target change starts a new chart history and network counter baseline.
+  useEffect(() => {
+    if (monitorBaselineTargetRef.current === monitorTargetKey) return;
+    monitorBaselineTargetRef.current = monitorTargetKey;
+    networkBaselineRef.current = null;
+    setMonitorSnapshot({ targetKey: monitorTargetKey, data: null, history: [] });
+  }, [monitorTargetKey]);
+
   // Poll serially so a slow SSH sample cannot overlap with the next request.
   useEffect(() => {
     if (leftActivity !== 'monitor') return;
-    networkBaselineRef.current = null;
     let cancelled = false;
     let timeoutId: number | null = null;
     const poll = async () => {
@@ -147,7 +155,6 @@ export function useSystemMonitor({ leftActivity, activePaneTabRef, activePaneTab
     return () => {
       cancelled = true;
       monitorRequestGenerationRef.current++;
-      networkBaselineRef.current = null;
       if (timeoutId !== null) window.clearTimeout(timeoutId);
     };
   }, [leftActivity, monitorTargetKey]);
