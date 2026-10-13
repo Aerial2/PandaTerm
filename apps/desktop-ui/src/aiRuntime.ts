@@ -37,6 +37,7 @@ export type AiMessage = {
   model?: string;
   stepIndex?: number;
   usage?: AiUsage;
+  durationMs?: number;
   phase?: string;
   contexts: AiContextItem[];
   proposals: AiEditProposal[];
@@ -170,6 +171,7 @@ function toStoredMessage(message: AiMessage): AiStoredMessage {
     model: message.model,
     step_index: message.stepIndex,
     usage: message.usage,
+    duration_ms: message.durationMs,
     phase: message.phase,
     contexts: message.contexts.map(({ kind, label, source }) => ({ kind, label, source: source ?? null })),
     actions: toStoredActions(message),
@@ -297,6 +299,7 @@ function fromStoredMessage(message: AiStoredMessage): AiMessage {
     model: message.model,
     stepIndex: message.step_index,
     usage: message.usage,
+    durationMs: message.duration_ms,
     phase: message.phase,
     contexts: (message.contexts ?? []).map(({ kind, label, source }) => ({ kind, label, source: source ?? undefined, preview: '' })),
     ...fromStoredActions(message.actions),

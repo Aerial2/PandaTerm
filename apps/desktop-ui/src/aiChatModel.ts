@@ -160,12 +160,10 @@ export const AI_EMPTY_SUGGESTIONS: Array<{ label: string; prompt: string }> = [
   { label: '安全检查', prompt: '从运维安全角度检查当前上下文：有没有高风险操作、权限问题或配置隐患？给出简洁清单。' },
 ];
 
-/** 聊天下拉：仅 enabled；当前 model 始终兜底出现 */
+/** 聊天下拉：展示同步后的完整目录；当前 model 始终兜底出现 */
 export function resolveAiChatModelOptions(config: Pick<AiProviderConfig, 'model' | 'models' | 'enabled_models'>) {
   const catalog = resolveAiModelCatalog(config);
-  const options = catalog.enabled_models.filter((item) => catalog.models.includes(item));
-  if (catalog.model && !options.includes(catalog.model)) options.unshift(catalog.model);
-  return options.length > 0 ? options : catalog.models;
+  return catalog.models;
 }
 
 export function isAiAgentContinuationMessage(message: Pick<AiMessage, 'role' | 'contexts'>): boolean {

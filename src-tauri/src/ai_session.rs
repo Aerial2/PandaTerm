@@ -77,6 +77,8 @@ pub(crate) struct AiStoredMessage {
     pub(crate) step_index: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -625,6 +627,9 @@ pub(crate) fn upsert_conversation(
                 if node.message.phase.is_none() {
                     node.message.phase = old_node.message.phase.clone();
                 }
+                if node.message.duration_ms.is_none() {
+                    node.message.duration_ms = old_node.message.duration_ms;
+                }
                 // Missing old action records are history, not a request to delete them.
                 for old_action in &old_node.message.actions {
                     let action_id = |action: &AiStoredAction| match action {
@@ -714,6 +719,7 @@ mod tests {
         result.model = Some("model-1".into());
         result.step_index = Some(4);
         result.phase = Some("tool_pending".into());
+        result.duration_ms = Some(125_000);
         result
     }
 
@@ -771,6 +777,7 @@ mod tests {
         assert_eq!(restored.model.as_deref(), Some("model-1"));
         assert_eq!(restored.step_index, Some(4));
         assert_eq!(restored.phase.as_deref(), Some("tool_pending"));
+        assert_eq!(restored.duration_ms, Some(125_000));
     }
 
     #[test]
@@ -782,6 +789,7 @@ mod tests {
         assert_eq!(restored.model, None);
         assert_eq!(restored.step_index, None);
         assert_eq!(restored.phase, None);
+        assert_eq!(restored.duration_ms, None);
     }
 
     #[test]
@@ -805,6 +813,7 @@ mod tests {
         assert_eq!(restored.model.as_deref(), Some("model-1"));
         assert_eq!(restored.step_index, Some(4));
         assert_eq!(restored.phase.as_deref(), Some("tool_pending"));
+        assert_eq!(restored.duration_ms, Some(125_000));
     }
 
     #[test]

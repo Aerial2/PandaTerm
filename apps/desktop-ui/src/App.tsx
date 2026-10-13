@@ -121,6 +121,8 @@ import {
   CircleOff,
 } from 'lucide-react';
 import { AiMarkdown } from './AiMarkdown';
+import { AiMessageFooter } from './AiMessageFooter';
+import { aiMessagePhaseLabel } from './aiMessageStats';
 import { AiModelIcon } from './AiModelIcon';
 import { AiModeIcon } from './AiModeIcon';
 import { AiSendIcon } from './AiSendIcon';
@@ -4404,11 +4406,15 @@ export function App() {
       ? parseAiAgentTurn(conversation, activeRequest)
       : null;
 
+    const finishedAt = Date.now();
+
     updateAiConversation(activeRequest.conversationId, (current) => ({
       ...current,
       updatedAt: new Date().toISOString(),
       messages: current.messages.map((message) => {
         if (message.id !== activeRequest.assistantMessageId) return message;
+        const startedAt = Date.parse(message.createdAt);
+        const durationMs = Number.isFinite(startedAt) ? Math.max(0, finishedAt - startedAt) : undefined;
         if (agentTurn) {
           return {
             ...message,
@@ -4417,16 +4423,17 @@ export function App() {
             terminalActions: agentTurn.terminalActions,
             mcpActions: agentTurn.mcpActions,
             toolCalls: activeRequest.toolCalls,
+            durationMs,
             status,
           };
         }
         if (status === 'complete') {
-          return { ...message, status, proposals: [], terminalActions: [], mcpActions: [] };
+          return { ...message, durationMs, status, proposals: [], terminalActions: [], mcpActions: [] };
         }
         const content = status === 'error'
           ? `${message.content}${message.content ? '\n\n' : ''}请求失败：${errorMessage}`
           : message.content;
-        return { ...message, content, status };
+        return { ...message, content, durationMs, status };
       }),
     }));
 
@@ -7769,10 +7776,9 @@ export function App() {
                         {message.status === 'error' && <em>失败</em>}
                       </div>
                     )}
-                    {message.role === 'assistant' && (message.phase || message.usage) && (
-                      <div className="ai-message-status">
-                        {message.phase ? <span>{message.phase}</span> : null}
-                        {message.usage ? <span>输入 {message.usage.input_tokens} · 输出 {message.usage.output_tokens} · 总计 {message.usage.total_tokens} tokens</span> : null}
+                    {message.role === 'assistant' && aiMessagePhaseLabel(message) && (
+                      <div className={`ai-message-status${message.status === 'streaming' && message.phase === 'thinking' ? ' is-thinking' : ''}`}>
+                        <span>{aiMessagePhaseLabel(message)}</span>
                       </div>
                     )}
                     {message.contexts.length > 0 && (
@@ -7850,6 +7856,7 @@ export function App() {
                     ) : message.content ? (
                       <div className="ai-message-content">
                         <AiMarkdown content={message.content} />
+                        {message.role === 'assistant' && message.status !== 'streaming' && <AiMessageFooter message={message} />}
                       </div>
                     ) : message.status === 'streaming' ? (
                       <div className="ai-typing" aria-label="正在生成"><i /><i /><i /></div>

@@ -66,6 +66,18 @@ const conversation = (): AiConversationState => ({
 });
 
 describe('AI runtime persistence', () => {
+  it('retains measured duration in the stored message and conversation tree', () => {
+    const current = conversation();
+    current.messages[0].durationMs = 125000;
+    const stored = toStoredAiConversation(current);
+    expect(stored.messages[0].duration_ms).toBe(125000);
+    expect(stored.tree?.nodes[0].message.duration_ms).toBe(125000);
+    expect(fromStoredAiConversation(stored).messages[0].durationMs).toBe(125000);
+    delete stored.messages[0].duration_ms;
+    if (stored.tree) delete stored.tree.nodes[0].message.duration_ms;
+    expect(fromStoredAiConversation(stored).messages[0].durationMs).toBeUndefined();
+  });
+
   it('round-trips durable action state without persisting transient file buffers', () => {
     const stored = toStoredAiConversation(conversation());
     expect(stored.messages[0].actions).toHaveLength(3);

@@ -587,6 +587,7 @@ export type AiStoredMessage = {
   model?: string;
   step_index?: number;
   usage?: AiUsage;
+  duration_ms?: number;
   phase?: string;
   contexts: AiStoredContext[];
   actions?: AiStoredAction[];
