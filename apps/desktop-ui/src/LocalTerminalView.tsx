@@ -20,7 +20,7 @@ const terminalTheme = {
   foreground: '#d4d4d4',
   cursor: '#61afef',
   selectionBackground: 'rgba(97, 175, 239, 0.15)',
-  black: '#23272e',
+  black: '#1E1E1E',
   blue: '#61afef',
   cyan: '#56b6c2',
   green: '#98c379',

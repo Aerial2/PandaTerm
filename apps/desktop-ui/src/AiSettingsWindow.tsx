@@ -912,22 +912,6 @@ export function AiSettingsWindow() {
           >
             {/* Cursor 风格：左侧导航 + 右侧内容 */}
             <aside className="ai-settings-sidebar" aria-label="设置导航">
-              <div className="ai-settings-sidebar-top">
-                <div className="ai-settings-sidebar-brand">
-                  <Settings size={14} aria-hidden />
-                  <span>Settings</span>
-                </div>
-                <label className="ai-settings-sidebar-search">
-                  <Search size={13} aria-hidden />
-                  <input
-                    type="search"
-                    value={aiSettingsNavQuery}
-                    placeholder="Search settings"
-                    spellCheck={false}
-                    onChange={(event) => setAiSettingsNavQuery(event.target.value)}
-                  />
-                </label>
-              </div>
               <nav className="ai-settings-nav">
                 {(() => {
                   const navItems = ([

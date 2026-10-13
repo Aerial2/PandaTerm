@@ -205,7 +205,6 @@ export function TopMenubar({
                   role="menuitem"
                   onClick={() => runAndClose(onOpenConnectionCreate)}
                 >
-                  <Plus size={14} />
                   <span>新建连接</span>
                 </button>
                 <button
@@ -213,7 +212,6 @@ export function TopMenubar({
                   role="menuitem"
                   onClick={() => runAndClose(onOpenConnectionManage)}
                 >
-                  <Server size={14} />
                   <span>连接管理</span>
                 </button>
               </div>
@@ -238,8 +236,7 @@ export function TopMenubar({
                   role="menuitem"
                   onClick={() => runAndClose(onOpenAiSettings)}
                 >
-                  <Settings size={14} />
-                  <span>AI 设置</span>
+                  <span>设置</span>
                 </button>
               </div>
             )}
@@ -263,7 +260,6 @@ export function TopMenubar({
                   role="menuitem"
                   onClick={() => runAndClose(() => onSetLeftActivity('recent'))}
                 >
-                  <ActivityBarIcon name="files" size={14} />
                   <span>最近文件</span>
                 </button>
                 <button
@@ -271,7 +267,6 @@ export function TopMenubar({
                   role="menuitem"
                   onClick={() => runAndClose(() => onSetLeftActivity('files'))}
                 >
-                  <FolderOpen size={14} />
                   <span>文件资源管理器</span>
                 </button>
                 <button
@@ -279,7 +274,6 @@ export function TopMenubar({
                   role="menuitem"
                   onClick={() => runAndClose(() => onSetLeftActivity('monitor'))}
                 >
-                  <Cpu size={14} />
                   <span>系统监控</span>
                 </button>
                 <button
@@ -287,7 +281,6 @@ export function TopMenubar({
                   role="menuitem"
                   onClick={() => runAndClose(() => onSetLeftActivity('processes'))}
                 >
-                  <Activity size={14} />
                   <span>进程列表</span>
                 </button>
                 <button
@@ -295,7 +288,6 @@ export function TopMenubar({
                   role="menuitem"
                   onClick={() => runAndClose(() => onSetLeftActivity('ai'))}
                 >
-                  <Bot size={14} />
                   <span>AI 助手</span>
                 </button>
               </div>
@@ -320,7 +312,6 @@ export function TopMenubar({
                   role="menuitem"
                   onClick={() => runAndClose(openAbout)}
                 >
-                  <Info size={14} />
                   <span>关于</span>
                 </button>
               </div>

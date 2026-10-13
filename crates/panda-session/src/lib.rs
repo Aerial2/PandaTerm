@@ -134,6 +134,16 @@ impl SessionCatalog {
         Ok(())
     }
 
+    pub fn mark_connected(&mut self, id: Uuid, timestamp: String) -> SessionResult<()> {
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .ok_or(SessionError::NotFound(id))?;
+        session.last_connected_at = Some(timestamp);
+        Ok(())
+    }
+
     pub fn remove(&mut self, id: Uuid) -> SessionResult<()> {
         let before = self.sessions.len();
         self.sessions.retain(|session| session.id != id);
@@ -228,6 +238,30 @@ mod tests {
         catalog.upsert(make_session(id, "  ", &[" linux ", "", "linux"])).unwrap();
         assert_eq!(catalog.all()[0].group, "Custom");
         assert_eq!(catalog.all()[0].tags, vec!["linux"]);
+    }
+
+    #[test]
+    fn mark_connected_updates_the_matching_session_timestamp() {
+        let id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let mut catalog = SessionCatalog::new(vec![
+            make_session(id, "Servers", &[]),
+            make_session(other_id, "Servers", &[]),
+        ]);
+
+        catalog
+            .mark_connected(id, "2026-10-13T12:34:56+00:00".into())
+            .unwrap();
+
+        assert_eq!(
+            catalog.all()[0].last_connected_at.as_deref(),
+            Some("2026-10-13T12:34:56+00:00")
+        );
+        assert_eq!(catalog.all()[1].last_connected_at, None);
+        assert!(matches!(
+            catalog.mark_connected(Uuid::new_v4(), "2026-10-13T12:34:56+00:00".into()),
+            Err(SessionError::NotFound(_))
+        ));
     }
 
     #[test]

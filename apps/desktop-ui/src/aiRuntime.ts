@@ -38,6 +38,8 @@ export type AiMessage = {
   stepIndex?: number;
   usage?: AiUsage;
   durationMs?: number;
+  generationDurationMs?: number;
+  firstTokenDurationMs?: number;
   phase?: string;
   contexts: AiContextItem[];
   proposals: AiEditProposal[];
@@ -172,6 +174,8 @@ function toStoredMessage(message: AiMessage): AiStoredMessage {
     step_index: message.stepIndex,
     usage: message.usage,
     duration_ms: message.durationMs,
+    generation_duration_ms: message.generationDurationMs,
+    first_token_duration_ms: message.firstTokenDurationMs,
     phase: message.phase,
     contexts: message.contexts.map(({ kind, label, source }) => ({ kind, label, source: source ?? null })),
     actions: toStoredActions(message),
@@ -300,6 +304,8 @@ function fromStoredMessage(message: AiStoredMessage): AiMessage {
     stepIndex: message.step_index,
     usage: message.usage,
     durationMs: message.duration_ms,
+    generationDurationMs: message.generation_duration_ms,
+    firstTokenDurationMs: message.first_token_duration_ms,
     phase: message.phase,
     contexts: (message.contexts ?? []).map(({ kind, label, source }) => ({ kind, label, source: source ?? undefined, preview: '' })),
     ...fromStoredActions(message.actions),

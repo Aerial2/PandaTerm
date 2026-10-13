@@ -1011,7 +1011,7 @@ impl SseDecoder {
     }
 }
 
-fn merge_claude_usage(response: &mut ProviderResponse, value: &Value) {
+pub(crate) fn merge_claude_usage(usage: &mut Option<Usage>, value: &Value) {
     let Some(value) = value
         .pointer("/message/usage")
         .or_else(|| value.get("usage"))
@@ -1019,7 +1019,7 @@ fn merge_claude_usage(response: &mut ProviderResponse, value: &Value) {
     else {
         return;
     };
-    let usage = response.usage.get_or_insert_with(Usage::default);
+    let usage = usage.get_or_insert_with(Usage::default);
     // Anthropic sends cumulative output counts, not increments. A delta which
     // omits input/cache counts must retain the counts from message_start.
     if let Some(input) = value.get("input_tokens").and_then(Value::as_u64) {
@@ -1241,7 +1241,7 @@ pub async fn stream_request(
                     response.content.push_str(delta);
                 }
                 if kind.is_claude() {
-                    merge_claude_usage(&mut response, &value);
+                    merge_claude_usage(&mut response.usage, &value);
                 } else if let Some(usage) = &event.usage {
                     response.usage = Some(usage.clone());
                 }

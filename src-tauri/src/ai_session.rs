@@ -79,6 +79,10 @@ pub(crate) struct AiStoredMessage {
     pub(crate) phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) generation_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) first_token_duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,7 +327,9 @@ fn validate_message(message: &AiStoredMessage) -> Result<usize, String> {
         ("模型", message.model.as_deref(), 200usize),
         ("阶段", message.phase.as_deref(), 100usize),
     ] {
-        if value.is_some_and(|value| value.is_empty() || value.len() > max_len || value.chars().any(char::is_control)) {
+        if value.is_some_and(|value| {
+            value.is_empty() || value.len() > max_len || value.chars().any(char::is_control)
+        }) {
             return Err(format!("AI 会话{}元数据无效", label));
         }
     }
@@ -630,6 +636,12 @@ pub(crate) fn upsert_conversation(
                 if node.message.duration_ms.is_none() {
                     node.message.duration_ms = old_node.message.duration_ms;
                 }
+                if node.message.generation_duration_ms.is_none() {
+                    node.message.generation_duration_ms = old_node.message.generation_duration_ms;
+                }
+                if node.message.first_token_duration_ms.is_none() {
+                    node.message.first_token_duration_ms = old_node.message.first_token_duration_ms;
+                }
                 // Missing old action records are history, not a request to delete them.
                 for old_action in &old_node.message.actions {
                     let action_id = |action: &AiStoredAction| match action {
@@ -656,7 +668,7 @@ pub(crate) fn upsert_conversation(
         if store.conversations.len() >= 100 {
             return Err("最多保存 100 个 AI 会话，请先删除旧会话".to_string());
         }
-        store.conversations.insert(0, incoming);
+        store.conversations.push(incoming);
     }
     store.version = AI_CONVERSATION_VERSION;
     Ok(())
@@ -681,6 +693,24 @@ mod tests {
             "messages": [message("root"), message("old")]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn new_conversations_append_and_updates_preserve_order() {
+        let first = conversation();
+        let mut second = conversation();
+        second.id = "00000000-0000-0000-0000-000000000002".into();
+        let mut store = AiConversationStore::default();
+        upsert_conversation(&mut store, first.clone()).unwrap();
+        upsert_conversation(&mut store, second.clone()).unwrap();
+        let mut updated = first.clone();
+        updated.title = "updated".into();
+        upsert_conversation(&mut store, updated).unwrap();
+        let restored = decode_store(&encode_store(&store).unwrap()).unwrap();
+        assert_eq!(restored.conversations.len(), 2);
+        assert_eq!(restored.conversations[0].id, first.id);
+        assert_eq!(restored.conversations[0].title, "updated");
+        assert_eq!(restored.conversations[1].id, second.id);
     }
 
     fn branch() -> AiConversation {
@@ -720,6 +750,8 @@ mod tests {
         result.step_index = Some(4);
         result.phase = Some("tool_pending".into());
         result.duration_ms = Some(125_000);
+        result.generation_duration_ms = Some(100_000);
+        result.first_token_duration_ms = Some(1_250);
         result
     }
 
@@ -778,6 +810,8 @@ mod tests {
         assert_eq!(restored.step_index, Some(4));
         assert_eq!(restored.phase.as_deref(), Some("tool_pending"));
         assert_eq!(restored.duration_ms, Some(125_000));
+        assert_eq!(restored.generation_duration_ms, Some(100_000));
+        assert_eq!(restored.first_token_duration_ms, Some(1_250));
     }
 
     #[test]
@@ -790,6 +824,8 @@ mod tests {
         assert_eq!(restored.step_index, None);
         assert_eq!(restored.phase, None);
         assert_eq!(restored.duration_ms, None);
+        assert_eq!(restored.generation_duration_ms, None);
+        assert_eq!(restored.first_token_duration_ms, None);
     }
 
     #[test]
@@ -814,6 +850,8 @@ mod tests {
         assert_eq!(restored.step_index, Some(4));
         assert_eq!(restored.phase.as_deref(), Some("tool_pending"));
         assert_eq!(restored.duration_ms, Some(125_000));
+        assert_eq!(restored.generation_duration_ms, Some(100_000));
+        assert_eq!(restored.first_token_duration_ms, Some(1_250));
     }
 
     #[test]

@@ -69,13 +69,28 @@ describe('AI runtime persistence', () => {
   it('retains measured duration in the stored message and conversation tree', () => {
     const current = conversation();
     current.messages[0].durationMs = 125000;
+    current.messages[0].generationDurationMs = 25000;
+    current.messages[0].firstTokenDurationMs = 1250;
     const stored = toStoredAiConversation(current);
     expect(stored.messages[0].duration_ms).toBe(125000);
-    expect(stored.tree?.nodes[0].message.duration_ms).toBe(125000);
+    expect(stored.messages[0].generation_duration_ms).toBe(25000);
+    expect(stored.messages[0].first_token_duration_ms).toBe(1250);
+    expect(stored.tree?.nodes[0].message.generation_duration_ms).toBe(25000);
+    expect(stored.tree?.nodes[0].message.first_token_duration_ms).toBe(1250);
     expect(fromStoredAiConversation(stored).messages[0].durationMs).toBe(125000);
+    expect(fromStoredAiConversation(stored).messages[0].generationDurationMs).toBe(25000);
+    expect(fromStoredAiConversation(stored).messages[0].firstTokenDurationMs).toBe(1250);
     delete stored.messages[0].duration_ms;
-    if (stored.tree) delete stored.tree.nodes[0].message.duration_ms;
+    delete stored.messages[0].generation_duration_ms;
+    delete stored.messages[0].first_token_duration_ms;
+    if (stored.tree) {
+      delete stored.tree.nodes[0].message.duration_ms;
+      delete stored.tree.nodes[0].message.generation_duration_ms;
+      delete stored.tree.nodes[0].message.first_token_duration_ms;
+    }
     expect(fromStoredAiConversation(stored).messages[0].durationMs).toBeUndefined();
+    expect(fromStoredAiConversation(stored).messages[0].generationDurationMs).toBeUndefined();
+    expect(fromStoredAiConversation(stored).messages[0].firstTokenDurationMs).toBeUndefined();
   });
 
   it('round-trips durable action state without persisting transient file buffers', () => {

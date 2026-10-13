@@ -3,11 +3,11 @@ import { type ITheme } from '@xterm/xterm';
 import type { LocalTerminalProfile, Session } from './api';
 
 export const oneDarkProTerminalTheme: ITheme = {
-  background: '#23272e',
+  background: '#1E1E1E',
   foreground: '#e6e6e6',
   cursor: '#61afef',
   selectionBackground: 'rgba(97, 175, 239, 0.15)',
-  black: '#23272e',
+  black: '#1E1E1E',
   blue: '#61afef',
   cyan: '#56b6c2',
   green: '#98c379',

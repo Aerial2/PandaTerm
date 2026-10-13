@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { aiMessagePhaseLabel, aiOutputTokenRate, formatAiDuration, formatAiTokens } from './aiMessageStats';
+import { aiMessagePhaseLabel, aiOutputTokenRate, formatAiDuration, formatAiFirstTokenDuration, formatAiTokens } from './aiMessageStats';
 
 describe('AI message statistics', () => {
   it('formats elapsed time across minute boundaries', () => {
@@ -9,17 +9,24 @@ describe('AI message statistics', () => {
     expect(formatAiDuration(0)).toBe('0分0秒');
   });
 
+  it('formats time to first token with tenths of a second', () => {
+    expect(formatAiFirstTokenDuration(1250)).toBe('1.3秒');
+    expect(formatAiFirstTokenDuration(60_000)).toBe('1分0秒');
+    expect(formatAiFirstTokenDuration(undefined)).toBeUndefined();
+  });
+
   it('does not invent elapsed time or throughput for legacy messages', () => {
     expect(formatAiDuration(undefined)).toBeUndefined();
     expect(formatAiDuration(NaN)).toBeUndefined();
     expect(formatAiDuration(-1)).toBeUndefined();
-    expect(aiOutputTokenRate({ durationMs: 0, usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } })).toBeUndefined();
+    expect(aiOutputTokenRate({ generationDurationMs: 0, usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } })).toBeUndefined();
     expect(aiOutputTokenRate({})).toBeUndefined();
     expect(aiMessagePhaseLabel({ status: 'complete', phase: 'completed' })).toBe('已处理');
   });
 
   it('uses output tokens for speed and total tokens for the compact total', () => {
-    expect(aiOutputTokenRate({ durationMs: 125_000, usage: { input_tokens: 273375, output_tokens: 7625, total_tokens: 281000 } })).toBe('61 token/s');
+    expect(aiOutputTokenRate({ generationDurationMs: 25_000, usage: { input_tokens: 273375, output_tokens: 7625, total_tokens: 281000 } })).toBe('305 token/s');
+    expect(aiOutputTokenRate({ generationDurationMs: 125_000, usage: { input_tokens: 273375, output_tokens: 7625, total_tokens: 281000 } })).toBe('61 token/s');
     expect(formatAiTokens(281000)).toBe('281.0k tokens');
     expect(formatAiTokens(999)).toBe('999 tokens');
     expect(formatAiTokens(1500000)).toBe('1.5m tokens');

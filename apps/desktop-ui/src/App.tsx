@@ -18,8 +18,10 @@ import { scrollHorizontallyOnWheel } from './wheelScroll';
 import { VscodeFileIcon } from './FileIcon';
 import { ResourceBottomPanel } from './ResourceBottomPanel';
 import { RecentFilesPanel } from './RecentFilesPanel';
+import { AiSessionTabs } from './AiSessionTabs';
 import { ActivityBarIcon } from './ActivityBarIcon';
 import { useRecentFiles } from './useRecentFiles';
+import { recentSessions } from './recentSessionsModel';
 import { StatusBar } from './StatusBar';
 import {
   ARCHIVE_FORMAT_OPTIONS,
@@ -69,7 +71,7 @@ import {
   type WorkspaceTab,
 } from './terminalLayout';
 import type { ActivityPanel, LeftActivity } from './activity';
-import { recentFileMatchesServer, filterRecentFiles, type RecentFile } from './recentFilesModel';
+import { recentFileMatchesServer, type RecentFile } from './recentFilesModel';
 import { TopMenubar } from './TopMenubar';
 import {
   ArrowLeft,
@@ -113,6 +115,7 @@ import {
   Paperclip,
   Sparkles,
   RotateCcw,
+  MessageSquare,
   MessageSquarePlus,
   Store,
   Zap,
@@ -376,14 +379,51 @@ export function App() {
     records: recentFiles,
     loading: recentFilesLoading,
     error: recentFilesError,
-    query: recentFilesQuery,
-    setQuery: setRecentFilesQuery,
     recordOpen: recordRecentFileOpen,
     remove: removeRecentFile,
-    clear: clearRecentFiles,
-    currentSessionIds,
+    sessions: recentFileSessions,
     refreshSessions: refreshRecentFileSessions,
   } = useRecentFiles();
+  const [homeSessions, setHomeSessions] = useState<Session[]>([]);
+  const [homeSessionsLoading, setHomeSessionsLoading] = useState(true);
+  const [homeSessionsError, setHomeSessionsError] = useState(false);
+  const [homeSessionsRefreshKey, setHomeSessionsRefreshKey] = useState(0);
+  const visibleHomeSessions = useMemo(() => recentSessions(homeSessions), [homeSessions]);
+
+  useEffect(() => {
+    let disposed = false;
+    let requestId = 0;
+    const refresh = async () => {
+      const currentRequestId = ++requestId;
+      setHomeSessionsLoading(true);
+      try {
+        const sessions = await listSessions();
+        if (disposed || currentRequestId !== requestId) return;
+        setHomeSessions(sessions);
+        setHomeSessionsError(false);
+      } catch {
+        if (disposed || currentRequestId !== requestId) return;
+        setHomeSessionsError(true);
+      } finally {
+        if (!disposed && currentRequestId === requestId) setHomeSessionsLoading(false);
+      }
+    };
+
+    void refresh();
+    window.addEventListener('focus', refresh);
+    let unlisten: (() => void) | undefined;
+    void listen('sessions-changed', refresh).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    }).catch(() => {});
+
+    return () => {
+      disposed = true;
+      window.removeEventListener('focus', refresh);
+      unlisten?.();
+    };
+  }, [homeSessionsRefreshKey]);
+
   useEffect(() => {
     if (leftActivity !== 'recent') return;
     void refreshRecentFileSessions();
@@ -521,6 +561,7 @@ export function App() {
     mode: AiConversationMode;
     content: string;
     toolCalls: AiNativeToolCall[];
+    firstTokenAt?: number;
     protocolRepairAttempt: boolean;
     agentId: string;
     stepIndex?: number;
@@ -4144,6 +4185,7 @@ export function App() {
         });
       }
       if (payload.kind === 'delta' && payload.delta) {
+        activeRequest.firstTokenAt ??= Date.now();
         activeRequest.content += payload.delta;
         updateAiConversation(activeRequest.conversationId, (conversation) => ({
           ...conversation,
@@ -4415,6 +4457,12 @@ export function App() {
         if (message.id !== activeRequest.assistantMessageId) return message;
         const startedAt = Date.parse(message.createdAt);
         const durationMs = Number.isFinite(startedAt) ? Math.max(0, finishedAt - startedAt) : undefined;
+        const firstTokenDurationMs = activeRequest.firstTokenAt === undefined || !Number.isFinite(startedAt)
+          ? undefined
+          : Math.max(0, activeRequest.firstTokenAt - startedAt);
+        const generationDurationMs = activeRequest.firstTokenAt === undefined
+          ? undefined
+          : Math.max(0, finishedAt - activeRequest.firstTokenAt);
         if (agentTurn) {
           return {
             ...message,
@@ -4424,16 +4472,18 @@ export function App() {
             mcpActions: agentTurn.mcpActions,
             toolCalls: activeRequest.toolCalls,
             durationMs,
+            generationDurationMs,
+            firstTokenDurationMs,
             status,
           };
         }
         if (status === 'complete') {
-          return { ...message, durationMs, status, proposals: [], terminalActions: [], mcpActions: [] };
+          return { ...message, durationMs, generationDurationMs, firstTokenDurationMs, status, proposals: [], terminalActions: [], mcpActions: [] };
         }
         const content = status === 'error'
           ? `${message.content}${message.content ? '\n\n' : ''}请求失败：${errorMessage}`
           : message.content;
-        return { ...message, content, durationMs, status };
+        return { ...message, content, durationMs, generationDurationMs, firstTokenDurationMs, status };
       }),
     }));
 
@@ -6188,7 +6238,7 @@ export function App() {
   function createNewAiConversation() {
     const conversation = createAiConversationState();
     setAiWorkspace((current) => ({
-      conversations: [conversation, ...current.conversations],
+      conversations: [...current.conversations, conversation],
       activeConversationId: conversation.id,
     }));
     setPendingAiContexts([]);
@@ -6204,25 +6254,17 @@ export function App() {
     cancelEditUserMessage();
   }
 
-  function removeAiConversation(conversation: AiConversationState) {
-    setConfirmDialog({
-      title: '删除 AI 会话',
-      message: `确定删除“${conversation.title}”吗？此操作不会删除任何项目文件。`,
-      confirmLabel: '删除',
-      danger: true,
-      onConfirm: async () => {
-        if (aiActiveRequestRef.current?.conversationId === conversation.id) {
-          await stopCurrentAiGeneration();
-        }
-        const remaining = aiConversations.filter((item) => item.id !== conversation.id);
-        const fallback = remaining[0] ?? createAiConversationState();
-        setAiWorkspace({
-          conversations: remaining.length > 0 ? remaining : [fallback],
-          activeConversationId: fallback.id,
-        });
-        await deleteAiConversation(conversation.id);
-      },
+  async function removeAiConversation(conversation: AiConversationState) {
+    if (aiActiveRequestRef.current?.conversationId === conversation.id) {
+      await stopCurrentAiGeneration();
+    }
+    const remaining = aiConversations.filter((item) => item.id !== conversation.id);
+    const fallback = remaining[0] ?? createAiConversationState();
+    setAiWorkspace({
+      conversations: remaining.length > 0 ? remaining : [fallback],
+      activeConversationId: fallback.id,
     });
+    await deleteAiConversation(conversation.id);
   }
 
   function formatBytes(bytes: number): string {
@@ -7260,28 +7302,6 @@ export function App() {
     );
   }
 
-  const recentServer = activePaneTab && !isLocalResourceTab(activePaneTab)
-    ? activePaneTab.session
-    : null;
-  const recentServerIdentity = recentServer ? {
-    session_id: recentServer.id,
-    protocol: recentServer.protocol ?? 'ssh' as const,
-    host: recentServer.host,
-    port: recentServer.port,
-    username: recentServer.username,
-  } : null;
-  const visibleRecentFiles = recentServerIdentity
-    ? filterRecentFiles(
-      recentFiles.filter((record) => recentFileMatchesServer(record, recentServerIdentity, currentSessionIds)),
-      { query: '' },
-    )
-    : [];
-  const recentConnectionMessage = !recentServer
-    ? '请先选择一个远程服务器连接'
-    : activePaneTab?.status === 'connected'
-      ? null
-      : '当前服务器未连接，请先连接后再打开文件';
-
   return (
     <main className="ssh-workbench" onDragOver={handleGlobalDragOver} onDrop={handleGlobalDrop}>
       <TopMenubar
@@ -7352,24 +7372,12 @@ export function App() {
           </div>
           {leftActivity === 'recent' && (
             <RecentFilesPanel
-              records={visibleRecentFiles}
+              records={recentFiles}
+              sessions={recentFileSessions}
               loading={recentFilesLoading}
               error={recentFilesError}
-              query={recentFilesQuery}
-              onQueryChange={setRecentFilesQuery}
-              connectionMessage={recentConnectionMessage}
               onRemove={(record) => { void removeRecentFile(record); }}
               onOpen={(record) => { void openRecentFile(record); }}
-              onClear={() => {
-                const snapshot = [...visibleRecentFiles];
-                if (snapshot.length === 0) return;
-                requestConfirm({
-                  title: '清空最近文件',
-                  message: '只会移除当前服务器的打开记录，不会删除远程文件。确定继续吗？',
-                  confirmLabel: '清空记录',
-                  onConfirm: () => { void clearRecentFiles(snapshot); },
-                });
-              }}
             />
           )}
           {leftActivity === 'files' && (
@@ -7681,7 +7689,7 @@ export function App() {
             </div>
 
             {/* Cursor 风格：会话 tabs，hover 显示删除 */}
-            <div className="ai-session-tabs" role="tablist" aria-label="AI 会话" onWheel={scrollHorizontallyOnWheel}>
+            <AiSessionTabs label="AI 会话" tabList activeId={activeAiConversation?.id}>
               {aiConversations.map((conversation) => {
                 const isActive = conversation.id === activeAiConversation?.id;
                 return (
@@ -7700,6 +7708,7 @@ export function App() {
                       }
                     }}
                   >
+                    <MessageSquare className="ai-session-tab-icon" size={13} strokeWidth={1.8} aria-hidden />
                     <span className="ai-session-tab-title">{conversation.title || '新对话'}</span>
                     <button
                       type="button"
@@ -7708,7 +7717,7 @@ export function App() {
                       aria-label={`删除 ${conversation.title || '新对话'}`}
                       onClick={(event) => {
                         event.stopPropagation();
-                        removeAiConversation(conversation);
+                        void removeAiConversation(conversation);
                       }}
                     >
                       <X size={12} />
@@ -7716,14 +7725,14 @@ export function App() {
                   </div>
                 );
               })}
-            </div>
+            </AiSessionTabs>
 
             {activeAiConversation && (() => {
               const tree = migrateAiTree(activeAiConversation.messages, activeAiConversation.tree);
               const leaves = aiTreeLeaves(tree);
               if (leaves.length < 2 && (!tree.active_leaf_id || leaves.some(({ id }) => id === tree.active_leaf_id))) return null;
               return (
-                <div className="ai-session-tabs" aria-label="会话分支">
+                <AiSessionTabs label="会话分支" activeId={tree.active_leaf_id}>
                   {leaves.map((leaf, index) => (
                     <button type="button" key={leaf.id}
                       className={tree.active_leaf_id === leaf.id ? 'ai-session-tab active' : 'ai-session-tab'}
@@ -7732,32 +7741,13 @@ export function App() {
                       分支 {index + 1}
                     </button>
                   ))}
-                </div>
+                </AiSessionTabs>
               );
             })()}
             {aiConversationError && <div className="ai-conversation-error">{aiConversationError}</div>}
 
             <div ref={aiMessageListRef} className="ai-message-list">
-              {aiMessages.length === 0 ? (
-                <div className="ai-empty-state">
-                  <div className="ai-empty-icon"><Bot size={24} /></div>
-                  <strong>可以开始工作了</strong>
-                  <span>输入问题，或使用 @ 引用终端、选中文本和项目文件。</span>
-                  <div className="ai-empty-suggestions">
-                    {AI_EMPTY_SUGGESTIONS.map((item) => (
-                      <button
-                        key={item.label}
-                        type="button"
-                        className="ai-empty-chip"
-                        disabled={isAiGenerating}
-                        onClick={() => setAiInput(item.prompt)}
-                      >
-                        {item.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ) : aiMessages.map((message) => {
+              {aiMessages.length > 0 && aiMessages.map((message) => {
                 const isUser = message.role === 'user';
                 const isEditingUser = isUser && editingUserMessageId === message.id;
                 const isContinuation = isAiAgentContinuationMessage(message);
@@ -8048,29 +8038,6 @@ export function App() {
             </div>
 
             <div className="ai-composer">
-              <div className="ai-context-toolbar">
-                <button
-                  type="button"
-                  className="ai-context-add"
-                  title="添加上下文"
-                  onClick={() => setIsAiMentionOpen((current) => !current)}
-                >
-                  <Paperclip size={12} />@
-                </button>
-                {pendingAiContexts.map((context, index) => (
-                  <span className="ai-pending-context" key={`${context.kind}-${context.source ?? context.label}-${index}`}>
-                    {context.label}
-                    <button
-                      type="button"
-                      title="移除上下文"
-                      onClick={() => setPendingAiContexts((current) => current.filter((_, itemIndex) => itemIndex !== index))}
-                    >
-                      <X size={10} />
-                    </button>
-                  </span>
-                ))}
-                {pendingAiContexts.length === 0 && <span className="ai-context-hint">@ 添加上下文，每次读取都会确认</span>}
-              </div>
               {isAiMentionOpen && (
                 <div className="ai-mention-menu">
                   <strong>添加上下文</strong>
@@ -8282,7 +8249,7 @@ export function App() {
                             <div className="ai-composer-menu ai-composer-menu-auto-run">
                               <button
                                 type="button"
-                                className={`ai-composer-trigger muted ai-auto-run-toggle${aiAutoRunPolicy !== 'ask' ? ' on' : ''}${aiComposerMenu === 'autoRun' ? ' open' : ''}`}
+                                className={`ai-composer-trigger muted ai-auto-run-toggle${aiAutoRunPolicy !== 'ask' ? ' on' : ''}${aiAutoRunPolicy === 'full' ? ' full' : ''}${aiComposerMenu === 'autoRun' ? ' open' : ''}`}
                                 aria-label="自动执行权限"
                                 aria-haspopup="listbox"
                                 aria-expanded={aiComposerMenu === 'autoRun'}
@@ -8730,12 +8697,52 @@ export function App() {
               />
             ) : !activeTab ? (
               <div className="empty-workspace">
-                <h2>没有活动标签页</h2>
-                <p>点 + 打开连接管理，或从侧边栏发起连接。</p>
-                <button className="empty-primary-action" onClick={() => openNewConnectionTab()}>
-                  <Plus size={17} />
-                  <span>新建连接</span>
-                </button>
+                <div className="empty-welcome-content">
+                  <div className="empty-welcome-actions">
+                    <button type="button" className="empty-welcome-action" onClick={() => void openConnectionWindow('create')}>
+                      <Plus size={18} aria-hidden="true" />
+                      <span>新建连接</span>
+                    </button>
+                    <button type="button" className="empty-welcome-action" onClick={() => void openConnectionWindow('manage')}>
+                      <Server size={18} aria-hidden="true" />
+                      <span>打开连接</span>
+                    </button>
+                  </div>
+
+                  <section className="empty-recent-servers" aria-labelledby="empty-recent-servers-title">
+                    <header className="empty-recent-servers-header">
+                      <h2 id="empty-recent-servers-title">最近服务器</h2>
+                      <button type="button" onClick={() => void openConnectionWindow('manage')}>
+                        查看全部 <ArrowRight size={14} aria-hidden="true" />
+                      </button>
+                    </header>
+                    {homeSessionsLoading ? (
+                      <p className="empty-recent-servers-message" role="status">正在加载服务器...</p>
+                    ) : homeSessionsError ? (
+                      <div className="empty-recent-servers-message" role="alert">
+                        <span>无法加载服务器列表</span>
+                        <button type="button" onClick={() => setHomeSessionsRefreshKey((key) => key + 1)}>重试</button>
+                      </div>
+                    ) : visibleHomeSessions.length === 0 ? (
+                      <p className="empty-recent-servers-message">暂无已保存的服务器</p>
+                    ) : (
+                      <div className="empty-recent-servers-list">
+                        {visibleHomeSessions.map((session) => (
+                          <button
+                            type="button"
+                            className="empty-recent-server"
+                            key={session.id}
+                            title={`${session.name} · ${session.username}@${session.host}:${session.port}`}
+                            onClick={() => void openConnectionPanelSession(session)}
+                          >
+                            <span className="empty-recent-server-name"><Server size={14} aria-hidden="true" />{session.name}</span>
+                            <span className="empty-recent-server-host">{session.host}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+                </div>
               </div>
             ) : (activeTab.kind === 'terminal' || activeTab.kind === 'rdp') ? (
               <div

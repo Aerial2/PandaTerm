@@ -260,7 +260,7 @@ export function EditorPanel({
         { token: 'variable', foreground: 'e06c75' },
       ],
       colors: {
-        'editor.background': '#23272e',
+        'editor.background': '#1E1E1E',
         'editor.foreground': '#e6e6e6',
         'editorLineNumber.foreground': '#495162',
         'editorLineNumber.activeForeground': '#abb2bf',
@@ -270,7 +270,7 @@ export function EditorPanel({
         'editorWhitespace.foreground': '#3b4048',
         'editorIndentGuide.background': '#3b4048',
         'editorIndentGuide.activeBackground': '#5c6370',
-        'editorGutter.background': '#23272e',
+        'editorGutter.background': '#1E1E1E',
         'editorBracketMatch.background': '#3d4450',
         'editorWidget.background': '#282c34',
         'editorWidget.border': '#181a1f',

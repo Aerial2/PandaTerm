@@ -588,6 +588,8 @@ export type AiStoredMessage = {
   step_index?: number;
   usage?: AiUsage;
   duration_ms?: number;
+  generation_duration_ms?: number;
+  first_token_duration_ms?: number;
   phase?: string;
   contexts: AiStoredContext[];
   actions?: AiStoredAction[];

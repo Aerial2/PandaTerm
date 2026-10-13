@@ -78,8 +78,7 @@ describe('useRecentFiles', () => {
     expect(hook.loading).toBe(true);
     // A queued refresh also provides a completion barrier for the mount load.
     await hook.refreshSessions();
-    hook.setQuery('main');
-    expect(render()).toMatchObject({ records: [file], currentSessionIds: ['prod'], loading: false, error: null, query: 'main' });
+    expect(render()).toMatchObject({ records: [file], currentSessionIds: ['prod'], sessions: sessions('prod'), loading: false, error: null });
     expect(api.listRecentFiles).toHaveBeenCalledTimes(1);
     expect(api.listSessions).toHaveBeenCalledTimes(2);
   });

@@ -1,8 +1,13 @@
-import type { WheelEvent } from 'react';
+type HorizontalWheelEvent = {
+  currentTarget: HTMLElement;
+  deltaX: number;
+  deltaY: number;
+  preventDefault(): void;
+};
 
 // 让横向排布的 tab / chip 条支持鼠标滚轮横滑：
 // 纵向或横向滚轮 delta 统一转成 scrollLeft。未溢出或已到边界时不拦截，把事件交还外层。
-export function scrollHorizontallyOnWheel(event: WheelEvent<HTMLElement>) {
+export function scrollHorizontallyOnWheel(event: HorizontalWheelEvent) {
   const el = event.currentTarget;
   if (el.scrollWidth <= el.clientWidth) return;
   const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;

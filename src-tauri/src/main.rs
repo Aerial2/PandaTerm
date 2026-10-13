@@ -576,6 +576,21 @@ async fn ensure_session_store_available(state: &AppState) -> Result<(), String> 
     }
 }
 
+async fn record_session_connection(app: &AppHandle, state: &AppState, session_id: Uuid) {
+    let mut sessions = state.sessions.lock().await;
+    if let Err(error) = sessions.mark_connected(session_id, chrono::Utc::now().to_rfc3339()) {
+        eprintln!("[Session] failed to record connection time: {error}");
+        return;
+    }
+
+    if let Err(error) = save_persistent_sessions(sessions.all()) {
+        eprintln!("[Session] failed to persist connection time: {error}");
+    }
+    if let Err(error) = app.emit("sessions-changed", ()) {
+        eprintln!("[Session] failed to notify session listeners: {error}");
+    }
+}
+
 fn local_terminal_profile() -> LocalTerminalProfile {
     let cwd = default_local_path().unwrap_or_else(|_| PathBuf::from("."));
     LocalTerminalProfile {
@@ -5637,6 +5652,46 @@ fn emit_ai_stream_event_with_usage(
     );
 }
 
+fn parse_ai_chat_provider_event(
+    data: &str,
+    claude_format: bool,
+    accumulator: &mut ai_provider::ToolAccumulator,
+    usage: &mut Option<ai_provider::Usage>,
+    finish_seen: &mut bool,
+) -> Result<ai_provider::ProviderEvent, String> {
+    let mut event = if claude_format {
+        let event = ai_provider::parse_claude_event(data, accumulator)?;
+        let value =
+            serde_json::from_str(data).map_err(|error| format!("SSE 数据 JSON 无效：{error}"))?;
+        ai_provider::merge_claude_usage(usage, &value);
+        event
+    } else {
+        ai_provider::parse_openai_event(data, accumulator)?
+    };
+    if !claude_format {
+        if let Some(incoming) = &event.usage {
+            *usage = Some(incoming.clone());
+        }
+        // finish_reason precedes the final usage chunk. Only [DONE]/EOF
+        // completes an OpenAI chat stream.
+        if event.kind == "completed" {
+            *finish_seen = true;
+            event.kind = if event.delta.is_some() {
+                "delta"
+            } else if event.usage.is_some() {
+                "usage"
+            } else {
+                "ignored"
+            }
+            .into();
+        }
+    }
+    if event.usage.is_some() {
+        event.usage = usage.clone();
+    }
+    Ok(event)
+}
+
 async fn register_ai_generation(
     state: &AppState,
     request_id: &str,
@@ -5891,6 +5946,7 @@ async fn ai_chat_stream(
     let mut provider_tool_accumulator = ai_provider::ToolAccumulator::default();
     let mut agent_content = String::new();
     let mut agent_usage = None;
+    let mut finish_seen = false;
     let mut agent_tool_calls = Vec::new();
     'stream: loop {
         let chunk = tokio::select! {
@@ -5910,7 +5966,24 @@ async fn ai_chat_stream(
         match chunk {
             Ok(Some(bytes)) => buffer.extend_from_slice(&bytes),
             Ok(None) => {
-                if !completed {
+                if !claude_format && finish_seen && buffer.is_empty() {
+                    match provider_tool_accumulator.finish() {
+                        Ok(calls) => {
+                            agent_tool_calls = provider_tool_calls_to_ai(calls);
+                            emit_ai_stream_event_with_usage(
+                                &app,
+                                &request.request_id,
+                                "completed",
+                                None,
+                                Some(response_model.clone()),
+                                None,
+                                agent_usage.clone(),
+                                (!agent_tool_calls.is_empty()).then_some(agent_tool_calls.clone()),
+                            );
+                        }
+                        Err(error) => stream_error = Some(error),
+                    }
+                } else if !completed {
                     stream_error = Some("AI 流式响应意外结束：供应商未发送完成事件".to_string());
                 }
                 break;
@@ -5931,18 +6004,24 @@ async fn ai_chat_stream(
             };
             if data == "[DONE]" {
                 if !completed {
-                    let tool_calls = provider_tool_accumulator.finish().unwrap_or_default();
-                    let tool_calls = provider_tool_calls_to_ai(tool_calls);
+                    let tool_calls = match provider_tool_accumulator.finish() {
+                        Ok(calls) => provider_tool_calls_to_ai(calls),
+                        Err(error) => {
+                            stream_error = Some(error);
+                            break 'stream;
+                        }
+                    };
                     if !tool_calls.is_empty() {
                         agent_tool_calls = tool_calls.clone();
                     }
-                    emit_ai_stream_event_with_tools(
+                    emit_ai_stream_event_with_usage(
                         &app,
                         &request.request_id,
                         "completed",
                         None,
                         Some(response_model.clone()),
                         None,
+                        agent_usage.clone(),
                         (!tool_calls.is_empty()).then_some(tool_calls),
                     );
                     completed = true;
@@ -5950,16 +6029,33 @@ async fn ai_chat_stream(
                 break;
             }
             if claude_format {
-                let provider_event =
-                    match ai_provider::parse_claude_event(&data, &mut provider_tool_accumulator) {
-                        Ok(event) => event,
-                        Err(error) => {
-                            stream_error = Some(error);
-                            break 'stream;
-                        }
-                    };
+                let provider_event = match parse_ai_chat_provider_event(
+                    &data,
+                    true,
+                    &mut provider_tool_accumulator,
+                    &mut agent_usage,
+                    &mut finish_seen,
+                ) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        stream_error = Some(error);
+                        break 'stream;
+                    }
+                };
                 if let Some(model) = provider_event.model {
                     response_model = model;
+                }
+                if provider_event.usage.is_some() {
+                    emit_ai_stream_event_with_usage(
+                        &app,
+                        &request.request_id,
+                        "usage",
+                        None,
+                        None,
+                        None,
+                        agent_usage.clone(),
+                        None,
+                    );
                 }
                 match provider_event.kind.as_str() {
                     "delta" => {
@@ -5979,19 +6075,6 @@ async fn ai_chat_stream(
                             );
                         }
                     }
-                    "usage" => {
-                        agent_usage = provider_event.usage.clone();
-                        emit_ai_stream_event_with_usage(
-                            &app,
-                            &request.request_id,
-                            "usage",
-                            None,
-                            None,
-                            None,
-                            provider_event.usage,
-                            None,
-                        );
-                    }
                     "completed" if !completed => {
                         let tool_calls = provider_event
                             .tool_calls
@@ -6000,13 +6083,14 @@ async fn ai_chat_stream(
                         if let Some(calls) = tool_calls.clone() {
                             agent_tool_calls = calls.clone();
                         }
-                        emit_ai_stream_event_with_tools(
+                        emit_ai_stream_event_with_usage(
                             &app,
                             &request.request_id,
                             "completed",
                             None,
                             Some(response_model.clone()),
                             None,
+                            agent_usage.clone(),
                             tool_calls,
                         );
                         completed = true;
@@ -6020,16 +6104,33 @@ async fn ai_chat_stream(
                 }
                 continue;
             }
-            let provider_event =
-                match ai_provider::parse_openai_event(&data, &mut provider_tool_accumulator) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        stream_error = Some(error);
-                        break 'stream;
-                    }
-                };
+            let provider_event = match parse_ai_chat_provider_event(
+                &data,
+                false,
+                &mut provider_tool_accumulator,
+                &mut agent_usage,
+                &mut finish_seen,
+            ) {
+                Ok(event) => event,
+                Err(error) => {
+                    stream_error = Some(error);
+                    break 'stream;
+                }
+            };
             if let Some(model) = provider_event.model {
                 response_model = model;
+            }
+            if provider_event.usage.is_some() {
+                emit_ai_stream_event_with_usage(
+                    &app,
+                    &request.request_id,
+                    "usage",
+                    None,
+                    None,
+                    None,
+                    agent_usage.clone(),
+                    None,
+                );
             }
             match provider_event.kind.as_str() {
                 "delta" => {
@@ -6045,38 +6146,9 @@ async fn ai_chat_stream(
                         None,
                     );
                 }
-                "usage" => {
-                    agent_usage = provider_event.usage.clone();
-                    emit_ai_stream_event_with_usage(
-                        &app,
-                        &request.request_id,
-                        "usage",
-                        None,
-                        None,
-                        None,
-                        provider_event.usage,
-                        None,
-                    );
-                }
-                "completed" if !completed => {
-                    let tool_calls = provider_event
-                        .tool_calls
-                        .map(provider_tool_calls_to_ai)
-                        .filter(|calls| !calls.is_empty());
-                    if let Some(calls) = tool_calls.clone() {
-                        agent_tool_calls = calls.clone();
-                    }
-                    emit_ai_stream_event_with_tools(
-                        &app,
-                        &request.request_id,
-                        "completed",
-                        None,
-                        Some(response_model.clone()),
-                        None,
-                        tool_calls,
-                    );
-                    completed = true;
-                    break;
+                "error" => {
+                    stream_error = provider_event.error;
+                    break 'stream;
                 }
                 _ => {}
             }
@@ -6435,6 +6507,7 @@ async fn connect_session(
         }
     });
 
+    record_session_connection(&app, &state, session_id).await;
     Ok(TerminalEvent {
         session_id: terminal_id,
         kind: TerminalEventKind::Connected,
@@ -6531,14 +6604,16 @@ async fn rdp_connect(
         }
     }
 
+    let thread_app = app.clone();
     thread::spawn(move || {
-        rdp::run_session(app, params, channel, thread_closed, ready_tx, input_rx);
+        rdp::run_session(thread_app, params, channel, thread_closed, ready_tx, input_rx);
     });
 
     let result = ready_rx
         .await
         .map_err(|_| "RDP 连接线程提前退出".to_string())??;
 
+    record_session_connection(&app, &state, session_id).await;
     Ok(result)
 }
 
@@ -6650,6 +6725,8 @@ fn apply_window_dark_mode(window_label: String, app: tauri::AppHandle) -> Result
     {
         use tauri::Manager;
         const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+        const DWMWA_CAPTION_COLOR: u32 = 35;
+        const DWMWA_TEXT_COLOR: u32 = 36;
 
         if let Some(window) = app.get_webview_window(&window_label) {
             let hwnd = window
@@ -6657,11 +6734,25 @@ fn apply_window_dark_mode(window_label: String, app: tauri::AppHandle) -> Result
                 .map_err(|e| format!("获取窗口句柄失败: {e}"))?
                 .0;
             let dark_mode: i32 = 1;
+            let bg_color: u32 = 0x00262525; // #252526 BGR
+            let text_color: u32 = 0x00d0c4c2; // #c2c4d0 BGR
             unsafe {
                 let _ = DwmSetWindowAttribute(
                     hwnd,
                     DWMWA_USE_IMMERSIVE_DARK_MODE,
                     &dark_mode as *const _ as *const _,
+                    4,
+                );
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_CAPTION_COLOR,
+                    &bg_color as *const _ as *const _,
+                    4,
+                );
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_TEXT_COLOR,
+                    &text_color as *const _ as *const _,
                     4,
                 );
             }
@@ -6761,7 +6852,7 @@ fn main() {
                     };
                     let hwnd = native_hwnd.0;
                     let dark_mode: i32 = 1;
-                    let bg_color: u32 = 0x0027221e; // #1e2227 BGR
+                    let bg_color: u32 = 0x00262525; // #252526 BGR
                     let text_color: u32 = 0x00d0c4c2; // #c2c4d0 BGR
                     unsafe {
                         let _ = DwmSetWindowAttribute(
@@ -6882,6 +6973,136 @@ fn main() {
 mod tests {
     use super::*;
     use ai_config::ai_chat_completions_url;
+
+    #[test]
+    fn ai_chat_usage_after_finish_reason_is_retained() {
+        let mut accumulator = ai_provider::ToolAccumulator::default();
+        let mut usage: Option<ai_provider::Usage> = None;
+        let mut finish_seen = false;
+        let wire = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":273375,\"completion_tokens\":7625,\"total_tokens\":281000}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut buffer = wire.as_bytes().to_vec();
+        let mut kinds = Vec::new();
+        for event in take_sse_events(&mut buffer) {
+            let data = sse_data(&event).unwrap().unwrap();
+            if data == "[DONE]" {
+                assert!(finish_seen);
+                assert_eq!(usage.as_ref().unwrap().total_tokens, 281000);
+                kinds.push("completed".to_string());
+                break;
+            }
+            let parsed = parse_ai_chat_provider_event(
+                &data,
+                false,
+                &mut accumulator,
+                &mut usage,
+                &mut finish_seen,
+            )
+            .unwrap();
+            kinds.push(parsed.kind);
+        }
+        assert_eq!(kinds, ["ignored", "usage", "completed"]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn ai_chat_combined_delta_finish_and_usage_preserves_all_fields() {
+        for finish in [serde_json::Value::Null, serde_json::json!("stop")] {
+            let mut accumulator = ai_provider::ToolAccumulator::default();
+            let mut usage = None;
+            let mut finish_seen = false;
+            let data = serde_json::json!({
+                "choices": [{"delta": {"content": "hello"}, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+            })
+            .to_string();
+            let event = parse_ai_chat_provider_event(
+                &data,
+                false,
+                &mut accumulator,
+                &mut usage,
+                &mut finish_seen,
+            )
+            .unwrap();
+            assert_eq!(event.kind, "delta");
+            assert_eq!(event.delta.as_deref(), Some("hello"));
+            assert_eq!(event.usage.as_ref().unwrap().total_tokens, 14);
+            assert_eq!(usage.as_ref().unwrap().output_tokens, 4);
+            assert_eq!(finish_seen, !finish.is_null());
+        }
+    }
+
+    #[test]
+    fn ai_chat_claude_usage_retains_input_and_cache_counts() {
+        let mut accumulator = ai_provider::ToolAccumulator::default();
+        let mut usage = None;
+        let mut finish_seen = false;
+        let start = parse_ai_chat_provider_event(
+            r#"{"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":5,"cache_creation_input_tokens":2}}}"#,
+            true, &mut accumulator, &mut usage, &mut finish_seen,
+        ).unwrap();
+        assert_eq!(start.usage.unwrap().total_tokens, 18);
+        for output in [4, 6] {
+            let data =
+                serde_json::json!({"type": "message_delta", "usage": {"output_tokens": output}})
+                    .to_string();
+            let event = parse_ai_chat_provider_event(
+                &data,
+                true,
+                &mut accumulator,
+                &mut usage,
+                &mut finish_seen,
+            )
+            .unwrap();
+            let stats = event.usage.unwrap();
+            assert_eq!(stats.input_tokens, 10);
+            assert_eq!(stats.output_tokens, output);
+            assert_eq!(stats.cache_read_tokens, Some(5));
+            assert_eq!(stats.cache_write_tokens, Some(2));
+            assert_eq!(stats.total_tokens, 17 + output);
+        }
+        let stop = parse_ai_chat_provider_event(
+            r#"{"type":"message_stop"}"#,
+            true,
+            &mut accumulator,
+            &mut usage,
+            &mut finish_seen,
+        )
+        .unwrap();
+        assert_eq!(stop.kind, "completed");
+        assert_eq!(usage.unwrap().total_tokens, 23);
+    }
+
+    #[test]
+    fn ai_chat_missing_usage_preserves_tools_without_inventing_counts() {
+        let mut accumulator = ai_provider::ToolAccumulator::default();
+        accumulator
+            .apply_openai(
+                0,
+                Some("call-test"),
+                Some("propose_file_edit"),
+                Some(r#"{"summary":"review","target_source":"test.txt","edits":[{"search":"old","replace":"new"}]}"#),
+            )
+            .unwrap();
+        let mut usage = None;
+        let mut finish_seen = false;
+        let event = parse_ai_chat_provider_event(
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            false,
+            &mut accumulator,
+            &mut usage,
+            &mut finish_seen,
+        )
+        .unwrap();
+        assert_eq!(event.kind, "ignored");
+        assert!(finish_seen);
+        assert!(usage.is_none());
+        assert!(event.usage.is_none());
+        assert_eq!(accumulator.finish().unwrap()[0].id, "call-test");
+    }
 
     #[test]
     fn terminal_lifecycle_event_serializes_as_frontend_contract() {

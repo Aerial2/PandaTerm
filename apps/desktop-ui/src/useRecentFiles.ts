@@ -12,9 +12,8 @@ export type UseRecentFilesResult = {
   records: RecentFile[];
   loading: boolean;
   error: string | null;
-  query: string;
-  setQuery: (query: string) => void;
   currentSessionIds: string[] | null;
+  sessions: Awaited<ReturnType<typeof listSessions>>;
   recordOpen: (file: RecentFile) => Promise<void>;
   remove: (file: RecentFile) => Promise<void>;
   clear: (files: RecentFile[]) => Promise<void>;
@@ -30,8 +29,8 @@ export function useRecentFiles(): UseRecentFilesResult {
   const [records, setRecords] = useState<RecentFile[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [query, setQuery] = useState('');
   const [currentSessionIds, setCurrentSessionIds] = useState<string[] | null>(null);
+  const [sessions, setSessions] = useState<Awaited<ReturnType<typeof listSessions>>>([]);
   const mountedRef = useRef(true);
   const queueRef = useRef<Promise<void>>(Promise.resolve());
 
@@ -55,24 +54,30 @@ export function useRecentFiles(): UseRecentFilesResult {
     try {
       const sessions = await listSessions();
       if (!mountedRef.current) return;
+      setSessions(sessions);
       setCurrentSessionIds(sessions.map((session) => session.id));
       // Session discovery cannot resolve an existing history storage error.
     } catch (sessionError) {
-      if (mountedRef.current) setCurrentSessionIds(null);
+      if (mountedRef.current) {
+        setSessions([]);
+        setCurrentSessionIds(null);
+      }
       throw sessionError;
     }
   }), [enqueue]);
 
   const recordOpen = useCallback((file: RecentFile): Promise<void> => enqueue(async () => {
     // Always obtain a fresh session list. An unavailable list must never become an empty fallback.
-    const sessionIds = await listSessions().then(
-      (sessions) => sessions.map((session) => session.id),
-      (sessionError: unknown) => {
-        if (mountedRef.current) setCurrentSessionIds(null);
-        throw sessionError;
-      },
-    );
+    const sessionRecords = await listSessions().catch((sessionError: unknown) => {
+      if (mountedRef.current) {
+        setSessions([]);
+        setCurrentSessionIds(null);
+      }
+      throw sessionError;
+    });
     if (!mountedRef.current) return;
+    const sessionIds = sessionRecords.map((session) => session.id);
+    setSessions(sessionRecords);
     setCurrentSessionIds(sessionIds);
     const nextRecords = await upsertRecentFile(file, sessionIds);
     if (!mountedRef.current) return;
@@ -107,8 +112,12 @@ export function useRecentFiles(): UseRecentFilesResult {
       if (!mountedRef.current) return;
       try {
         const sessions = await listSessions();
-        if (mountedRef.current) setCurrentSessionIds(sessions.map((session) => session.id));
+        if (mountedRef.current) {
+          setSessions(sessions);
+          setCurrentSessionIds(sessions.map((session) => session.id));
+        }
       } catch (loadError) {
+        if (mountedRef.current) setSessions([]);
         firstError ??= errorMessage(loadError);
       }
       if (mountedRef.current && firstError) setError(firstError);
@@ -122,9 +131,8 @@ export function useRecentFiles(): UseRecentFilesResult {
     records,
     loading,
     error,
-    query,
-    setQuery,
     currentSessionIds,
+    sessions,
     recordOpen,
     remove,
     clear,
