@@ -245,6 +245,18 @@ export type AuthType =
 
 export type Protocol = 'ssh' | 'rdp';
 
+export type RecentFile = {
+  session_id: string;
+  protocol: Protocol;
+  host: string;
+  port: number;
+  username: string;
+  path: string;
+  name: string;
+  kind: string;
+  opened_at: string;
+};
+
 export type Session = {
   id: string;
   name: string;
@@ -320,12 +332,13 @@ export type TerminalStatusEvent = {
   reason?: string | null;
 };
 
+const fallbackIsMac = typeof navigator !== 'undefined' && navigator.platform.toLowerCase().includes('mac');
 const fallbackLocalTerminalProfile: LocalTerminalProfile = {
   terminal_id: '',
-  os: navigator.platform.toLowerCase().includes('mac') ? 'macos' : 'windows',
-  shell_name: navigator.platform.toLowerCase().includes('mac') ? 'zsh' : 'PowerShell',
-  cwd: navigator.platform.toLowerCase().includes('mac') ? '/Users' : 'E:\\Project\\Rust\\PandaTerm',
-  prompt: navigator.platform.toLowerCase().includes('mac') ? '/Users $' : 'PS E:\\Project\\Rust\\PandaTerm>',
+  os: fallbackIsMac ? 'macos' : 'windows',
+  shell_name: fallbackIsMac ? 'zsh' : 'PowerShell',
+  cwd: fallbackIsMac ? '/Users' : 'E:\\Project\\Rust\\PandaTerm',
+  prompt: fallbackIsMac ? '/Users $' : 'PS E:\\Project\\Rust\\PandaTerm>',
   banner: [],
 };
 
@@ -386,6 +399,22 @@ export async function saveSession(
   return await invoke<Session[]>('save_session', {
     request: { session, secret: secret || null, passphrase: passphrase || null },
   });
+}
+
+export async function listRecentFiles(): Promise<RecentFile[]> {
+  return await invoke<RecentFile[]>('list_recent_files');
+}
+
+export async function upsertRecentFile(file: RecentFile, currentSessionIds: string[] = []): Promise<RecentFile[]> {
+  return await invoke<RecentFile[]>('upsert_recent_file', { file, currentSessionIds });
+}
+
+export async function removeRecentFile(file: RecentFile): Promise<RecentFile[]> {
+  return await invoke<RecentFile[]>('remove_recent_file', { file });
+}
+
+export async function clearRecentFiles(files: RecentFile[]): Promise<RecentFile[]> {
+  return await invoke<RecentFile[]>('clear_recent_files', { files });
 }
 
 export async function getCredentialStatus(): Promise<CredentialStatus> {
@@ -591,6 +620,25 @@ export type AiToolExecutionResult = {
   step_index?: number | null;
 };
 
+export type AiPermissionPolicy = 'ask' | 'edit' | 'allowlist' | 'full';
+export type AiExecutionIntent = 'automatic' | 'approve_once' | 'approve_and_remember';
+
+export type AiAllowlistRule = {
+  id: string;
+  kind: 'terminal' | 'file_edit' | 'mcp';
+  name: string;
+  target: string;
+  arguments_identity: string;
+  timeout_ms: number;
+  preparation_identity?: string | null;
+};
+
+export type AiPermissionSettings = {
+  policy: AiPermissionPolicy;
+  rules: AiAllowlistRule[];
+  error: string | null;
+};
+
 export type AiToolExecutionMetadata = {
   tool_id?: string;
   conversation_id?: string;
@@ -598,15 +646,60 @@ export type AiToolExecutionMetadata = {
   step_index?: number;
 };
 
+export async function getAiPermissionSettings(): Promise<AiPermissionSettings> {
+  return await invoke<AiPermissionSettings>('get_ai_permission_settings');
+}
+
+export async function setAiPermissionPolicy(policy: AiPermissionPolicy): Promise<AiPermissionSettings> {
+  return await invoke<AiPermissionSettings>('set_ai_permission_policy', { request: { policy } });
+}
+
+export async function removeAiAllowlistRule(ruleId: string): Promise<AiPermissionSettings> {
+  return await invoke<AiPermissionSettings>('remove_ai_allowlist_rule', { ruleId });
+}
+
+export type PrepareAiFileEditRequest = {
+  tool_id?: string;
+  tool_call_id: string;
+  path: string;
+  terminal_id?: string;
+  edits: Array<{ search: string; replace: string }>;
+  execution_intent: AiExecutionIntent;
+};
+
+export type PrepareAiFileEditResponse = {
+  allowed: boolean;
+  status: string;
+  content?: string | null;
+  original_content?: string | null;
+  new_content?: string | null;
+  request?: {
+    tool_id?: string | null;
+    tool_call_id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+    approved: boolean;
+    execution_intent: AiExecutionIntent;
+    timeout_ms?: number | null;
+    conversation_id?: string | null;
+    agent_id?: string | null;
+    step_index?: number | null;
+  } | null;
+};
+
+export async function prepareAiFileEdit(request: PrepareAiFileEditRequest): Promise<PrepareAiFileEditResponse> {
+  return await invoke<PrepareAiFileEditResponse>('prepare_ai_file_edit', { request });
+}
+
 export async function executeAiTool(request: {
   tool_id?: string;
   tool_call_id: string;
   name: string;
   arguments: Record<string, unknown>;
-  approved: boolean;
+  approved?: boolean;
+  execution_intent?: AiExecutionIntent;
   timeout_ms?: number;
 } & AiToolExecutionMetadata): Promise<AiToolExecutionResult> {
-  if (!request.approved) throw new Error('工具执行尚未获得授权');
   return await invoke<AiToolExecutionResult>('execute_ai_tool', { request });
 }
 
@@ -841,8 +934,21 @@ export async function exportMcpServersCursorJson(servers: McpServerConfig[]): Pr
   return await invoke<string>('export_mcp_servers_cursor_json', { servers });
 }
 
+function serializeAiChatMessages(messages: AiChatMessage[]) {
+  return messages.map((message) => ({
+    ...message,
+    ...(message.tool_calls ? {
+      tool_calls: message.tool_calls.map(({ id, name, arguments: args }) => ({
+        id,
+        type: 'function' as const,
+        function: { name, arguments: args },
+      })),
+    } : {}),
+  }));
+}
+
 export async function sendAiChat(messages: AiChatMessage[]): Promise<AiChatResponse> {
-  return await invoke<AiChatResponse>('ai_chat', { request: { messages } });
+  return await invoke<AiChatResponse>('ai_chat', { request: { messages: serializeAiChatMessages(messages) } });
 }
 
 export async function streamAiChat(
@@ -854,7 +960,7 @@ export async function streamAiChat(
   await invoke('ai_chat_stream', {
     request: {
       request_id: requestId,
-      messages,
+      messages: serializeAiChatMessages(messages),
       mode: mode ?? null,
       conversation_id: options?.conversation_id ?? null,
       agent_id: options?.agent_id ?? null,

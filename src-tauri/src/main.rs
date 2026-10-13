@@ -3,6 +3,7 @@
 mod about;
 mod ai_agent;
 mod ai_config;
+mod ai_permissions;
 mod ai_provider;
 mod ai_session;
 mod ai_tools;
@@ -15,6 +16,7 @@ mod local_fs;
 mod local_shell;
 mod mcp;
 mod rdp;
+mod recent_files;
 mod session_store;
 mod shell_text;
 mod sse;
@@ -122,6 +124,9 @@ struct AppState {
     ai_generations: Mutex<HashMap<String, AiGenerationEntry>>,
     ai_agent_runtime: Arc<ai_agent::AgentRuntime>,
     ai_agent_steps: Mutex<HashMap<String, ai_agent::AgentStep>>,
+    ai_permission_store: Mutex<ai_permissions::AiPermissionStore>,
+    ai_permission_error: Mutex<Option<String>>,
+    recent_files: Mutex<recent_files::RecentFilesState>,
     ai_tool_executions: ai_tools::ExecutionTracker,
     ai_http: Client,
     mcp_config: Mutex<mcp::McpConfigStore>,
@@ -482,6 +487,8 @@ struct AiTerminalCommandRequest {
     is_remote: bool,
     command: String,
     timeout_ms: u64,
+    #[serde(default)]
+    execution_intent: ai_tools::ExecutionIntent,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -497,6 +504,9 @@ const AI_TERMINAL_COMMAND_MAX_LENGTH: usize = 4_000;
 const AI_TERMINAL_OUTPUT_LIMIT: usize = 64 * 1024;
 const AI_TERMINAL_MIN_TIMEOUT_MS: u64 = 3_000;
 const AI_TERMINAL_MAX_TIMEOUT_MS: u64 = 30_000;
+fn timeout_ms_string(value: u64) -> String {
+    value.to_string()
+}
 const TERMINAL_OUTPUT_EVENT: &str = "terminal-output";
 const TERMINAL_STATUS_EVENT: &str = "terminal-status";
 
@@ -2145,7 +2155,40 @@ async fn run_ai_terminal_command(
     }
     let terminal_id =
         Uuid::parse_str(&request.terminal_id).map_err(|error| format!("终端标识无效：{error}"))?;
+    let is_remote = ai_tool_target_is_remote(&state, terminal_id).await?;
+    if request.is_remote != is_remote {
+        return Err("授权的终端类型与实际会话不一致".into());
+    }
     let timeout_duration = Duration::from_millis(request.timeout_ms);
+    let target = format!(
+        "{}:{terminal_id}",
+        if is_remote { "remote" } else { "local" }
+    );
+    let args_identity =
+        ai_permissions::identity(&[command, &timeout_ms_string(request.timeout_ms)]);
+    authorize_ai_invocation(
+        &state,
+        "run_terminal_command",
+        ai_tools::ToolKind::Terminal,
+        target.clone(),
+        args_identity.clone(),
+        request.timeout_ms,
+        request.execution_intent,
+    )
+    .await
+    .map_err(|e| e.strip_prefix("denied|").unwrap_or(&e).to_string())?;
+    if request.execution_intent == ai_tools::ExecutionIntent::ApproveAndRemember {
+        remember_ai_invocation(
+            &state,
+            "run_terminal_command",
+            ai_tools::ToolKind::Terminal,
+            target,
+            args_identity,
+            request.timeout_ms,
+            None,
+        )
+        .await?;
+    }
 
     if !request.is_remote {
         let terminals = state.local_terminals.lock().await;
@@ -2266,9 +2309,84 @@ async fn ai_tool_target_is_remote(state: &AppState, terminal_id: Uuid) -> Result
     Err("工具目标终端不存在或已经关闭".into())
 }
 
+async fn resolve_ai_remote_path(state: &AppState, id: Uuid, path: &str) -> Result<String, String> {
+    let handle = interactive_remote_handle(state, id).await?;
+    let quoted = shell_quote(path);
+    let (stdout, stderr, code) =
+        exec_remote_command_full(&handle, &format!("realpath -- {quoted}")).await?;
+    if code != Some(0) {
+        return Err(format!(
+            "远程文件路径解析失败：{}",
+            String::from_utf8_lossy(&stderr)
+        ));
+    }
+    let canonical = String::from_utf8(stdout).map_err(|_| "远程路径不是 UTF-8".to_string())?;
+    let canonical = canonical.trim_end_matches(['\r', '\n']);
+    if !canonical.starts_with('/') || canonical.contains('\0') {
+        return Err("远程文件路径无效".into());
+    }
+    Ok(canonical.into())
+}
+
+async fn authorize_ai_invocation(
+    state: &AppState,
+    name: &str,
+    kind: ai_tools::ToolKind,
+    target: String,
+    arguments_identity: String,
+    timeout_ms: u64,
+    intent: ai_tools::ExecutionIntent,
+) -> Result<(), String> {
+    if state.ai_permission_error.lock().await.is_some() {
+        return Err("denied|AI 权限设置损坏或无法读取；策略已按 ask 拒绝执行".into());
+    }
+    let store = state.ai_permission_store.lock().await.clone();
+    let allowed = store.rules.iter().any(|rule| {
+        ai_permissions::matches(rule, kind, name, &target, &arguments_identity, timeout_ms)
+    });
+    if ai_tools::evaluate_policy(store.policy, kind, intent, allowed)
+        == ai_tools::PermissionDecision::Allow
+    {
+        return Ok(());
+    }
+    Err("denied|工具执行尚未获得符合当前策略的用户授权；未执行任何操作".into())
+}
+
+async fn remember_ai_invocation(
+    state: &AppState,
+    name: &str,
+    kind: ai_tools::ToolKind,
+    target: String,
+    arguments_identity: String,
+    timeout_ms: u64,
+    preparation_identity: Option<String>,
+) -> Result<(), String> {
+    let mut current = state.ai_permission_store.lock().await;
+    let mut next = current.clone();
+    let rule = ai_permissions::AiAllowlistRule {
+        id: ai_permissions::rule_id(),
+        kind,
+        name: name.into(),
+        target,
+        arguments_identity,
+        timeout_ms,
+        preparation_identity,
+    };
+    next.rules.push(rule);
+    if next.rules.len() > 2048 {
+        next.rules.remove(0);
+    }
+    let path = ai_permissions::permission_path()?;
+    ai_permissions::save(&path, &next)?;
+    *current = next;
+    Ok(())
+}
+
 async fn execute_ai_tool_adapter(
     invocation: ai_tools::Invocation,
     cancellation: Arc<ai_tools::Cancellation>,
+    intent: ai_tools::ExecutionIntent,
+    effective_timeout_ms: u64,
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(String, bool), String> {
@@ -2279,6 +2397,36 @@ async fn execute_ai_tool_adapter(
             let is_remote = ai_tool_target_is_remote(&state, terminal_id).await?;
             if args.is_remote.is_some_and(|hint| hint != is_remote) {
                 return Err("授权的终端类型与实际会话不一致".into());
+            }
+            let target = format!(
+                "{}:{terminal_id}",
+                if is_remote { "remote" } else { "local" }
+            );
+            let args_identity = ai_permissions::identity(&[
+                &args.command,
+                &timeout_ms_string(effective_timeout_ms),
+            ]);
+            authorize_ai_invocation(
+                &state,
+                "run_terminal_command",
+                ai_tools::ToolKind::Terminal,
+                target.clone(),
+                args_identity.clone(),
+                effective_timeout_ms,
+                intent,
+            )
+            .await?;
+            if intent == ai_tools::ExecutionIntent::ApproveAndRemember {
+                remember_ai_invocation(
+                    &state,
+                    "run_terminal_command",
+                    ai_tools::ToolKind::Terminal,
+                    target,
+                    args_identity,
+                    effective_timeout_ms,
+                    None,
+                )
+                .await?;
             }
             if cancellation.is_cancelled() {
                 return Err("工具执行已取消，未启动命令".into());
@@ -2316,6 +2464,53 @@ async fn execute_ai_tool_adapter(
             } else {
                 None
             };
+            let mut args = args;
+            let target = if let Some(id) = remote_terminal {
+                args.path = resolve_ai_remote_path(&state, id, &args.path).await?;
+                format!("remote:{id}:{}", args.path)
+            } else {
+                let canonical = PathBuf::from(&args.path)
+                    .canonicalize()
+                    .map_err(|e| format!("文件路径无效：{e}"))?;
+                args.path = canonical.to_string_lossy().into_owned();
+                format!("local:{}", args.path)
+            };
+            let preparation_identity = if let Some(edits) = &args.edits {
+                let proposed = ai_tools::apply_file_edits(&args.original_content, edits)
+                    .map_err(|error| format!("文件编辑提案无效：{error}"))?;
+                if proposed != args.new_content {
+                    return Err("文件编辑提案与修改结果不匹配".into());
+                }
+                Some(ai_permissions::identity(&[
+                    &ai_permissions::canonical_json(&json!(edits)),
+                ]))
+            } else {
+                None
+            };
+            let args_identity =
+                ai_permissions::identity(&[&args.original_content, &args.new_content]);
+            authorize_ai_invocation(
+                &state,
+                "propose_file_edit",
+                ai_tools::ToolKind::FileEdit,
+                target.clone(),
+                args_identity.clone(),
+                effective_timeout_ms,
+                intent,
+            )
+            .await?;
+            if intent == ai_tools::ExecutionIntent::ApproveAndRemember {
+                remember_ai_invocation(
+                    &state,
+                    "propose_file_edit",
+                    ai_tools::ToolKind::FileEdit,
+                    target,
+                    args_identity,
+                    effective_timeout_ms,
+                    preparation_identity,
+                )
+                .await?;
+            }
             if cancellation.is_cancelled() {
                 return Err("工具执行已取消，未提交文件修改".into());
             }
@@ -2342,13 +2537,15 @@ async fn execute_ai_tool_adapter(
             if cancellation.is_cancelled() {
                 return Err("工具执行已取消，未调用 MCP".into());
             }
-            let result = call_mcp_tool(
+            let result = call_mcp_tool_gated(
                 mcp::CallMcpToolRequest {
                     server_id: args.server,
                     tool_name: args.tool,
                     arguments: Some(args.arguments),
+                    execution_intent: intent,
                 },
-                state,
+                effective_timeout_ms,
+                &state,
             )
             .await?;
             Ok((result.content, result.is_error))
@@ -2365,11 +2562,22 @@ async fn execute_ai_tool(
     // Tauri requires Result for async commands with borrowed State. Every tool
     // policy/adapter failure is still an Ok envelope, not a rejected invocation.
     let tool_call_id = request.tool_call_id.clone();
+    let intent = request.execution_intent;
+    let effective_timeout_ms = ai_tools::validate_request(&request)
+        .map(|v| v.timeout.as_millis() as u64)
+        .unwrap_or(120_000);
     state.ai_agent_runtime.tool_phase(&tool_call_id, true);
     let result = state
         .ai_tool_executions
         .execute(request, |invocation, cancellation| {
-            execute_ai_tool_adapter(invocation, cancellation, app, state.clone())
+            execute_ai_tool_adapter(
+                invocation,
+                cancellation,
+                intent,
+                effective_timeout_ms,
+                app,
+                state.clone(),
+            )
         })
         .await;
     state.ai_agent_runtime.tool_phase(&tool_call_id, false);
@@ -2387,6 +2595,209 @@ async fn cancel_ai_tool(
 #[tauri::command]
 fn list_ai_tools() -> Vec<ai_tools::ToolDefinition> {
     ai_tools::definitions()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PrepareAiFileEditRequest {
+    pub path: String,
+    #[serde(default)]
+    pub terminal_id: Option<String>,
+    pub edits: Vec<AiFileEditProposal>,
+    #[serde(default)]
+    pub execution_intent: ai_tools::ExecutionIntent,
+    #[serde(default)]
+    pub tool_id: Option<String>,
+    pub tool_call_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiFileEditProposal {
+    pub search: String,
+    pub replace: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PrepareAiFileEditResponse {
+    pub allowed: bool,
+    pub status: String,
+    pub content: Option<String>,
+    pub original_content: Option<String>,
+    pub new_content: Option<String>,
+    pub request: Option<ai_tools::ExecuteToolRequest>,
+}
+
+fn ai_permission_snapshot(
+    store: &ai_permissions::AiPermissionStore,
+    error: Option<String>,
+) -> ai_permissions::AiPermissionSnapshot {
+    ai_permissions::AiPermissionSnapshot {
+        policy: store.policy,
+        rules: store.rules.clone(),
+        error,
+    }
+}
+
+#[tauri::command]
+async fn get_ai_permission_settings(
+    state: State<'_, Arc<AppState>>,
+) -> Result<ai_permissions::AiPermissionSnapshot, String> {
+    let store = state.ai_permission_store.lock().await.clone();
+    let error = state.ai_permission_error.lock().await.clone();
+    Ok(ai_permission_snapshot(&store, error))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SetAiPermissionPolicyRequest {
+    policy: ai_tools::AiPermissionPolicy,
+}
+
+#[tauri::command]
+async fn set_ai_permission_policy(
+    request: SetAiPermissionPolicyRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ai_permissions::AiPermissionSnapshot, String> {
+    let mut store = state.ai_permission_store.lock().await;
+    let mut next = store.clone();
+    next.policy = request.policy;
+    let path = ai_permissions::permission_path()?;
+    ai_permissions::save(&path, &next)?;
+    *store = next;
+    *state.ai_permission_error.lock().await = None;
+    Ok(ai_permission_snapshot(&store, None))
+}
+
+#[tauri::command]
+async fn remove_ai_allowlist_rule(
+    rule_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ai_permissions::AiPermissionSnapshot, String> {
+    uuid::Uuid::parse_str(&rule_id).map_err(|_| "权限规则标识无效".to_string())?;
+    let mut store = state.ai_permission_store.lock().await;
+    let mut next = store.clone();
+    next.rules.retain(|rule| rule.id != rule_id);
+    let path = ai_permissions::permission_path()?;
+    ai_permissions::save(&path, &next)?;
+    *store = next;
+    Ok(ai_permission_snapshot(&store, None))
+}
+
+#[tauri::command]
+async fn prepare_ai_file_edit(
+    request: PrepareAiFileEditRequest,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<PrepareAiFileEditResponse, String> {
+    ai_tools::validate_tool_call_id(&request.tool_call_id)?;
+    if request.path.trim().is_empty() || request.path.contains('\0') || request.edits.is_empty() {
+        return Err("文件编辑提案无效".into());
+    }
+    if request.edits.iter().any(|edit| edit.search.is_empty()) {
+        return Err("文件编辑搜索内容不能为空".into());
+    }
+    let remote = if let Some(id) = &request.terminal_id {
+        let id = Uuid::parse_str(id).map_err(|_| "文件终端标识无效".to_string())?;
+        if ai_tool_target_is_remote(&state, id).await? {
+            Some(id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let timeout_ms = 120_000;
+    let path = if let Some(id) = remote {
+        resolve_ai_remote_path(&state, id, &request.path).await?
+    } else {
+        if !Path::new(&request.path).is_absolute() {
+            return Err("本地文件必须使用绝对路径".into());
+        }
+        PathBuf::from(&request.path)
+            .canonicalize()
+            .map_err(|e| format!("文件路径无效：{e}"))?
+            .to_string_lossy()
+            .into_owned()
+    };
+    let target = match remote {
+        Some(id) => format!("remote:{id}:{path}"),
+        None => format!("local:{path}"),
+    };
+    let preparation_identity = ai_permissions::identity(&[&ai_permissions::canonical_json(
+        &serde_json::to_value(&request.edits).map_err(|e| e.to_string())?,
+    )]);
+    let store = state.ai_permission_store.lock().await.clone();
+    let matching_preparation = store.rules.iter().any(|rule| {
+        ai_permissions::matches_preparation(
+            rule,
+            ai_tools::ToolKind::FileEdit,
+            "propose_file_edit",
+            &target,
+            &preparation_identity,
+            timeout_ms,
+        )
+    });
+    if state.ai_permission_error.lock().await.is_some()
+        || ai_tools::evaluate_policy(
+            store.policy,
+            ai_tools::ToolKind::FileEdit,
+            request.execution_intent,
+            matching_preparation,
+        ) != ai_tools::PermissionDecision::Allow
+    {
+        return Ok(PrepareAiFileEditResponse {
+            allowed: false,
+            status: "denied".into(),
+            content: Some("当前策略不允许读取和准备此文件编辑；未读取文件内容".into()),
+            original_content: None,
+            new_content: None,
+            request: None,
+        });
+    }
+    let original = if let Some(id) = remote {
+        read_remote_file_full(id, path.clone(), None, app, state.clone())
+            .await?
+            .content
+    } else {
+        local_fs::read_local_file_full(path.clone()).await?.content
+    };
+    let edit_values = request
+        .edits
+        .iter()
+        .map(|edit| serde_json::to_value(edit).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let edited = ai_tools::apply_file_edits(&original, &edit_values)?;
+    let args_identity = ai_permissions::identity(&[&original, &edited]);
+    if request.execution_intent == ai_tools::ExecutionIntent::ApproveAndRemember {
+        remember_ai_invocation(
+            &state,
+            "propose_file_edit",
+            ai_tools::ToolKind::FileEdit,
+            target.clone(),
+            args_identity.clone(),
+            timeout_ms,
+            Some(preparation_identity.clone()),
+        )
+        .await?;
+    }
+    let execute_request = ai_tools::ExecuteToolRequest {
+        tool_id: request.tool_id,
+        tool_call_id: request.tool_call_id,
+        name: "propose_file_edit".into(),
+        arguments: json!({"path": path, "terminal_id": request.terminal_id, "original_content": original, "new_content": edited, "edits": request.edits}),
+        approved: false,
+        execution_intent: request.execution_intent,
+        timeout_ms: Some(timeout_ms),
+        conversation_id: None,
+        agent_id: None,
+        step_index: None,
+    };
+    Ok(PrepareAiFileEditResponse {
+        allowed: true,
+        status: "prepared".into(),
+        content: None,
+        original_content: Some(original),
+        new_content: Some(edited),
+        request: Some(execute_request),
+    })
 }
 
 #[tauri::command]
@@ -4844,16 +5255,69 @@ async fn list_mcp_tools(state: State<'_, Arc<AppState>>) -> Result<Vec<serde_jso
     Ok(state.mcp_runtime.list_tools_catalog(&store).await)
 }
 
+async fn call_mcp_tool_gated(
+    request: mcp::CallMcpToolRequest,
+    timeout_ms: u64,
+    state: &AppState,
+) -> Result<mcp::CallMcpToolResult, String> {
+    if let Some(error) = state.mcp_config_error.lock().await.clone() {
+        return Err(error);
+    }
+    if request.tool_name != request.tool_name.trim()
+        || request.tool_name.is_empty()
+        || request.tool_name.chars().count() > 128
+    {
+        return Err("MCP 工具名无效".into());
+    }
+    let args = request.arguments.clone().unwrap_or_else(|| json!({}));
+    if !args.is_object() {
+        return Err("MCP 参数必须为对象".into());
+    }
+    // Keep the same configuration locked through authorization and transport use:
+    // replacing a server under the same ID cannot reuse its old grant.
+    let store = state.mcp_config.lock().await;
+    let server = store
+        .servers
+        .iter()
+        .find(|s| s.id == request.server_id)
+        .ok_or_else(|| "MCP 服务器不存在".to_string())?;
+    let config =
+        ai_permissions::canonical_json(&serde_json::to_value(server).map_err(|e| e.to_string())?);
+    let fingerprint = ai_permissions::identity(&[&config]);
+    let target = format!("{}:{}:{fingerprint}", request.server_id, request.tool_name);
+    let args_json = ai_permissions::canonical_json(&args);
+    let identity = ai_permissions::identity(&[&args_json]);
+    authorize_ai_invocation(
+        state,
+        "call_mcp_tool",
+        ai_tools::ToolKind::Mcp,
+        target.clone(),
+        identity.clone(),
+        timeout_ms,
+        request.execution_intent,
+    )
+    .await?;
+    if request.execution_intent == ai_tools::ExecutionIntent::ApproveAndRemember {
+        remember_ai_invocation(
+            state,
+            "call_mcp_tool",
+            ai_tools::ToolKind::Mcp,
+            target,
+            identity,
+            timeout_ms,
+            None,
+        )
+        .await?;
+    }
+    state.mcp_runtime.call_tool(&store, request).await
+}
+
 #[tauri::command]
 async fn call_mcp_tool(
     request: mcp::CallMcpToolRequest,
     state: State<'_, Arc<AppState>>,
 ) -> Result<mcp::CallMcpToolResult, String> {
-    if let Some(error) = state.mcp_config_error.lock().await.clone() {
-        return Err(error);
-    }
-    let store = state.mcp_config.lock().await.clone();
-    state.mcp_runtime.call_tool(&store, request).await
+    call_mcp_tool_gated(request, 120_000, &state).await
 }
 
 #[tauri::command]
@@ -6240,6 +6704,18 @@ fn main() {
         ai_generations: Mutex::new(HashMap::new()),
         ai_agent_runtime: Arc::new(ai_agent::AgentRuntime::default()),
         ai_agent_steps: Mutex::new(HashMap::new()),
+        ai_permission_store: Mutex::new(
+            match ai_permissions::permission_path().and_then(|p| ai_permissions::load(&p)) {
+                Ok(store) => store,
+                Err(_) => ai_permissions::AiPermissionStore::default(),
+            },
+        ),
+        ai_permission_error: Mutex::new(
+            ai_permissions::permission_path()
+                .and_then(|p| ai_permissions::load(&p))
+                .err(),
+        ),
+        recent_files: Mutex::new(recent_files::RecentFilesState::load_default()),
         ai_tool_executions: ai_tools::ExecutionTracker::default(),
         ai_http,
         mcp_config: Mutex::new(mcp_config.clone()),
@@ -6325,6 +6801,10 @@ fn main() {
             save_session,
             delete_session,
             reorder_sessions,
+            recent_files::list_recent_files,
+            recent_files::upsert_recent_file,
+            recent_files::remove_recent_file,
+            recent_files::clear_recent_files,
             credential_status,
             unlock_credentials,
             lock_credentials,
@@ -6341,6 +6821,10 @@ fn main() {
             reconnect_mcp_server,
             list_mcp_tools,
             call_mcp_tool,
+            get_ai_permission_settings,
+            set_ai_permission_policy,
+            remove_ai_allowlist_rule,
+            prepare_ai_file_edit,
             list_mcp_import_candidates,
             import_mcp_servers_from_path,
             export_mcp_servers_cursor_json,

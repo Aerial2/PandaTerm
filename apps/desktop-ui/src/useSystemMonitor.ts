@@ -2,9 +2,8 @@ import { useEffect, useRef, useState, type RefObject } from 'react';
 import { getSystemMonitor, getProcessList, type ProcessInfo, type SystemMonitorData } from './api';
 import { setStatusMessage } from './appShellStore';
 import type { WorkspaceTab } from './terminalLayout';
+import type { LeftActivity } from './activity';
 import { appendMonitorSample, createMonitorSample, type MonitorSample, type NetworkBaseline } from './monitorHistory';
-
-type LeftActivity = 'files' | 'monitor' | 'processes' | 'ai' | null;
 export type ProcessSortKey = 'cpu' | 'memory' | 'name';
 export type ProcessSortDir = 'asc' | 'desc';
 

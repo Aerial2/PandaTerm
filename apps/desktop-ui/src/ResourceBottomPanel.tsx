@@ -23,6 +23,7 @@ import {
   type LogEntry,
   type TransferRecord,
 } from './transferModel';
+import type { LocalTerminalProfile } from './api';
 
 export type { LogEntry, TransferRecord };
 export { isTransferTerminal, transferKindLabel };
@@ -208,6 +209,8 @@ type ResourceBottomPanelProps = {
   onCancelTransfer: (id: string) => void;
   /** 递增时切换到本地终端并展开 */
   openLocalTerminalKey?: number;
+  /** 暴露本地终端的实时目标信息，供 AI 选择执行目标 */
+  onLocalTerminalProfile?: (profile: LocalTerminalProfile) => void;
 };
 
 /**
@@ -218,6 +221,7 @@ type ResourceBottomPanelProps = {
 export const ResourceBottomPanel = memo(function ResourceBottomPanel({
   onCancelTransfer,
   openLocalTerminalKey = 0,
+  onLocalTerminalProfile,
 }: ResourceBottomPanelProps) {
   const { transferRecords, logEntries } = useSyncExternalStore(
     subscribeTransferLog,
@@ -422,7 +426,7 @@ export const ResourceBottomPanel = memo(function ResourceBottomPanel({
         className="resource-bottom-content resource-local-terminal-wrap"
         hidden={collapsed || tab !== 'local'}
       >
-        <LocalTerminalView active={localActive} />
+        <LocalTerminalView active={localActive} onProfile={onLocalTerminalProfile} />
       </div>
 
       <div

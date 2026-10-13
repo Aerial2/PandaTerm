@@ -41,12 +41,13 @@ const terminalTheme = {
 type LocalTerminalViewProps = {
   /** 面板可见时 fit + focus；隐藏时保持 PTY 存活 */
   active: boolean;
+  onProfile?: (profile: Awaited<ReturnType<typeof getLocalTerminalProfile>>) => void;
 };
 
 /**
  * 底部面板专用本地终端：自管 xterm / PTY，不进入工作区 tab。
  */
-export function LocalTerminalView({ active }: LocalTerminalViewProps) {
+export function LocalTerminalView({ active, onProfile }: LocalTerminalViewProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -212,10 +213,8 @@ export function LocalTerminalView({ active }: LocalTerminalViewProps) {
     };
   }, []);
 
-  // 首次可见时启动 PTY；每次 active 时 fit + focus
+  // 组件挂载后自动启动 PTY；active 时额外 fit + focus
   useEffect(() => {
-    if (!active) return;
-
     let cancelled = false;
     const run = async () => {
       requestAnimationFrame(() => {
@@ -229,6 +228,7 @@ export function LocalTerminalView({ active }: LocalTerminalViewProps) {
       startingRef.current = true;
       try {
         const profileMeta = await getLocalTerminalProfile().catch(() => null);
+        if (profileMeta) onProfile?.(profileMeta);
         const cwd = profileMeta?.cwd || null;
         const terminal = terminalRef.current;
         if (!terminal || cancelled) return;
@@ -239,6 +239,7 @@ export function LocalTerminalView({ active }: LocalTerminalViewProps) {
           return;
         }
         terminalIdRef.current = profile.terminal_id;
+        onProfile?.(profile);
         startedRef.current = true;
         for (const chunk of pendingOutputRef.current) {
           terminal.write(chunk);

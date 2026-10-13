@@ -41,8 +41,8 @@ pub fn validate_ai_model(model: &str) -> Result<String, String> {
 pub fn validate_ai_reasoning_effort(effort: &str) -> Result<String, String> {
     let effort = effort.trim().to_ascii_lowercase();
     match effort.as_str() {
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(effort),
-        _ => Err("推理强度无效，可选：none / minimal / low / medium / high / xhigh".to_string()),
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Ok(effort),
+        _ => Err("推理强度无效，可选：none / minimal / low / medium / high / xhigh / max".to_string()),
     }
 }
 

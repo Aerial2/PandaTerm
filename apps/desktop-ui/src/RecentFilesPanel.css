@@ -1,0 +1,258 @@
+/* Recent files — scoped sidebar styles. */
+.recent-files-panel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
+
+.recent-files-header {
+  flex-shrink: 0;
+  padding: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.recent-files-heading-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.recent-files-title {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.recent-files-count {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.recent-files-clear-button,
+.recent-files-search-clear,
+.recent-files-remove {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+
+.recent-files-clear-button {
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 7px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.recent-files-clear-button:hover:not(:disabled),
+.recent-files-remove:hover:not(:disabled) {
+  background: rgba(224, 108, 117, 0.08);
+  color: var(--accent-red);
+}
+
+.recent-files-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 7px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+}
+
+.recent-files-search:focus-within {
+  border-color: var(--accent-blue);
+}
+
+.recent-files-search > svg {
+  flex-shrink: 0;
+}
+
+.recent-files-search input {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.recent-files-search input::placeholder {
+  color: var(--text-muted);
+}
+
+.recent-files-search input::-webkit-search-cancel-button {
+  appearance: none;
+}
+
+.recent-files-search-clear {
+  width: 22px;
+  height: 22px;
+}
+
+.recent-files-search-clear:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+
+.recent-files-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.recent-files-notice {
+  margin: 8px 12px 0;
+  padding: 7px 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.recent-files-notice-error {
+  border-color: rgba(224, 108, 117, 0.35);
+  color: var(--accent-red);
+}
+
+.recent-files-list {
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+}
+
+.recent-files-item {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding-right: 8px;
+}
+
+.recent-files-item:hover,
+.recent-files-item:focus-within {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.recent-files-item-main {
+  display: flex;
+  flex: 1;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+  padding: 10px 8px 10px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.recent-files-item-icon {
+  display: flex;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.recent-files-item-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.recent-files-item-copy > strong,
+.recent-files-item-path,
+.recent-files-item-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-files-item-copy > strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.recent-files-item-path {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.recent-files-item-meta {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.recent-files-remove {
+  width: 26px;
+  height: 26px;
+}
+
+.recent-files-panel button:focus-visible {
+  outline: 1px solid var(--accent-blue);
+  outline-offset: -1px;
+}
+
+.recent-files-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 40px 20px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.recent-files-state strong {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.recent-files-state-error,
+.recent-files-state-error strong {
+  color: var(--accent-red);
+}
+
+.recent-files-spinner {
+  animation: recent-files-spin 1s linear infinite;
+}
+
+@keyframes recent-files-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .recent-files-spinner {
+    animation: none;
+  }
+}

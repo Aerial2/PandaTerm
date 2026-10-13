@@ -3,6 +3,9 @@
  * 从 App.tsx 拆出，职责：layout 变换与查找。
  */
 import type { Session } from './api';
+import type { TerminalActivityEntry } from './activity';
+
+export type { TerminalActivityEntry } from './activity';
 
 export type TabKind = 'terminal' | 'sftp' | 'rdp';
 
@@ -61,12 +64,6 @@ export type TerminalLayoutNode =
       first: TerminalLayoutNode;
       second: TerminalLayoutNode;
     };
-
-export type TerminalActivityEntry = {
-  time: string;
-  level: 'info' | 'warn' | 'error';
-  text: string;
-};
 
 export type WorkspaceTab = {
   id: string;

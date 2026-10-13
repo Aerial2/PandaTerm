@@ -50,13 +50,24 @@ export const MAX_AI_OUTPUT_TOKENS = 1_000_000;
  */
 export const AI_DEFAULT_CONTEXT_WINDOW = 200_000;
 
+/** 聊天栏的账号级上下文窗口预设；未设置时选中实际生效的默认值。 */
+export const AI_CONTEXT_WINDOW_OPTIONS: readonly { value: number; label: string; description: string }[] = [
+  { value: 200_000, label: '200K', description: '' },
+  { value: 256_000, label: '256K', description: '' },
+  { value: 300_000, label: '300K', description: '' },
+  { value: 400_000, label: '400K', description: '' },
+  { value: 500_000, label: '500K', description: '' },
+  { value: 800_000, label: '800K', description: '' },
+  { value: 1_000_000, label: '1M', description: '' },
+] as const;
+
 export const AI_REASONING_EFFORT_OPTIONS: readonly SelectOption<string>[] = [
-  { value: 'none', label: '默认', description: '请求不带推理强度' },
-  { value: 'minimal', label: '最低', description: 'Minimal' },
-  { value: 'low', label: '低', description: 'Low' },
-  { value: 'medium', label: '中', description: 'Medium' },
-  { value: 'high', label: '高', description: 'High' },
-  { value: 'xhigh', label: '最高', description: 'Extra High' },
+  { value: 'none', label: 'Disable', description: '' },
+  { value: 'low', label: 'Low', description: '' },
+  { value: 'medium', label: 'Medium', description: '' },
+  { value: 'high', label: 'High', description: '' },
+  { value: 'xhigh', label: 'X-High', description: '' },
+  { value: 'max', label: 'Max', description: '' },
 ] as const;
 
 export function normalizeAiApiFormat(raw?: string | null): AiApiFormat {
@@ -582,6 +593,6 @@ export function mcpServerStatusDot(status?: string | null, enabled?: boolean): '
 
 export function normalizeAiReasoningEffort(value?: string | null): string {
   const next = (value ?? 'none').trim().toLowerCase();
-  const allowed = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+  const allowed = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
   return allowed.has(next) ? next : 'none';
 }

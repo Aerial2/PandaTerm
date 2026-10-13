@@ -17,6 +17,9 @@ import { EditorPanel, detectLanguage, type EditorTab } from './EditorPanel';
 import { scrollHorizontallyOnWheel } from './wheelScroll';
 import { VscodeFileIcon } from './FileIcon';
 import { ResourceBottomPanel } from './ResourceBottomPanel';
+import { RecentFilesPanel } from './RecentFilesPanel';
+import { ActivityBarIcon } from './ActivityBarIcon';
+import { useRecentFiles } from './useRecentFiles';
 import { StatusBar } from './StatusBar';
 import {
   ARCHIVE_FORMAT_OPTIONS,
@@ -65,6 +68,8 @@ import {
   type TerminalSplitResizeCandidate,
   type WorkspaceTab,
 } from './terminalLayout';
+import type { ActivityPanel, LeftActivity } from './activity';
+import { recentFileMatchesServer, filterRecentFiles, type RecentFile } from './recentFilesModel';
 import { TopMenubar } from './TopMenubar';
 import {
   ArrowLeft,
@@ -89,7 +94,6 @@ import {
   Monitor,
   Settings,
   TerminalSquare,
-  Eraser,
   Trash2,
   Upload,
   FolderUp,
@@ -108,13 +112,18 @@ import {
   CornerDownLeft,
   Paperclip,
   Sparkles,
-  Square,
   RotateCcw,
   MessageSquarePlus,
   Store,
   Zap,
+  Shield,
+  ShieldCheck,
+  CircleOff,
 } from 'lucide-react';
 import { AiMarkdown } from './AiMarkdown';
+import { AiModelIcon } from './AiModelIcon';
+import { AiModeIcon } from './AiModeIcon';
+import { AiSendIcon } from './AiSendIcon';
 import {
   connectSession,
   disconnectSession,
@@ -145,6 +154,7 @@ import {
   type McpImportCandidate,
   listLocalDirectory,
   listRemoteDirectory,
+  listSessions,
   readLocalFileFull,
   readRemoteFileFull,
   writeLocalFile,
@@ -173,8 +183,12 @@ import {
   openConnectionWindow,
   openAiSettingsWindow,
   preloadConnectionWindows,
+  getAiPermissionSettings,
+  setAiPermissionPolicy,
+  removeAiAllowlistRule,
+  prepareAiFileEdit,
 } from './api';
-import type { AiChatStreamEvent, AiProviderConfig, ArchiveFormat, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, TerminalStatusEvent } from './api';
+import type { AiChatStreamEvent, AiProviderConfig, ArchiveFormat, LocalDirectoryListing, LocalTerminalProfile, Session, TerminalOutputEvent, TerminalStatusEvent, AiPermissionPolicy, AiAllowlistRule } from './api';
 import { useSystemMonitor } from './useSystemMonitor';
 import { CapacityMonitorCharts, CpuMonitorCharts, NetworkMonitorCharts } from './MonitorCharts';
 import { useMediaViewer } from './useMediaViewer';
@@ -214,6 +228,7 @@ import {
   mapNativeToolCalls,
   type AiNativeToolCall,
 } from './aiToolCall';
+import { resolveAiRequestMetadata } from './aiRequestMetadata';
 import {
   createAiConversationState,
   fromStoredAiConversation,
@@ -277,7 +292,10 @@ import {
   snapshotToMcpDraft,
   toggleMcpToolDisabled,
   AI_API_FORMAT_OPTIONS,
+  AI_CONTEXT_WINDOW_OPTIONS,
   normalizeAiApiFormat,
+  normalizeAiContextWindow,
+  resolveAiEffectiveContextWindow,
 } from './aiSettingsModel';
 import { aiTreeLeaves, aiTreePath, migrateAiTree, switchAiTree } from './aiConversationTree';
 import { acceptAiStreamEvent, parseAiStreamEvent, type AiStreamCursor } from './aiProtocol';
@@ -294,9 +312,53 @@ import {
   localSession,
   oneDarkProTerminalTheme,
 } from './appEnvironment';
+import {
+  shouldAutoDispatch,
+  visibleManualApprovalActions,
+  type AiExecutionIntent,
+} from './aiPermissionFlow';
 
 const isAiSettingsWindow = false;
 const initialAiSettingsTab: 'models' | 'mcp' = 'models';
+
+type AiAutoRunPolicy = AiPermissionPolicy;
+
+const AI_AUTO_RUN_OPTIONS: Array<{
+  value: AiAutoRunPolicy;
+  label: string;
+  hint: string;
+  description: string;
+  icon: typeof Shield;
+}> = [
+  {
+    value: 'ask',
+    label: '逐项批准',
+    hint: '编辑和命令都先询问',
+    description: '每次操作执行前都需要你的确认',
+    icon: CircleOff,
+  },
+  {
+    value: 'edit',
+    label: '自动接受编辑',
+    hint: '直接编辑文本，运行命令询问',
+    description: '允许编辑操作，终端命令仍需确认',
+    icon: ShieldCheck,
+  },
+  {
+    value: 'allowlist',
+    label: '仅限已允许',
+    hint: '未预先允许的一律拒绝',
+    description: '只执行已经加入允许列表的操作',
+    icon: Shield,
+  },
+  {
+    value: 'full',
+    label: '完全访问',
+    hint: '编辑和命令直接执行',
+    description: '不再逐项检查操作权限',
+    icon: Zap,
+  },
+];
 
 export function App() {
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
@@ -307,7 +369,37 @@ export function App() {
   const leftSidebarRef = useRef<HTMLDivElement | null>(null);
   const sessionContentRef = useRef<HTMLElement | null>(null);
   // Left-side activity bar state — which panel is open
-  const [leftActivity, setLeftActivity] = useState<'files' | 'monitor' | 'processes' | 'ai' | null>('files');
+  const [leftActivity, setLeftActivity] = useState<LeftActivity>('files');
+  const {
+    records: recentFiles,
+    loading: recentFilesLoading,
+    error: recentFilesError,
+    query: recentFilesQuery,
+    setQuery: setRecentFilesQuery,
+    recordOpen: recordRecentFileOpen,
+    remove: removeRecentFile,
+    clear: clearRecentFiles,
+    currentSessionIds,
+    refreshSessions: refreshRecentFileSessions,
+  } = useRecentFiles();
+  useEffect(() => {
+    if (leftActivity !== 'recent') return;
+    void refreshRecentFileSessions();
+    const refresh = () => { void refreshRecentFileSessions(); };
+    window.addEventListener('focus', refresh);
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen('sessions-changed', refresh).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      window.removeEventListener('focus', refresh);
+      unlisten?.();
+    };
+  }, [leftActivity, refreshRecentFileSessions]);
+  const recentFileOpenGenerationRef = useRef(0);
 
   const [aiWorkspace, setAiWorkspace] = useState(() => {
     const conversation = createAiConversationState();
@@ -398,18 +490,18 @@ export function App() {
   const [pendingAiContexts, setPendingAiContexts] = useState<AiContextItem[]>([]);
   const [isAiMentionOpen, setIsAiMentionOpen] = useState(false);
   /** 输入区模式/模型/推理强度/上下文菜单：Cursor 风格自定义下拉 */
-  const [aiComposerMenu, setAiComposerMenu] = useState<null | 'mode' | 'model' | 'effort' | 'context'>(null);
+  const [aiComposerMenu, setAiComposerMenu] = useState<null | 'mode' | 'autoRun' | 'model' | 'context'>(null);
   const [aiComposerMenuAnchor, setAiComposerMenuAnchor] = useState<FloatingMenuAnchor | null>(null);
-  /** Agent：低风险终端/MCP 提案后自动执行（高风险与文件修改仍须确认） */
-  const [aiAutoRunEnabled, setAiAutoRunEnabled] = useState(() => {
-    try {
-      return window.localStorage.getItem('pandaterm.ai.autoRun') === '1';
-    } catch {
-      return false;
-    }
-  });
-  const aiAutoRunEnabledRef = useRef(aiAutoRunEnabled);
-  aiAutoRunEnabledRef.current = aiAutoRunEnabled;
+  /** Backend is authoritative; remain Ask until its persisted policy has loaded. */
+  const [aiAutoRunPolicy, setAiAutoRunPolicy] = useState<AiAutoRunPolicy>('ask');
+  const [aiPermissionRules, setAiPermissionRules] = useState<AiAllowlistRule[]>([]);
+  const [aiPermissionSettingsLoaded, setAiPermissionSettingsLoaded] = useState(false);
+  const [aiPermissionManagerOpen, setAiPermissionManagerOpen] = useState(false);
+  const [aiPermissionError, setAiPermissionError] = useState('');
+  const aiPermissionUpdateGenerationRef = useRef(0);
+  const aiAutoRunEnabled = aiPermissionSettingsLoaded && aiAutoRunPolicy !== 'ask';
+  const aiPermissionPolicyRef = useRef<AiPermissionPolicy>('ask');
+  aiPermissionPolicyRef.current = aiPermissionSettingsLoaded ? aiAutoRunPolicy : 'ask';
   /** 生成中排队的用户消息（发送时若正在生成则入队） */
   const [aiMessageQueue, setAiMessageQueue] = useState<Array<{
     id: string;
@@ -441,11 +533,13 @@ export function App() {
     conversationId: string,
     messageId: string,
     action: AiTerminalAction,
+    intent?: AiExecutionIntent,
   ) => void>(() => undefined);
   const runAiMcpActionRef = useRef<(
     conversationId: string,
     messageId: string,
     action: AiMcpAction,
+    intent?: AiExecutionIntent,
   ) => Promise<void>>(async () => undefined);
   const flushAiMessageQueueRef = useRef<() => void>(() => undefined);
   /** 本次运行中创建的助手消息 id：只有它们才允许自动执行，避免误跑历史会话里遗留的待授权提案 */
@@ -661,6 +755,7 @@ export function App() {
   const pathEditInputRef = useRef<HTMLInputElement | null>(null);
   const uploadAbortRefs = useRef<Map<string, AbortController>>(new Map());
   const editorSaveGenerationRef = useRef<Map<string, number>>(new Map());
+  const editorOpenGenerationRef = useRef<Map<string, number>>(new Map());
   /** 正在保存中的编辑器 tab：避免并发保存时旧内容后落盘覆盖新内容 */
   const editorSavingIdsRef = useRef<Set<string>>(new Set());
   /** 保存期间又产生的改动：当前这次结束后再补存一次 */
@@ -669,6 +764,9 @@ export function App() {
   const [openingConnection, setOpeningConnection] = useState<{ session: Session; tabId: string; startedAt: number } | null>(null);
   const openingSecondsRef = useRef<HTMLSpanElement | null>(null);
   const [localTerminalProfile, setLocalTerminalProfile] = useState<LocalTerminalProfile>(fallbackLocalTerminalProfile);
+  const [localAiTerminalProfile, setLocalAiTerminalProfile] = useState<LocalTerminalProfile | null>(null);
+  const localAiTerminalProfileRef = useRef<LocalTerminalProfile | null>(null);
+  const localAiTerminalWaitersRef = useRef<Array<(profile: LocalTerminalProfile | null) => void>>([]);
   const [terminalDragState, setTerminalDragState] = useState<TerminalDragState | null>(null);
   const terminalsRef = useRef<Map<string, Terminal>>(new Map());
   const terminalDataDisposablesRef = useRef<Map<string, { dispose: () => void }>>(new Map());
@@ -901,6 +999,15 @@ export function App() {
     setOpeningConnection((current) => current?.tabId === tabId ? null : current);
     setStatusMessage(`${event.state === 'failed' ? '连接失败' : message}：${sessionName}`);
     if (event.transport === 'remote' && (event.state === 'failed' || event.state === 'disconnected')) {
+      for (const editor of editorTabsRef.current) {
+        if (editor.isRemote && editor.terminalId === event.terminal_id && editor.loading) {
+          editorOpenGenerationRef.current.delete(editor.id);
+        }
+      }
+      setEditorTabs((current) => current.map((editor) =>
+        editor.isRemote && editor.terminalId === event.terminal_id && editor.loading
+          ? { ...editor, loading: false, loadProgress: undefined, error: '连接已断开，请重新打开文件' }
+          : editor));
       scheduleTerminalReconnect(tabId);
     }
     if (event.state === 'connected') {
@@ -1092,6 +1199,7 @@ export function App() {
         && (currentTab?.id ?? '__local__') === paneKey;
     };
     const local = isLocalResourceTab(tab);
+    closeMediaViewer();
     setInlineRename(null);
     lastPlainFileClickRef.current = null;
     if (pendingInlineRenameTimerRef.current !== null) {
@@ -1120,7 +1228,6 @@ export function App() {
       resourceFilesRef.current = nextFiles;
       setSelectedFiles(new Set());
       setLastClickedIndex(-1);
-      closeMediaViewer();
 
       // Update per-pane navigation history.
       const entry = navHistoryRef.current.get(paneKey);
@@ -1288,6 +1395,27 @@ export function App() {
     setProcessSearch,
   } = useSystemMonitor({ leftActivity, activePaneTabRef, activePaneTab, isLocalResourceTab });
 
+  function recentFileForTarget(file: ResourceFile, kind: string, target: { session: Session | null }): RecentFile | null {
+    const session = target.session;
+    if (!session || !file.path.trim() || !file.name.trim()) return null;
+    return {
+      session_id: session.id,
+      protocol: session.protocol ?? 'ssh',
+      host: session.host,
+      port: session.port,
+      username: session.username,
+      path: file.path,
+      name: file.name,
+      kind,
+      opened_at: new Date().toISOString(),
+    };
+  }
+
+  async function recordRemoteFileOpen(file: ResourceFile, kind: string, target: { session: Session | null }) {
+    const record = recentFileForTarget(file, kind, target);
+    if (record) await recordRecentFileOpen(record);
+  }
+
   const {
     mediaViewer,
     isLoadingMedia,
@@ -1295,12 +1423,17 @@ export function App() {
     openMediaViewer,
     closeMediaViewer,
     resetMediaViewer,
-  } = useMediaViewer({ activePaneTabRef, isLocalResourceTab });
+  } = useMediaViewer({
+    activePaneTabRef,
+    isLocalResourceTab,
+    onOpened: (file, kind, target) => recordRemoteFileOpen(file, kind, target),
+  });
 
   // When the active pane changes (switching tabs, focusing a different split
   // pane, or after a remote connection establishes), reload the resource panel
   // so it reflects the newly focused terminal's filesystem.
   useEffect(() => {
+    recentFileOpenGenerationRef.current += 1;
     resetMediaViewer();
     if (!activePaneTab) return;
     // Remote panes become browseable only after the SSH terminal is ready.
@@ -1316,7 +1449,7 @@ export function App() {
       void loadResourceDirectory(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePaneTab?.id, activePaneTab?.status]);
+  }, [activePaneTab?.id, activePaneTab?.status, activePaneTab?.terminalId, activePaneTab?.session.id]);
 
   useEffect(() => {
     terminalDragStateRef.current = terminalDragState;
@@ -2111,7 +2244,35 @@ export function App() {
     setSortDirection('asc');
   }
 
-  async function openSelectedFile(file: ResourceFile) {
+  function renderMediaPreview() {
+    return (
+      <div className="media-viewer">
+        <div className="media-viewer-header">
+          <span className="media-viewer-name">{mediaViewer?.name ?? '媒体预览'}</span>
+          <button className="media-viewer-close" title="关闭" onClick={closeMediaViewer}>
+            <X size={16} />
+          </button>
+        </div>
+        <div className="media-viewer-body">
+          {isLoadingMedia ? (
+            <div className="resource-preview-empty"><h2>正在加载媒体...</h2></div>
+          ) : mediaError ? (
+            <div className="resource-preview-empty is-error"><h2>无法查看媒体</h2><p>{mediaError}</p></div>
+          ) : mediaViewer?.kind === 'image' ? (
+            <img src={mediaViewer.url} alt={mediaViewer.name} className="media-viewer-img" />
+          ) : mediaViewer?.kind === 'video' ? (
+            <video src={mediaViewer.url} controls autoPlay className="media-viewer-video" />
+          ) : mediaViewer?.kind === 'audio' ? (
+            <div className="media-viewer-audio-wrap"><audio src={mediaViewer.url} controls autoPlay /></div>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
+  async function openSelectedFile(file: ResourceFile, options?: { target?: FileOpenTarget }) {
+    recentFileOpenGenerationRef.current += 1;
+    const target = options?.target ?? captureFileOpenTarget(activePaneTabRef.current);
     setSelectedFiles(new Set([file.name]));
     if (file.type === 'directory') {
       void loadResourceDirectory(file.path);
@@ -2121,12 +2282,89 @@ export function App() {
     // Images / videos / audio -> media viewer
     const kind = getMediaKind(file.name);
     if (kind) {
-      void openMediaViewer(file, kind);
+      void openMediaViewer(file, kind, {
+        paneId: target.paneTabId,
+        terminalId: target.terminalId ?? null,
+        session: target.session,
+      });
       return;
     }
 
     // Everything else -> built-in editor
-    void openFileInEditor(file);
+    closeMediaViewer();
+    void openFileInEditor(file, { target });
+  }
+
+  async function openRecentFile(record: RecentFile) {
+    const tab = activePaneTabRef.current;
+    if (!tab || isLocalResourceTab(tab) || tab.status !== 'connected' || !tab.terminalId || !tab.session) {
+      setStatusMessage('请先连接对应服务器后再打开最近文件');
+      return;
+    }
+    const session = tab.session;
+    const generation = ++recentFileOpenGenerationRef.current;
+    const targetIsCurrent = () => {
+      const current = activePaneTabRef.current;
+      return generation === recentFileOpenGenerationRef.current
+        && current?.id === tab.id
+        && current.status === 'connected'
+        && current.terminalId === tab.terminalId
+        && current.session.id === session.id;
+    };
+    let currentIds: string[] | null = null;
+    try {
+      currentIds = (await listSessions()).map((item) => item.id);
+    } catch {
+      // Exact UUID/endpoint matching remains safe without session discovery.
+    }
+    if (!targetIsCurrent()) return;
+    if (!recentFileMatchesServer(record, {
+      session_id: session.id,
+      protocol: session.protocol ?? 'ssh',
+      host: session.host,
+      port: session.port,
+      username: session.username,
+    }, currentIds)) {
+      setStatusMessage('最近文件不属于当前服务器');
+      return;
+    }
+    const existing = editorTabsRef.current.find((item) =>
+      item.isRemote && item.terminalId === tab.terminalId && item.path === record.path
+    );
+    if (existing && (existing.loading || !existing.error || existing.content !== existing.originalContent)) {
+      closeMediaViewer();
+      setActiveEditorTabId(existing.id);
+      setShowEditor(true);
+      if (!existing.loading && !existing.error) {
+        void recordRemoteFileOpen({
+          name: record.name, path: record.path, type: 'file',
+          size: '', sizeBytes: 0, modifiedTime: '',
+        }, 'file', { session });
+      }
+      return;
+    }
+    const slash = record.path.lastIndexOf('/');
+    const parent = slash > 0 ? record.path.slice(0, slash) : '/';
+    try {
+      const listing = await listRemoteDirectory(tab.terminalId, parent);
+      if (!targetIsCurrent()) return;
+      const entry = listing.entries.find((item) => item.path === record.path);
+      if (!entry || entry.entry_type === 'directory') {
+        throw new Error('远程文件不存在或已无法读取');
+      }
+      await openSelectedFile(toResourceFile(entry), {
+        target: {
+          paneTabId: tab.id,
+          paneId: tab.id,
+          terminalId: tab.terminalId,
+          local: false,
+          session,
+        },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (targetIsCurrent()) setStatusMessage(`无法打开最近文件：${message}`);
+    }
   }
 
   function createUntitledEditorTab() {
@@ -2153,6 +2391,8 @@ export function App() {
   }
 
   function selectEditorWorkspaceTab(id: string) {
+    recentFileOpenGenerationRef.current += 1;
+    closeMediaViewer();
     setActiveEditorTabId(id);
     setShowEditor(true);
   }
@@ -2179,19 +2419,52 @@ export function App() {
   /** 超过该大小的文件打开前先确认，避免误点大文件把界面卡死 */
   const HUGE_FILE_OPEN_BYTES = 20 * 1024 * 1024;
 
-  async function openFileInEditor(file: ResourceFile, options?: { skipSizeConfirm?: boolean }) {
-    // If already open, just focus it.  Must match both path AND the
-    // originating session (terminalId) so that the same filename on
-    // different servers is treated as separate editor tabs.
-    const tab = activePaneTabRef.current;
+  type FileOpenTarget = {
+    paneTabId: string | null;
+    paneId: string | null;
+    terminalId: string | undefined;
+    local: boolean;
+    session: Session | null;
+  };
+
+  function captureFileOpenTarget(tab: WorkspaceTab | null): FileOpenTarget {
     const local = isLocalResourceTab(tab);
-    const terminalId = local ? undefined : tab?.terminalId;
-    const existing = editorTabs.find((t) =>
+    return {
+      paneTabId: tab?.id ?? null,
+      paneId: activePaneIdRef.current,
+      terminalId: local ? undefined : tab?.terminalId,
+      local,
+      session: local ? null : tab?.session ?? null,
+    };
+  }
+
+  async function openFileInEditor(file: ResourceFile, options?: { skipSizeConfirm?: boolean; target?: FileOpenTarget }) {
+    // Capture the source pane before any await. The target must survive pane
+    // switches and the large-file confirmation dialog.
+    const target = options?.target ?? captureFileOpenTarget(activePaneTabRef.current);
+    const { local, terminalId } = target;
+    const sourceStillValid = () => {
+      if (local) return true;
+      const current = tabsRef.current.find((item) => item.id === target.paneTabId);
+      return current?.status === 'connected'
+        && Boolean(terminalId)
+        && current.terminalId === terminalId
+        && current.session.id === target.session?.id;
+    };
+    if (!sourceStillValid()) return;
+    // If already open, focus it without replacing unsaved content.
+    const currentEditorTabs = editorTabsRef.current;
+
+    const existing = currentEditorTabs.find((t) =>
       t.path === file.path && t.terminalId === terminalId && t.isRemote === !local
     );
-    if (existing) {
+    if (existing && (existing.loading || !existing.error || existing.content !== existing.originalContent)) {
+      closeMediaViewer();
       setActiveEditorTabId(existing.id);
       setShowEditor(true);
+      if (!local && !existing.loading && !existing.error) {
+        void recordRemoteFileOpen(file, 'file', { session: target.session });
+      }
       return;
     }
 
@@ -2201,7 +2474,7 @@ export function App() {
         title: '文件较大',
         message: `「${file.name}」约 ${(file.sizeBytes / (1024 * 1024)).toFixed(1)} MB，打开会占用较多内存并可能明显卡顿。确定要打开吗？`,
         confirmLabel: '仍要打开',
-        onConfirm: () => { void openFileInEditor(file, { skipSizeConfirm: true }); },
+        onConfirm: () => { void openFileInEditor(file, { skipSizeConfirm: true, target }); },
       });
       return;
     }
@@ -2216,11 +2489,16 @@ export function App() {
       originalContent: '',
       isRemote: !local,
       terminalId,
-      hostPaneId: activePaneIdRef.current,
+      hostPaneId: target.paneId,
       loading: true,
       error: '',
     };
-    setEditorTabs((current) => [...current, newTab]);
+    if (existing) editorOpenGenerationRef.current.delete(existing.id);
+    const openGeneration = (editorOpenGenerationRef.current.get(tabId) ?? 0) + 1;
+    editorOpenGenerationRef.current.set(tabId, openGeneration);
+    const targetStillValid = () =>
+      editorOpenGenerationRef.current.get(tabId) === openGeneration && sourceStillValid();
+    setEditorTabs((current) => [...current.filter((item) => item.id !== existing?.id), newTab]);
     setActiveEditorTabId(tabId);
     setShowEditor(true);
 
@@ -2246,7 +2524,7 @@ export function App() {
           transferred: number;
           total: number;
         }>('file-open-progress', (event) => {
-          if (event.payload.transfer_id !== activeTransferId || openAbortController?.signal.aborted) return;
+          if (event.payload.transfer_id !== activeTransferId || openAbortController?.signal.aborted || !targetStillValid()) return;
           const transferred = Math.max(0, event.payload.transferred);
           const total = Math.max(0, event.payload.total || file.sizeBytes);
           const elapsed = (Date.now() - openStartTime) / 1000;
@@ -2269,7 +2547,19 @@ export function App() {
       }
     }
 
+    const finishInvalidOpen = () => {
+      if (transferId) updateTransferRecord(transferId, { status: 'cancelled', message: '打开目标已失效' });
+      if (editorOpenGenerationRef.current.get(tabId) !== openGeneration) return;
+      setEditorTabs((current) => current.map((item) => item.id === tabId
+        ? { ...item, loading: false, loadProgress: undefined, error: '连接已变化，请重新打开文件' }
+        : item));
+    };
+
     try {
+      if (!targetStillValid()) {
+        finishInvalidOpen();
+        return;
+      }
       const full = local
         ? await readLocalFileFull(file.path)
         : terminalId
@@ -2280,6 +2570,10 @@ export function App() {
       }
       if (!full) {
         throw new Error('远程终端尚未连接，无法读取文件');
+      }
+      if (!targetStillValid()) {
+        finishInvalidOpen();
+        return;
       }
       if (transferId) {
         const elapsed = (Date.now() - openStartTime) / 1000;
@@ -2298,8 +2592,15 @@ export function App() {
           ? { ...t, content: full.content, originalContent: full.content, loading: false, loadProgress: undefined }
           : t,
       ));
+      if (!local) {
+        void recordRemoteFileOpen(file, 'file', { session: target.session });
+      }
       setStatusMessage(`已打开文件：${file.path}`);
     } catch (error) {
+      if (!targetStillValid()) {
+        finishInvalidOpen();
+        return;
+      }
       const cancelled = openAbortController?.signal.aborted ?? false;
       const message = error instanceof Error ? error.message : String(error);
       if (transferId && !cancelled) {
@@ -2318,6 +2619,7 @@ export function App() {
   }
 
   function closeEditorTab(id: string) {
+    editorOpenGenerationRef.current.delete(id);
     editorSaveGenerationRef.current.delete(id);
     setEditorTabs((current) => {
       const next = current.filter((t) => t.id !== id);
@@ -3738,6 +4040,26 @@ export function App() {
 
   useEffect(() => {
     let disposed = false;
+    void getAiPermissionSettings()
+      .then((settings) => {
+        if (disposed) return;
+        setAiAutoRunPolicy(settings.policy);
+        aiPermissionPolicyRef.current = settings.policy;
+        setAiPermissionRules(settings.rules);
+        setAiPermissionError(settings.error ?? '');
+        setAiPermissionSettingsLoaded(true);
+      })
+      .catch((error) => {
+        if (!disposed) {
+          setAiPermissionError(error instanceof Error ? error.message : String(error));
+          setAiPermissionSettingsLoaded(true);
+        }
+      });
+    return () => { disposed = true; };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
     void listAiConversations()
       .then((conversations) => {
         if (disposed) return;
@@ -3854,6 +4176,16 @@ export function App() {
     };
   }, []);
 
+  async function refreshAiPermissionRules() {
+    try {
+      const settings = await getAiPermissionSettings();
+      setAiPermissionRules(settings.rules);
+      setAiPermissionError(settings.error ?? '');
+    } catch (error) {
+      setAiPermissionError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   function updateAiConversation(
     conversationId: string,
     updater: (conversation: AiConversationState) => AiConversationState,
@@ -3870,27 +4202,27 @@ export function App() {
     setAiWorkspace(next);
   }
 
-  /** 派发一次低风险自动执行；幂等（同一动作只派发一次，同步路径与兜底路径共用） */
+  /** Dispatch one fresh automatic invocation; backend policy remains authoritative. */
   function dispatchAiAutoRun(
     conversationId: string,
     messageId: string,
-    action: AiTerminalAction | AiMcpAction,
+    action: AiTerminalAction | AiMcpAction | AiEditProposal,
   ) {
     if (aiAutoRunDispatchedRef.current.has(action.id)) return;
     aiAutoRunDispatchedRef.current.add(action.id);
-    // 便于排查「开关似乎没生效」：控制台会打印实际派发的动作
-    console.info('[ai-auto-run] 低风险自动执行', 'command' in action ? action.command : `${action.serverId}/${action.toolName}`);
     if ('command' in action) {
-      runAiTerminalActionRef.current(conversationId, messageId, action);
+      runAiTerminalActionRef.current(conversationId, messageId, action, 'automatic');
+    } else if ('serverId' in action) {
+      void runAiMcpActionRef.current(conversationId, messageId, action, 'automatic');
     } else {
-      void runAiMcpActionRef.current(conversationId, messageId, action);
+      void runAiFileEditAutomatically(conversationId, messageId, action);
     }
   }
 
   /**
    * Agent 回合解析（仅「正常完成 + agent 模式」时调用）。
    *
-   * ⚠️ 必须在 setState 之外**同步**调用：解析产物（协议纠偏、低风险自动执行）要立刻使用，
+   * ⚠️ 必须在 setState 之外**同步**调用：解析产物（协议纠偏、策略自动执行）要立刻使用，
    * 而 React 18/19 的 setState updater 不保证同步执行（eagerState 只在 fiber 无 pending update 时生效）。
    * 之前把解析写在 updater 里、函数返回后立刻读取，结果自动执行与协议纠偏都静默失效。
    */
@@ -4039,21 +4371,16 @@ export function App() {
       ? `\n\n动作未全部接受：${actionErrors.join('；')}`
       : '';
 
-    // 低风险自动执行：每条消息只挑一个动作（终端优先，其次 MCP）
-    let autoRun: null | { messageId: string; terminal?: AiTerminalAction; mcp?: AiMcpAction } = null;
-    if (aiAutoRunEnabledRef.current && !shouldRepairAgentProtocol) {
-      const autoTerminal = terminalActions.find((action) =>
-        action.status === 'proposed' && !isHighRiskTerminalCommand(action.command),
-      );
-      if (autoTerminal) {
-        autoRun = { messageId: assistantMessageId, terminal: autoTerminal };
-      } else {
-        const autoMcp = mcpActions.find((action) => action.status === 'proposed');
-        if (autoMcp) {
-          autoRun = { messageId: assistantMessageId, mcp: autoMcp };
+    // Submit every fresh action permitted by the selected policy. The backend
+    // remains the final allow/deny decision, including Allowlist matching.
+    const autoRun = !shouldRepairAgentProtocol && aiPermissionSettingsLoaded
+      ? {
+          messageId: assistantMessageId,
+          terminal: terminalActions.filter((action) => shouldAutoDispatch(aiAutoRunPolicy, 'terminal', true)),
+          mcp: mcpActions.filter((action) => shouldAutoDispatch(aiAutoRunPolicy, 'mcp', true)),
+          edits: proposals.filter((proposal) => shouldAutoDispatch(aiAutoRunPolicy, 'file_edit', true)),
         }
-      }
-    }
+      : null;
 
     return {
       content: `${parsedMcp.visibleContent}${errorSuffix}`.trim(),
@@ -4122,12 +4449,13 @@ export function App() {
       beginAiGeneration(conversation, baseMessages, repairMessage, true);
       return;
     }
-    // 低风险自动执行（同步派发，不再依赖 setState 的执行时机）
+    // Dispatch only actions from this fresh assistant turn. Stored history is
+    // never eligible, even when the policy changes later.
     const job = agentTurn?.autoRun;
-    if (job?.terminal) {
-      dispatchAiAutoRun(activeRequest.conversationId, job.messageId, job.terminal);
-    } else if (job?.mcp) {
-      dispatchAiAutoRun(activeRequest.conversationId, job.messageId, job.mcp);
+    if (job) {
+      for (const action of job.terminal) dispatchAiAutoRun(activeRequest.conversationId, job.messageId, action);
+      for (const action of job.mcp) dispatchAiAutoRun(activeRequest.conversationId, job.messageId, action);
+      for (const action of job.edits) dispatchAiAutoRun(activeRequest.conversationId, job.messageId, action);
     } else if (status === 'complete') {
       // Calls rejected during parameter/context validation still need a paired error and continuation.
       continueResolvedAiTools(activeRequest.conversationId, activeRequest.assistantMessageId);
@@ -4139,7 +4467,7 @@ export function App() {
   finishAiStreamRef.current = finishAiStream;
 
   /**
-   * 低风险自动执行的兜底：主路径在 finishAiStream 里同步派发；
+   * 策略自动执行的兜底：主路径在 finishAiStream 里同步派发；
    * 万一解析产物没赶上（setState 批处理/时序意外），这里在状态提交后再检查一次。
    * 只认本回合新创建的助手消息（aiAutoRunEligibleRef），不会误跑历史会话里遗留的待授权提案；
    * 派发经 dispatchAiAutoRun 去重，绝不会重复执行同一条命令。
@@ -4162,16 +4490,19 @@ export function App() {
       if (message.status === 'streaming') continue;
       aiAutoRunEligibleRef.current.delete(messageId);
       if (message.status !== 'complete') continue;
-      const terminal = message.terminalActions.find((action) =>
-        action.status === 'proposed' && !isHighRiskTerminalCommand(action.command),
-      );
-      const mcp = terminal ? undefined : message.mcpActions.find((action) => action.status === 'proposed');
-      if (terminal) dispatchAiAutoRun(activeAiConversation.id, message.id, terminal);
-      else if (mcp) dispatchAiAutoRun(activeAiConversation.id, message.id, mcp);
+      for (const action of message.terminalActions.filter((item) =>
+        item.status === 'proposed' && shouldAutoDispatch(aiAutoRunPolicy, 'terminal', true),
+      )) dispatchAiAutoRun(activeAiConversation.id, message.id, action);
+      for (const action of message.mcpActions.filter((item) =>
+        item.status === 'proposed' && shouldAutoDispatch(aiAutoRunPolicy, 'mcp', true),
+      )) dispatchAiAutoRun(activeAiConversation.id, message.id, action);
+      for (const action of message.proposals.filter((item) =>
+        item.status === 'proposed' && shouldAutoDispatch(aiAutoRunPolicy, 'file_edit', true),
+      )) dispatchAiAutoRun(activeAiConversation.id, message.id, action);
     }
   }, [aiWorkspace, aiAutoRunEnabled, isAiGenerating, activeAiConversation]);
 
-  function toggleLeftActivity(panel: 'files' | 'monitor' | 'processes' | 'ai') {
+  function toggleLeftActivity(panel: ActivityPanel) {
     // VSCode 风格：再次点击已激活的图标则收起侧边栏
     setLeftActivity(leftActivity === panel ? null : panel);
   }
@@ -4931,6 +5262,7 @@ export function App() {
         enabled_models: catalog.enabled_models,
         reasoning_effort: aiProviderConfig.reasoning_effort,
         api_format: normalizeAiApiFormat(aiProviderConfig.api_format),
+        context_window: normalizeAiContextWindow(aiProviderConfig.context_window),
         use_api_key: true,
       });
       applyAiProviderConfigState(config);
@@ -4954,6 +5286,32 @@ export function App() {
         enabled_models: aiProviderConfig.enabled_models,
         reasoning_effort: nextEffort,
         api_format: normalizeAiApiFormat(aiProviderConfig.api_format),
+        context_window: normalizeAiContextWindow(aiProviderConfig.context_window),
+        use_api_key: true,
+      });
+      applyAiProviderConfigState(config);
+    } catch (error) {
+      setAiConfigError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function selectAiContextWindow(contextWindow: number) {
+    if (!aiProviderConfig || isAiGenerating || isAiConfigSaving) return;
+    const nextContextWindow = normalizeAiContextWindow(contextWindow);
+    const currentContextWindow = normalizeAiContextWindow(aiProviderConfig.context_window);
+    if (nextContextWindow === currentContextWindow) return;
+    setAiConfigError('');
+    try {
+      const config = await saveAiProviderConfig({
+        account_id: aiProviderConfig.account_id || aiProviderConfig.active_account_id || undefined,
+        account_name: aiProviderConfig.account_name || undefined,
+        base_url: aiProviderConfig.base_url,
+        model: aiProviderConfig.model,
+        models: aiProviderConfig.models,
+        enabled_models: aiProviderConfig.enabled_models,
+        reasoning_effort: aiProviderConfig.reasoning_effort,
+        api_format: normalizeAiApiFormat(aiProviderConfig.api_format),
+        context_window: nextContextWindow,
         use_api_key: true,
       });
       applyAiProviderConfigState(config);
@@ -5050,10 +5408,15 @@ export function App() {
     const requestId = crypto.randomUUID();
     const continuing = isAiAgentContinuationMessage(userMessage) || protocolRepairAttempt;
     const prior = [...baseMessages].reverse().find((message) => message.agentId);
-    const agentId = continuing ? userMessage.agentId ?? prior?.agentId ?? crypto.randomUUID() : crypto.randomUUID();
-    const accountId = continuing ? userMessage.accountId ?? prior?.accountId ?? aiProviderConfig?.account_id ?? aiProviderConfig?.active_account_id : aiProviderConfig?.account_id ?? aiProviderConfig?.active_account_id;
-    const model = continuing ? userMessage.model ?? prior?.model ?? aiProviderConfig?.model : aiProviderConfig?.model;
-    userMessage = { ...userMessage, agentId, accountId, model };
+    const metadata = resolveAiRequestMetadata({
+      continuation: continuing,
+      userMessage,
+      prior,
+      provider: aiProviderConfig,
+      newAgentId: crypto.randomUUID(),
+    });
+    const { agentId, accountId, model } = metadata;
+    userMessage = { ...userMessage, agentId, accountId, model, stepIndex: metadata.stepIndex ?? userMessage.stepIndex };
     baseMessages = baseMessages.map((message) => message.id === userMessage.id ? userMessage : message);
     const assistantMessage: AiMessage = {
       id: crypto.randomUUID(),
@@ -5071,7 +5434,7 @@ export function App() {
     };
     const userIndex = baseMessages.findIndex((message) => message.id === userMessage.id);
     const history = userIndex >= 0 ? baseMessages.slice(0, userIndex) : baseMessages;
-    // 本回合的助手消息允许被「低风险自动执行」兜底逻辑处理
+    // 本回合的助手消息允许被「策略自动执行」兜底逻辑处理
     aiAutoRunEligibleRef.current.add(assistantMessage.id);
     aiActiveRequestRef.current = {
       requestId,
@@ -5127,6 +5490,54 @@ export function App() {
     })();
   }
 
+  function handleLocalAiTerminalProfile(profile: LocalTerminalProfile) {
+    setLocalAiTerminalProfile(profile);
+    if (!profile.terminal_id) return;
+    localAiTerminalProfileRef.current = profile;
+    const waiters = localAiTerminalWaitersRef.current.splice(0);
+    for (const resolve of waiters) resolve(profile);
+  }
+
+  function waitForLocalAiTerminal(): Promise<LocalTerminalProfile | null> {
+    const current = localAiTerminalProfileRef.current;
+    if (current?.terminal_id) return Promise.resolve(current);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (profile: LocalTerminalProfile | null) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeoutId);
+        resolve(profile);
+      };
+      const timeoutId = window.setTimeout(() => {
+        const index = localAiTerminalWaitersRef.current.indexOf(finish);
+        if (index >= 0) localAiTerminalWaitersRef.current.splice(index, 1);
+        finish(null);
+      }, 5000);
+      localAiTerminalWaitersRef.current.push(finish);
+    });
+  }
+
+  function localAiTerminalContext(profileOverride?: LocalTerminalProfile | null): AiContextItem | null {
+    const profile = profileOverride ?? localAiTerminalProfileRef.current ?? localAiTerminalProfile;
+    if (!profile?.terminal_id) return null;
+    return {
+      kind: 'terminal',
+      label: `本地终端（${profile.shell_name}）`,
+      source: profile.terminal_id,
+      preview: [
+        'terminal_target_only: true',
+        'output_authorized: false',
+        `os: ${profile.os}`,
+        `shell: ${profile.shell_name}`,
+        `cwd: ${profile.cwd}`,
+        `prompt: ${profile.prompt}`,
+      ].join('\\n'),
+      isRemote: false,
+      terminalId: profile.terminal_id,
+    };
+  }
+
   async function submitAiMessage() {
     const content = aiInput.trim();
     if (!content || !activeAiConversation) return;
@@ -5151,6 +5562,14 @@ export function App() {
           isRemote: !isLocalResourceTab(terminalTab),
           terminalId: terminalTab.terminalId,
         });
+      } else {
+        const localProfile = await waitForLocalAiTerminal();
+        const localContext = localAiTerminalContext(localProfile);
+        if (!localContext) {
+          setAiConversationError('本地终端正在启动，请稍后重试。');
+          return;
+        }
+        messageContexts.push(localContext);
       }
     }
 
@@ -5239,6 +5658,7 @@ export function App() {
     conversationId: string,
     messageId: string,
     action: AiTerminalAction,
+    intent: AiExecutionIntent = 'approve_once',
   ) {
     const conversation = aiWorkspaceRef.current.conversations.find(({ id }) => id === conversationId);
     const sourceMessage = conversation?.messages.find(({ id }) => id === messageId);
@@ -5259,12 +5679,14 @@ export function App() {
         tool_call_id: action.toolCallId ?? action.id,
         name: 'run_terminal_command',
         approved: true,
+        execution_intent: intent,
         arguments: { terminal_id: action.terminalId, is_remote: action.isRemote, command: action.command, timeout_ms: action.timeoutMs },
         timeout_ms: action.timeoutMs,
         conversation_id: conversationId,
         agent_id: sourceMessage?.agentId ?? undefined,
         step_index: sourceMessage?.stepIndex ?? undefined,
       });
+      if (intent === 'approve_and_remember') void refreshAiPermissionRules();
       // Unified terminal content is a JSON result; tolerate plain-text tool adapters.
       let terminalResult: { output?: string; exit_code?: number | null; truncated?: boolean; timed_out?: boolean } = {};
       try { terminalResult = JSON.parse(result.content); } catch { terminalResult = { output: result.content }; }
@@ -5300,8 +5722,8 @@ export function App() {
       continueResolvedAiTools(conversationId, messageId);
     }
   }
-  runAiTerminalActionRef.current = (conversationId, messageId, action) => {
-    void runAiTerminalAction(conversationId, messageId, action);
+  runAiTerminalActionRef.current = (conversationId, messageId, action, intent) => {
+    void runAiTerminalAction(conversationId, messageId, action, intent);
   };
 
   async function cancelAiAction(action: AiTerminalAction | AiMcpAction) {
@@ -5370,6 +5792,7 @@ export function App() {
     conversationId: string,
     messageId: string,
     action: AiMcpAction,
+    intent: AiExecutionIntent = 'approve_once',
   ) {
     const conversation = aiWorkspaceRef.current.conversations.find(({ id }) => id === conversationId);
     const sourceMessage = conversation?.messages.find(({ id }) => id === messageId);
@@ -5389,11 +5812,13 @@ export function App() {
         tool_call_id: action.toolCallId ?? action.id,
         name: 'call_mcp_tool',
         approved: true,
+        execution_intent: intent,
         arguments: { server: action.serverId, tool: action.toolName, arguments: action.arguments },
         conversation_id: conversationId,
         agent_id: sourceMessage?.agentId ?? undefined,
         step_index: sourceMessage?.stepIndex ?? undefined,
       });
+      if (intent === 'approve_and_remember') void refreshAiPermissionRules();
       const wasCancelled = aiCancelledToolCallsRef.current.delete(action.toolCallId ?? action.id);
       const completedAction: AiMcpAction = {
         ...action,
@@ -5419,7 +5844,8 @@ export function App() {
       continueResolvedAiTools(conversationId, messageId);
     }
   }
-  runAiMcpActionRef.current = runAiMcpAction;
+  runAiMcpActionRef.current = (conversationId, messageId, action, intent) =>
+    runAiMcpAction(conversationId, messageId, action, intent);
 
   function rejectAiMcpAction(messageId: string, action: AiMcpAction) {
     if (!activeAiConversation || action.status === 'running' || action.status === 'completed') return;
@@ -5442,11 +5868,18 @@ export function App() {
     const lastTask = [...conversation.messages].reverse().find((message) => message.role === 'user' && !isAiAgentContinuationMessage(message));
     if (source.agentId && lastTask?.agentId && source.agentId !== lastTask.agentId) return;
     if (hasPendingAiTools(source)) {
-      if (aiAutoRunEnabledRef.current && !source.terminalActions.some((action) => action.status === 'running') && !source.mcpActions.some((action) => action.status === 'running')) {
-        const terminal = source.terminalActions.find((action) => action.status === 'proposed' && !isHighRiskTerminalCommand(action.command));
-        const mcp = terminal ? undefined : source.mcpActions.find((action) => action.status === 'proposed');
-        if (terminal) dispatchAiAutoRun(conversationId, messageId, terminal);
-        else if (mcp) dispatchAiAutoRun(conversationId, messageId, mcp);
+      // Resolve every fresh action in this assistant turn. The backend remains
+      // authoritative: automatic submissions may be denied individually.
+      if (aiPermissionSettingsLoaded && aiAutoRunEligibleRef.current.has(messageId) && !source.terminalActions.some((action) => action.status === 'running') && !source.mcpActions.some((action) => action.status === 'running') && !source.proposals.some((proposal) => proposal.status === 'applying')) {
+        for (const action of source.terminalActions.filter((item) =>
+          item.status === 'proposed' && shouldAutoDispatch(aiAutoRunPolicy, 'terminal', true),
+        )) dispatchAiAutoRun(conversationId, messageId, action);
+        for (const action of source.mcpActions.filter((item) =>
+          item.status === 'proposed' && shouldAutoDispatch(aiAutoRunPolicy, 'mcp', true),
+        )) dispatchAiAutoRun(conversationId, messageId, action);
+        for (const proposal of source.proposals.filter((item) =>
+          item.status === 'proposed' && shouldAutoDispatch(aiAutoRunPolicy, 'file_edit', true),
+        )) dispatchAiAutoRun(conversationId, messageId, proposal);
       }
       return; // All calls in one assistant message need results before the next model request.
     }
@@ -5483,6 +5916,78 @@ export function App() {
       })),
       updatedAt: new Date().toISOString(),
     }));
+  }
+
+  async function runAiFileEditAutomatically(
+    conversationId: string,
+    messageId: string,
+    proposal: AiEditProposal,
+  ) {
+    const current = aiWorkspaceRef.current.conversations.find(({ id }) => id === conversationId)
+      ?.messages.find(({ id }) => id === messageId)?.proposals.find(({ id }) => id === proposal.id);
+    if (!current || current.status !== 'proposed') return;
+    updateAiProposal(conversationId, messageId, proposal.id, (item) => ({ ...item, status: 'applying', error: undefined }));
+    try {
+      // Automatic edits must be prepared by Rust before any file content is read.
+      const prepared = await prepareAiFileEdit({
+        tool_id: proposal.id,
+        tool_call_id: proposal.toolCallId ?? proposal.id,
+        path: proposal.targetSource,
+        terminal_id: proposal.isRemote ? proposal.terminalId : undefined,
+        edits: proposal.edits,
+        execution_intent: 'automatic',
+      });
+      if (!prepared.allowed) {
+        updateAiProposal(conversationId, messageId, proposal.id, (item) => ({
+          ...item,
+          status: 'rejected',
+          error: prepared.content || '自动文件修改未获后端授权',
+        }));
+        continueResolvedAiTools(conversationId, messageId);
+        return;
+      }
+      if (!prepared.request) throw new Error('后端未返回已授权的执行请求');
+      const originalContent = prepared.original_content;
+      const newContent = prepared.new_content;
+      if (originalContent == null || newContent == null) throw new Error('后端未返回已校验的文件内容');
+      const sourceMessage = aiWorkspaceRef.current.conversations.find(({ id }) => id === conversationId)
+        ?.messages.find(({ id }) => id === messageId);
+      // Execute the exact request prepared by the backend.
+      const result = await executeAiTool({
+        ...prepared.request,
+        tool_id: prepared.request.tool_id ?? undefined,
+        approved: prepared.request.approved,
+        execution_intent: prepared.request.execution_intent,
+        timeout_ms: prepared.request.timeout_ms ?? undefined,
+        conversation_id: conversationId,
+        agent_id: sourceMessage?.agentId ?? prepared.request.agent_id ?? undefined,
+        step_index: sourceMessage?.stepIndex ?? prepared.request.step_index ?? undefined,
+      });
+      if (result.status !== 'completed' || result.is_error) {
+        updateAiProposal(conversationId, messageId, proposal.id, (item) => ({
+          ...item,
+          status: result.status === 'cancelled' ? 'cancelled'
+            : result.status === 'denied' || result.status === 'rejected' ? 'rejected' : 'error',
+          error: result.content || '自动文件修改未完成',
+        }));
+        continueResolvedAiTools(conversationId, messageId);
+        return;
+      }
+      setEditorTabs((tabs) => tabs.map((tab) => {
+        const matches = tab.path === proposal.targetSource && tab.isRemote === Boolean(proposal.isRemote) && tab.terminalId === proposal.terminalId;
+        return matches && tab.content === originalContent && tab.originalContent === originalContent
+          ? { ...tab, content: newContent, originalContent: newContent } : tab;
+      }));
+      updateAiProposal(conversationId, messageId, proposal.id, (item) => ({ ...item, status: 'applied', error: undefined }));
+      continueResolvedAiTools(conversationId, messageId);
+    } catch (error) {
+      updateAiProposal(conversationId, messageId, proposal.id, (item) => ({
+        ...item,
+        status: 'error',
+        error: error instanceof Error ? error.message : String(error),
+      }));
+      continueResolvedAiTools(conversationId, messageId);
+    }
   }
 
   function reviewAiEditProposal(messageId: string, proposal: AiEditProposal) {
@@ -5534,7 +6039,7 @@ export function App() {
     continueResolvedAiTools(activeAiConversation.id, messageId);
   }
 
-  function applyAiEditProposal(messageId: string, proposal: AiEditProposal) {
+  function applyAiEditProposal(messageId: string, proposal: AiEditProposal, intent: AiExecutionIntent = 'approve_once') {
     if (!activeAiConversation || proposal.status !== 'ready' || proposal.baseContent === undefined || proposal.nextContent === undefined) return;
     const conversationId = activeAiConversation.id;
     const baseContent = proposal.baseContent;
@@ -5553,16 +6058,19 @@ export function App() {
             tool_call_id: proposal.toolCallId ?? proposal.id,
             name: 'propose_file_edit',
             approved: true,
+            execution_intent: intent,
             arguments: {
               path: proposal.targetSource,
               terminal_id: proposal.isRemote ? proposal.terminalId : undefined,
               original_content: baseContent,
               new_content: nextContent,
+              edits: proposal.edits,
             },
             conversation_id: conversationId,
             agent_id: sourceMessage?.agentId ?? undefined,
             step_index: sourceMessage?.stepIndex ?? undefined,
           });
+          if (result.status === 'completed' && intent === 'approve_and_remember') void refreshAiPermissionRules();
           if (result.status === 'denied' || result.status === 'rejected' || result.is_error || result.status !== 'completed') {
             throw new Error(result.content || `文件修改未完成（${result.status}）`);
           }
@@ -5708,41 +6216,6 @@ export function App() {
         await deleteAiConversation(conversation.id);
       },
     });
-  }
-
-  function clearAiConversation() {
-    if (!activeAiConversation) return;
-    void stopCurrentAiGeneration();
-    updateAiConversation(activeAiConversation.id, (conversation) => ({
-      ...conversation,
-      title: '新对话',
-      updatedAt: new Date().toISOString(),
-      messages: [],
-      tree: { nodes: [], active_leaf_id: null },
-    }));
-    setPendingAiContexts([]);
-    cancelEditUserMessage();
-  }
-
-  /** 清除全部 AI 会话：逐个删除后端会话（没有批量命令），本地重置为一个空白会话 */
-  async function clearAllAiConversations() {
-    if (aiConversations.length === 0) return;
-    await stopCurrentAiGeneration();
-    for (const conversation of aiConversations) {
-      try {
-        await deleteAiConversation(conversation.id);
-      } catch (error) {
-        setAiConversationError(error instanceof Error ? error.message : String(error));
-        return;
-      }
-    }
-    const fallback = createAiConversationState();
-    setAiWorkspace({
-      conversations: [fallback],
-      activeConversationId: fallback.id,
-    });
-    setPendingAiContexts([]);
-    cancelEditUserMessage();
   }
 
   function formatBytes(bytes: number): string {
@@ -6780,6 +7253,28 @@ export function App() {
     );
   }
 
+  const recentServer = activePaneTab && !isLocalResourceTab(activePaneTab)
+    ? activePaneTab.session
+    : null;
+  const recentServerIdentity = recentServer ? {
+    session_id: recentServer.id,
+    protocol: recentServer.protocol ?? 'ssh' as const,
+    host: recentServer.host,
+    port: recentServer.port,
+    username: recentServer.username,
+  } : null;
+  const visibleRecentFiles = recentServerIdentity
+    ? filterRecentFiles(
+      recentFiles.filter((record) => recentFileMatchesServer(record, recentServerIdentity, currentSessionIds)),
+      { query: '' },
+    )
+    : [];
+  const recentConnectionMessage = !recentServer
+    ? '请先选择一个远程服务器连接'
+    : activePaneTab?.status === 'connected'
+      ? null
+      : '当前服务器未连接，请先连接后再打开文件';
+
   return (
     <main className="ssh-workbench" onDragOver={handleGlobalDragOver} onDrop={handleGlobalDrop}>
       <TopMenubar
@@ -6813,6 +7308,13 @@ export function App() {
         >
           <div className="activity-bar">
             <button
+              className={`activity-bar-icon${leftActivity === 'recent' ? ' active' : ''}`}
+              onClick={() => toggleLeftActivity('recent')}
+              title="最近文件"
+            >
+              <ActivityBarIcon name="files" size={20} />
+            </button>
+            <button
               className={`activity-bar-icon${leftActivity === 'files' ? ' active' : ''}`}
               onClick={() => toggleLeftActivity('files')}
               title="文件浏览器"
@@ -6824,23 +7326,45 @@ export function App() {
               onClick={() => toggleLeftActivity('monitor')}
               title="资源监控"
             >
-              <Activity size={20} />
+              <ActivityBarIcon name="resource-monitor" size={20} />
             </button>
             <button
               className={`activity-bar-icon${leftActivity === 'processes' ? ' active' : ''}`}
               onClick={() => toggleLeftActivity('processes')}
               title="进程管理"
             >
-              <ListChecks size={20} />
+              <ActivityBarIcon name="processes" size={20} />
             </button>
             <button
               className={`activity-bar-icon${leftActivity === 'ai' ? ' active' : ''}`}
               onClick={() => toggleLeftActivity('ai')}
               title="PandaTerm AI"
             >
-              <Bot size={20} />
+              <ActivityBarIcon name="ai" size={20} />
             </button>
           </div>
+          {leftActivity === 'recent' && (
+            <RecentFilesPanel
+              records={visibleRecentFiles}
+              loading={recentFilesLoading}
+              error={recentFilesError}
+              query={recentFilesQuery}
+              onQueryChange={setRecentFilesQuery}
+              connectionMessage={recentConnectionMessage}
+              onRemove={(record) => { void removeRecentFile(record); }}
+              onOpen={(record) => { void openRecentFile(record); }}
+              onClear={() => {
+                const snapshot = [...visibleRecentFiles];
+                if (snapshot.length === 0) return;
+                requestConfirm({
+                  title: '清空最近文件',
+                  message: '只会移除当前服务器的打开记录，不会删除远程文件。确定继续吗？',
+                  confirmLabel: '清空记录',
+                  onConfirm: () => { void clearRecentFiles(snapshot); },
+                });
+              }}
+            />
+          )}
           {leftActivity === 'files' && (
         <aside
           className={`file-panel${isDragOver ? ' is-drag-over' : ''}`}
@@ -7146,32 +7670,6 @@ export function App() {
                 >
                   <Settings size={14} />
                 </button>
-                <button
-                  type="button"
-                  className="ai-header-button"
-                  title="清空当前对话"
-                  onClick={clearAiConversation}
-                  disabled={aiMessages.length === 0}
-                >
-                  <Eraser size={14} />
-                </button>
-                <button
-                  type="button"
-                  className="ai-header-button"
-                  title="清除全部对话"
-                  onClick={() => {
-                    setConfirmDialog({
-                      title: '清除全部 AI 对话',
-                      message: `将删除全部 ${aiConversations.length} 个会话及其聊天记录，此操作不可恢复。确定清除吗？`,
-                      confirmLabel: '清除全部',
-                      danger: true,
-                      onConfirm: () => { void clearAllAiConversations(); },
-                    });
-                  }}
-                  disabled={!aiConversations.some((conversation) => conversation.messages.length > 0)}
-                >
-                  <Trash2 size={14} />
-                </button>
               </div>
             </div>
 
@@ -7261,7 +7759,7 @@ export function App() {
                 <article key={message.id} className={`ai-message ${message.role} ${message.status}${isEditingUser ? ' editing' : ''}`}>
                   <div className="ai-message-body">
                     {message.status !== 'streaming' && (
-                      <button type="button" className="ai-header-button" disabled={isAiGenerating}
+                      <button type="button" className="ai-message-branch-button" disabled={isAiGenerating}
                         title="保留现有回复，从此消息建立新分支"
                         onClick={() => switchAiBranch(message.id)}>从此处分支</button>
                     )}
@@ -7380,17 +7878,22 @@ export function App() {
                           )}
                           {proposal.error && <div className="ai-edit-error">{proposal.error}</div>}
                           <div className="ai-edit-actions">
-                            {['proposed', 'error', 'stale'].includes(proposal.status) && (
+                            {visibleManualApprovalActions(aiAutoRunPolicy) && ['proposed', 'error', 'stale'].includes(proposal.status) && (
                               <button type="button" onClick={() => reviewAiEditProposal(message.id, proposal)}>
                                 {proposal.status === 'proposed' ? '授权读取并审阅' : '重新读取'}
                               </button>
                             )}
-                            {proposal.status === 'ready' && (
-                              <button type="button" className="primary" onClick={() => applyAiEditProposal(message.id, proposal)}>
-                                应用修改
-                              </button>
+                            {proposal.status === 'ready' && visibleManualApprovalActions(aiAutoRunPolicy) && (
+                              <>
+                                <button type="button" className="primary" onClick={() => applyAiEditProposal(message.id, proposal, 'approve_once')}>
+                                  应用修改
+                                </button>
+                                <button type="button" onClick={() => applyAiEditProposal(message.id, proposal, 'approve_and_remember')}>
+                                  应用并记住
+                                </button>
+                              </>
                             )}
-                            {!['applied', 'rejected', 'applying', 'reading'].includes(proposal.status) && (
+                            {visibleManualApprovalActions(aiAutoRunPolicy) && !['applied', 'rejected', 'applying', 'reading'].includes(proposal.status) && (
                               <button type="button" onClick={() => rejectAiEditProposal(message.id, proposal)}>拒绝</button>
                             )}
                             {proposal.status === 'reading' && <span>正在读取并校验…</span>}
@@ -7421,14 +7924,10 @@ export function App() {
                             <span>{action.contextLabel} · {action.isRemote ? '远程' : '本地'} · {Math.round(action.timeoutMs / 1000)}s</span>
                           </div>
                           {isHighRiskTerminalCommand(action.command) && <em>高风险</em>}
-                          {/* 与 finishAiStream 的自动执行选择保持一致：每条消息只自动跑第一个低风险终端动作 */}
                           {aiAutoRunEnabled
                             && action.status === 'proposed'
-                            && !isHighRiskTerminalCommand(action.command)
-                            && message.terminalActions.find((item) =>
-                              item.status === 'proposed' && !isHighRiskTerminalCommand(item.command),
-                            )?.id === action.id && (
-                            <em className="ai-action-auto">自动执行</em>
+                            && shouldAutoDispatch(aiAutoRunPolicy, 'terminal', true) && (
+                            <em className="ai-action-auto">自动提交</em>
                           )}
                         </div>
                         <pre className="ai-terminal-command">{action.command}</pre>
@@ -7437,17 +7936,22 @@ export function App() {
                         )}
                         {action.error && <div className="ai-terminal-error">{action.error}</div>}
                         <div className="ai-terminal-actions">
-                          {['proposed', 'timeout', 'error'].includes(action.status) && (
-                            <button
-                              type="button"
-                              className={isHighRiskTerminalCommand(action.command) ? 'danger' : 'primary'}
-                              onClick={() => {
-                                if (!activeAiConversation) return;
-                                void runAiTerminalAction(activeAiConversation.id, message.id, action);
-                              }}
-                            >
-                              {action.status === 'proposed' ? '授权并执行' : '重新执行'}
-                            </button>
+                          {visibleManualApprovalActions(aiAutoRunPolicy) && ['proposed', 'timeout', 'error'].includes(action.status) && (
+                            <>
+                              <button
+                                type="button"
+                                className={isHighRiskTerminalCommand(action.command) ? 'danger' : 'primary'}
+                                onClick={() => {
+                                  if (!activeAiConversation) return;
+                                  void runAiTerminalAction(activeAiConversation.id, message.id, action, 'approve_once');
+                                }}
+                              >
+                                {action.status === 'proposed' ? '批准并执行' : '重新执行'}
+                              </button>
+                              {action.status === 'proposed' && <button type="button" onClick={() => {
+                                if (activeAiConversation) void runAiTerminalAction(activeAiConversation.id, message.id, action, 'approve_and_remember');
+                              }}>批准并记住</button>}
+                            </>
                           )}
                           {!['running', 'completed', 'rejected'].includes(action.status) && (
                             <button type="button" onClick={() => rejectAiTerminalAction(message.id, action)}>拒绝</button>
@@ -7478,14 +7982,10 @@ export function App() {
                             <strong>{action.summary}</strong>
                             <span>MCP · {action.serverId}/{action.toolName}</span>
                           </div>
-                          {/* 仅在没有低风险终端动作时，第一条 MCP 动作才会被自动执行 */}
                           {aiAutoRunEnabled
                             && action.status === 'proposed'
-                            && !message.terminalActions.some((item) =>
-                              item.status === 'proposed' && !isHighRiskTerminalCommand(item.command),
-                            )
-                            && message.mcpActions.find((item) => item.status === 'proposed')?.id === action.id && (
-                            <em className="ai-action-auto">自动执行</em>
+                            && shouldAutoDispatch(aiAutoRunPolicy, 'mcp', true) && (
+                            <em className="ai-action-auto">自动提交</em>
                           )}
                         </div>
                         <pre className="ai-terminal-command">{JSON.stringify(action.arguments ?? {}, null, 2)}</pre>
@@ -7494,17 +7994,22 @@ export function App() {
                         )}
                         {action.error && <div className="ai-terminal-error">{action.error}</div>}
                         <div className="ai-terminal-actions">
-                          {['proposed', 'error'].includes(action.status) && (
-                            <button
-                              type="button"
-                              className="primary"
-                              onClick={() => {
-                                if (!activeAiConversation) return;
-                                void runAiMcpAction(activeAiConversation.id, message.id, action);
-                              }}
-                            >
-                              {action.status === 'proposed' ? '授权并调用' : '重新调用'}
-                            </button>
+                          {visibleManualApprovalActions(aiAutoRunPolicy) && ['proposed', 'error'].includes(action.status) && (
+                            <>
+                              <button
+                                type="button"
+                                className="primary"
+                                onClick={() => {
+                                  if (!activeAiConversation) return;
+                                  void runAiMcpAction(activeAiConversation.id, message.id, action, 'approve_once');
+                                }}
+                              >
+                                {action.status === 'proposed' ? '批准并调用' : '重新调用'}
+                              </button>
+                              {action.status === 'proposed' && <button type="button" onClick={() => {
+                                if (activeAiConversation) void runAiMcpAction(activeAiConversation.id, message.id, action, 'approve_and_remember');
+                              }}>批准并记住</button>}
+                            </>
                           )}
                           {!['running', 'completed', 'rejected'].includes(action.status) && (
                             <button type="button" onClick={() => rejectAiMcpAction(message.id, action)}>拒绝</button>
@@ -7631,20 +8136,23 @@ export function App() {
                         ? resolveAiChatModelOptions(aiProviderConfig)
                         : [];
                       const currentEffort = normalizeAiReasoningEffort(aiProviderConfig?.reasoning_effort);
-                      const currentEffortOption = AI_REASONING_EFFORT_OPTIONS.find((item) => item.value === currentEffort);
+                      const currentContextWindow = resolveAiEffectiveContextWindow(aiProviderConfig?.context_window);
+                      const currentAutoRunOption = AI_AUTO_RUN_OPTIONS.find((item) => item.value === aiAutoRunPolicy) ?? AI_AUTO_RUN_OPTIONS[0];
+                      const CurrentAutoRunIcon = currentAutoRunOption.icon;
                       const autoTerminalContext = currentMode === 'agent'
-                        && activePaneTab
-                        && activePaneTab.kind === 'terminal'
-                        && activePaneTab.status === 'connected'
                         && !pendingAiContexts.some(({ kind }) => kind === 'terminal' || kind === 'selection')
-                        ? {
-                          kind: 'terminal' as const,
-                          label: `${activePaneTab.title || activePaneTab.session.name}（仅终端目标，未读取输出）`,
-                          source: activePaneTab.id,
-                          preview: `terminal_target_only: true\nstatus: ${activePaneTab.status}\noutput_authorized: false`,
-                          isRemote: !isLocalResourceTab(activePaneTab),
-                          terminalId: activePaneTab.terminalId,
-                        }
+                        ? activePaneTab
+                          && activePaneTab.kind === 'terminal'
+                          && activePaneTab.status === 'connected'
+                          ? {
+                            kind: 'terminal' as const,
+                            label: `${activePaneTab.title || activePaneTab.session.name}（仅终端目标，未读取输出）`,
+                            source: activePaneTab.id,
+                            preview: `terminal_target_only: true\nstatus: ${activePaneTab.status}\noutput_authorized: false`,
+                            isRemote: !isLocalResourceTab(activePaneTab),
+                            terminalId: activePaneTab.terminalId,
+                          }
+                          : localAiTerminalContext()
                         : null;
                       const contextUsage = estimateAiContextUsage({
                         conversation: activeAiConversation,
@@ -7661,7 +8169,7 @@ export function App() {
                         : contextUsage.percent >= 70
                           ? 'warn'
                           : 'ok';
-                      const toggleComposerMenu = (menu: 'mode' | 'model' | 'effort' | 'context', trigger: HTMLButtonElement) => {
+                      const toggleComposerMenu = (menu: 'mode' | 'autoRun' | 'model' | 'context', trigger: HTMLButtonElement) => {
                         if (aiComposerMenu === menu) {
                           setAiComposerMenu(null);
                           setAiComposerMenuAnchor(null);
@@ -7694,17 +8202,18 @@ export function App() {
                         || providerAccounts[0]?.name
                         || '供应商';
                       const composerMenuMinWidth = aiComposerMenu === 'model'
-                        ? 420
-                        : aiComposerMenu === 'effort'
-                          ? 200
-                          : aiComposerMenu === 'context'
-                            ? 240
+                        ? 410
+                        : aiComposerMenu === 'context'
+                          ? 240
+                          : aiComposerMenu === 'autoRun'
+                            ? 280
                             : 188;
                       const composerPopoverStyle = aiComposerMenuAnchor
                         ? {
                             left: clampFloatingMenuLeft(aiComposerMenuAnchor.left, composerMenuMinWidth),
                             bottom: Math.max(8, window.innerHeight - aiComposerMenuAnchor.top + 6),
-                            minWidth: Math.max(aiComposerMenuAnchor.width + 24, composerMenuMinWidth),
+                            minWidth: Math.min(window.innerWidth - 16, Math.max(aiComposerMenuAnchor.width + 24, composerMenuMinWidth)),
+                            ...(aiComposerMenu === 'model' ? { maxHeight: Math.max(80, aiComposerMenuAnchor.top - 14) } : {}),
                           }
                         : undefined;
                       return (
@@ -7720,9 +8229,7 @@ export function App() {
                               disabled={isAiGenerating}
                               onClick={(event) => toggleComposerMenu('mode', event.currentTarget)}
                             >
-                              {currentMode === 'agent'
-                                ? <Sparkles size={12} className="ai-composer-trigger-icon" aria-hidden />
-                                : <MessageSquarePlus size={12} className="ai-composer-trigger-icon" aria-hidden />}
+                              <AiModeIcon mode={currentMode} size={12} className="ai-composer-trigger-icon" />
                               <span>{currentModeOption?.label ?? 'Agent'}</span>
                               <ChevronDown size={12} aria-hidden />
                             </button>
@@ -7748,9 +8255,7 @@ export function App() {
                                       }}
                                     >
                                       <span className="ai-composer-option-leading">
-                                        {option.value === 'agent'
-                                          ? <Sparkles size={13} aria-hidden />
-                                          : <MessageSquarePlus size={13} aria-hidden />}
+                                        <AiModeIcon mode={option.value} size={13} />
                                       </span>
                                       <span className="ai-composer-option-text">
                                         <strong>{option.label}</strong>
@@ -7767,30 +8272,84 @@ export function App() {
                             )}
                           </div>
                           {currentMode === 'agent' ? (
-                            <button
-                              type="button"
-                              className={`ai-composer-trigger muted ai-auto-run-toggle${aiAutoRunEnabled ? ' on' : ''}`}
-                              aria-label="低风险自动执行"
-                              aria-pressed={aiAutoRunEnabled}
-                              title={aiAutoRunEnabled
-                                ? '已开启：低风险终端/MCP 提案后自动执行（高风险与改文件仍需确认）'
-                                : '关闭：每个动作都需你点授权'}
-                              disabled={isAiGenerating}
-                              onClick={() => {
-                                setAiAutoRunEnabled((on) => {
-                                  const next = !on;
-                                  try {
-                                    window.localStorage.setItem('pandaterm.ai.autoRun', next ? '1' : '0');
-                                  } catch {
-                                    /* ignore */
-                                  }
-                                  return next;
-                                });
-                              }}
-                            >
-                              <Zap size={12} className="ai-composer-trigger-icon" aria-hidden />
-                              <span>自动</span>
-                            </button>
+                            <div className="ai-composer-menu ai-composer-menu-auto-run">
+                              <button
+                                type="button"
+                                className={`ai-composer-trigger muted ai-auto-run-toggle${aiAutoRunPolicy !== 'ask' ? ' on' : ''}${aiComposerMenu === 'autoRun' ? ' open' : ''}`}
+                                aria-label="自动执行权限"
+                                aria-haspopup="listbox"
+                                aria-expanded={aiComposerMenu === 'autoRun'}
+                                title={`${currentAutoRunOption.label}：${currentAutoRunOption.hint}`}
+                                disabled={isAiGenerating}
+                                onClick={(event) => toggleComposerMenu('autoRun', event.currentTarget)}
+                              >
+                                <CurrentAutoRunIcon size={12} className="ai-composer-trigger-icon" aria-hidden />
+                                <span>{currentAutoRunOption.value === 'ask' ? '批准' : currentAutoRunOption.label.replace('自动接受', '自动')}</span>
+                                <ChevronDown size={12} aria-hidden />
+                              </button>
+                              {aiComposerMenu === 'autoRun' && aiComposerMenuAnchor && createPortal(
+                                <div
+                                  className="ai-composer-popover ai-auto-run-popover"
+                                  role="listbox"
+                                  aria-label="选择自动执行权限"
+                                  style={composerPopoverStyle}
+                                >
+                                  <div className="ai-auto-run-popover-header">
+                                    <strong>自动执行权限</strong>
+                                    <span>选择 Agent 遇到编辑和命令时的处理方式</span>
+                                  </div>
+                                  {AI_AUTO_RUN_OPTIONS.map((option) => {
+                                    const selected = option.value === aiAutoRunPolicy;
+                                    const OptionIcon = option.icon;
+                                    return (
+                                      <button
+                                        type="button"
+                                        key={option.value}
+                                        role="option"
+                                        aria-selected={selected}
+                                        className={selected ? 'active' : undefined}
+                                        onClick={() => {
+                                          const generation = aiPermissionUpdateGenerationRef.current + 1;
+                                          aiPermissionUpdateGenerationRef.current = generation;
+                                          aiAutoRunEligibleRef.current.clear();
+                                          setAiPermissionError('');
+                                          void setAiPermissionPolicy(option.value)
+                                            .then((settings) => {
+                                              if (generation !== aiPermissionUpdateGenerationRef.current) return;
+                                              setAiAutoRunPolicy(settings.policy);
+                                              setAiPermissionRules(settings.rules);
+                                              setAiPermissionError(settings.error ?? '');
+                                            })
+                                            .catch((error) => {
+                                              if (generation !== aiPermissionUpdateGenerationRef.current) return;
+                                              setAiPermissionError(error instanceof Error ? error.message : String(error));
+                                            });
+                                          closeComposerMenu();
+                                        }}
+                                      >
+                                        <span className="ai-composer-option-leading">
+                                          <OptionIcon size={14} aria-hidden />
+                                        </span>
+                                        <span className="ai-composer-option-text">
+                                          <strong>{option.label}</strong>
+                                          <em>{option.hint}</em>
+                                        </span>
+                                        <span className="ai-composer-option-check">
+                                          {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
+                                        </span>
+                                      </button>
+                                    );
+                                  })}
+                                  {aiPermissionError && <div className="ai-auto-run-popover-note">权限设置失败：{aiPermissionError}</div>}
+                                  {aiAutoRunPolicy === 'allowlist' && (
+                                    <div className="ai-auto-run-popover-note">
+                                      <button type="button" onClick={() => setAiPermissionManagerOpen(true)}>管理允许列表（{aiPermissionRules.length}）</button>
+                                    </div>
+                                  )}
+                                </div>,
+                                document.body,
+                              )}
+                            </div>
                           ) : null}
                           {aiProviderConfig ? (
                             <div className="ai-composer-menu ai-composer-menu-model">
@@ -7804,7 +8363,8 @@ export function App() {
                                 disabled={isAiGenerating || isAiConfigSaving || Boolean(aiProviderConfig.error)}
                                 onClick={(event) => toggleComposerMenu('model', event.currentTarget)}
                               >
-                                <span>{aiProviderConfig.model || '选择模型'}</span>
+                                <AiModelIcon model={aiProviderConfig.model} apiFormat={aiProviderConfig.api_format} size={12} />
+                                <span>{aiProviderConfig.model || '选择模型'} · {AI_REASONING_EFFORT_OPTIONS.find((option) => option.value === currentEffort)?.label ?? 'Minimal'}</span>
                                 <ChevronDown size={12} aria-hidden />
                               </button>
                               {aiComposerMenu === 'model' && aiComposerMenuAnchor && createPortal(
@@ -7815,42 +8375,20 @@ export function App() {
                                   style={composerPopoverStyle}
                                 >
                                   <div className="ai-composer-picker-body">
-                                    <div className="ai-composer-picker-col providers">
-                                      <div className="ai-composer-popover-label">供应商</div>
-                                      <div className="ai-composer-picker-list" role="listbox" aria-label="供应商列表">
-                                        {providerAccounts.map((account) => {
-                                          const selected = account.id === activeProviderId;
-                                          return (
-                                            <button
-                                              type="button"
-                                              key={account.id}
-                                              role="option"
-                                              aria-selected={selected}
-                                              className={selected ? 'active' : undefined}
-                                              onClick={() => {
-                                                // 切换供应商后保持菜单打开，右侧模型列表随配置刷新
-                                                void selectAiProviderAccountInChat(account.id);
-                                              }}
-                                            >
-                                              <span className="ai-composer-option-text">
-                                                <strong>{account.name || '未命名'}</strong>
-                                                <em>
-                                                  {account.model || '未选模型'}
-                                                  {account.api_key_configured ? '' : ' · 未配置密钥'}
-                                                </em>
-                                              </span>
-                                              <span className="ai-composer-option-check">
-                                                {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
-                                              </span>
-                                            </button>
-                                          );
-                                        })}
-                                      </div>
-                                    </div>
+                                    {providerAccounts.length > 1 && (
+                                      <select
+                                        className="ai-composer-provider-select"
+                                        aria-label="供应商"
+                                        value={activeProviderId}
+                                        disabled={isAiGenerating || isAiConfigSaving}
+                                        onChange={(event) => void selectAiProviderAccountInChat(event.target.value)}
+                                      >
+                                        {providerAccounts.map((account) => (
+                                          <option key={account.id} value={account.id}>{account.name || '未命名'}</option>
+                                        ))}
+                                      </select>
+                                    )}
                                     <div className="ai-composer-picker-col models">
-                                      <div className="ai-composer-popover-label">
-                                        模型 · {activeProviderName}
-                                      </div>
                                       <div className="ai-composer-picker-list" role="listbox" aria-label="模型列表">
                                         {modelOptions.length === 0 ? (
                                           <div className="ai-composer-popover-empty">当前供应商暂无可用模型</div>
@@ -7868,6 +8406,7 @@ export function App() {
                                                 closeComposerMenu();
                                               }}
                                             >
+                                              <AiModelIcon model={model} apiFormat={aiProviderConfig.api_format} />
                                               <span className="ai-composer-option-text single">
                                                 <strong>{model}</strong>
                                               </span>
@@ -7880,6 +8419,64 @@ export function App() {
                                       </div>
                                     </div>
                                   </div>
+                                  <div className="ai-composer-settings-panel">
+                                  <div className="ai-composer-unified-section">
+                                    <div className="ai-composer-popover-label">上下文</div>
+                                    <div className="ai-composer-unified-options" role="listbox" aria-label="选择上下文窗口">
+                                      {AI_CONTEXT_WINDOW_OPTIONS.map((option) => {
+                                        const selected = option.value === currentContextWindow;
+                                        return (
+                                          <button
+                                            type="button"
+                                            key={option.value}
+                                            role="option"
+                                            aria-selected={selected}
+                                            className={selected ? 'active' : undefined}
+                                            onClick={() => {
+                                              void selectAiContextWindow(option.value);
+                                              closeComposerMenu();
+                                            }}
+                                          >
+                                            <span className="ai-composer-option-text">
+                                              <strong>{option.label}</strong>
+                                            </span>
+                                            <span className="ai-composer-option-check">
+                                              {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
+                                            </span>
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                  <div className="ai-composer-unified-section">
+                                    <div className="ai-composer-popover-label">推理强度</div>
+                                    <div className="ai-composer-unified-options" role="listbox" aria-label="选择推理强度">
+                                      {AI_REASONING_EFFORT_OPTIONS.map((option) => {
+                                        const selected = option.value === currentEffort;
+                                        return (
+                                          <button
+                                            type="button"
+                                            key={option.value}
+                                            role="option"
+                                            aria-selected={selected}
+                                            className={selected ? 'active' : undefined}
+                                            onClick={() => {
+                                              void selectAiReasoningEffort(option.value);
+                                              closeComposerMenu();
+                                            }}
+                                          >
+                                            <span className="ai-composer-option-text">
+                                              <strong>{option.label}</strong>
+                                            </span>
+                                            <span className="ai-composer-option-check">
+                                              {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
+                                            </span>
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                  </div>
                                   <div className="ai-composer-popover-footer">
                                     <button
                                       type="button"
@@ -7890,7 +8487,7 @@ export function App() {
                                       }}
                                     >
                                       <Settings size={12} aria-hidden />
-                                      管理供应商与模型…
+                                      管理模型...
                                     </button>
                                   </div>
                                 </div>,
@@ -7902,58 +8499,6 @@ export function App() {
                               尚未配置模型
                             </button>
                           )}
-                          {aiProviderConfig ? (
-                            <div className="ai-composer-menu ai-composer-menu-effort">
-                              <button
-                                type="button"
-                                className={`ai-composer-trigger muted${aiComposerMenu === 'effort' ? ' open' : ''}`}
-                                aria-label="推理强度"
-                                aria-haspopup="listbox"
-                                aria-expanded={aiComposerMenu === 'effort'}
-                                title={currentEffortOption?.hint ?? '推理强度'}
-                                disabled={isAiGenerating || isAiConfigSaving || Boolean(aiProviderConfig.error)}
-                                onClick={(event) => toggleComposerMenu('effort', event.currentTarget)}
-                              >
-                                <span>{currentEffortOption?.label ?? '默认'}</span>
-                                <ChevronDown size={12} aria-hidden />
-                              </button>
-                              {aiComposerMenu === 'effort' && aiComposerMenuAnchor && createPortal(
-                                <div
-                                  className="ai-composer-popover effort"
-                                  role="listbox"
-                                  aria-label="选择推理强度"
-                                  style={composerPopoverStyle}
-                                >
-                                  <div className="ai-composer-popover-label">推理强度</div>
-                                  {AI_REASONING_EFFORT_OPTIONS.map((option) => {
-                                    const selected = option.value === currentEffort;
-                                    return (
-                                      <button
-                                        type="button"
-                                        key={option.value}
-                                        role="option"
-                                        aria-selected={selected}
-                                        className={selected ? 'active' : undefined}
-                                        onClick={() => {
-                                          void selectAiReasoningEffort(option.value);
-                                          closeComposerMenu();
-                                        }}
-                                      >
-                                        <span className="ai-composer-option-text">
-                                          <strong>{option.label}</strong>
-                                          <em>{option.hint}</em>
-                                        </span>
-                                        <span className="ai-composer-option-check">
-                                          {selected ? <Check size={13} strokeWidth={2.4} aria-hidden /> : null}
-                                        </span>
-                                      </button>
-                                    );
-                                  })}
-                                </div>,
-                                document.body,
-                              )}
-                            </div>
-                          ) : null}
                           <div className="ai-composer-menu ai-composer-menu-context">
                             <button
                               type="button"
@@ -7975,7 +8520,6 @@ export function App() {
                                   strokeDashoffset={contextRingOffset}
                                 />
                               </svg>
-                              <span>{contextUsage.percent}%</span>
                             </button>
                             {aiComposerMenu === 'context' && aiComposerMenuAnchor && createPortal(
                               <div
@@ -8041,7 +8585,7 @@ export function App() {
                     disabled={!isAiGenerating && !aiInput.trim()}
                     title={isAiGenerating ? '停止生成' : '发送消息'}
                   >
-                    {isAiGenerating ? <Square size={12} fill="currentColor" /> : <CornerDownLeft size={15} />}
+                    <AiSendIcon stopped={isAiGenerating} />
                   </button>
                 </div>
               </div>
@@ -8195,44 +8739,15 @@ export function App() {
                 {getWorkspaceDropPreview()}
                 {getGhostTab()}
                 {renderTerminalLayoutNode(activeTab.layout ?? createDefaultTerminalLayout(activeTab.id))}
+                {(isLoadingMedia || mediaError || mediaViewer) && (
+                  <div style={{ position: 'absolute', inset: 0, zIndex: 10 }}>
+                    {renderMediaPreview()}
+                  </div>
+                )}
               </div>
             ) : (
               <div className="resource-focus-card">
-                {isLoadingMedia ? (
-                  <div className="resource-preview-empty">
-                    <Home size={30} />
-                    <h2>正在加载媒体...</h2>
-                    <p>{selectedFiles.size > 0 ? [...selectedFiles].join(', ') : ''}</p>
-                  </div>
-                ) : mediaError ? (
-                  <div className="resource-preview-empty is-error">
-                    <File size={30} />
-                    <h2>无法查看媒体</h2>
-                    <p>{mediaError}</p>
-                  </div>
-                ) : mediaViewer ? (
-                  <div className="media-viewer">
-                    <div className="media-viewer-header">
-                      <span className="media-viewer-name">{mediaViewer.name}</span>
-                      <button className="media-viewer-close" title="关闭" onClick={() => closeMediaViewer()}>
-                        <X size={16} />
-                      </button>
-                    </div>
-                    <div className="media-viewer-body">
-                      {mediaViewer.kind === 'image' && (
-                        <img src={mediaViewer.url} alt={mediaViewer.name} className="media-viewer-img" />
-                      )}
-                      {mediaViewer.kind === 'video' && (
-                        <video src={mediaViewer.url} controls autoPlay className="media-viewer-video" />
-                      )}
-                      {mediaViewer.kind === 'audio' && (
-                        <div className="media-viewer-audio-wrap">
-                          <audio src={mediaViewer.url} controls autoPlay />
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                ) : (
+                {(isLoadingMedia || mediaError || mediaViewer) ? renderMediaPreview() : (
                   <div className="resource-preview-empty">
                     <Home size={30} />
                     <h2>{activeTab.session.name} 资源视图</h2>
@@ -8250,6 +8765,7 @@ export function App() {
           <ResourceBottomPanel
             onCancelTransfer={cancelUpload}
             openLocalTerminalKey={openLocalTerminalKey}
+            onLocalTerminalProfile={handleLocalAiTerminalProfile}
           />
 
           <StatusBar tabCount={tabs.length} />
@@ -9619,6 +10135,30 @@ export function App() {
                 {isAiProviderTesting ? '测试中…' : '关闭'}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {aiPermissionManagerOpen && (
+        <div className="dialog-backdrop" onMouseDown={() => setAiPermissionManagerOpen(false)}>
+          <div className="dialog-card" onMouseDown={(event) => event.stopPropagation()}>
+            <h3>允许列表</h3>
+            {aiPermissionRules.length === 0 ? <p className="dialog-message">暂无已允许操作</p> : (
+              <div className="dialog-list">
+                {aiPermissionRules.map((rule) => (
+                  <div className="dialog-list-row" key={rule.id}>
+                    <span>{rule.name} · {rule.target ?? '未指定目标'}</span>
+                    <button type="button" title="删除允许规则" onClick={() => {
+                      void removeAiAllowlistRule(rule.id).then((settings) => {
+                        setAiPermissionRules(settings.rules);
+                        setAiAutoRunPolicy(settings.policy);
+                      }).catch((error) => setAiPermissionError(error instanceof Error ? error.message : String(error)));
+                    }}><Trash2 size={14} aria-hidden /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="dialog-actions"><button className="dialog-btn" onClick={() => setAiPermissionManagerOpen(false)}>关闭</button></div>
           </div>
         </div>
       )}

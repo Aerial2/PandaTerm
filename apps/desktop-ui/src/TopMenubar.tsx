@@ -21,6 +21,8 @@ import {
   PANDATERM_GITHUB_REPO,
   type LatestVersionResult,
 } from './aboutModel';
+import type { ActivityPanel } from './activity';
+import { ActivityBarIcon } from './ActivityBarIcon';
 
 const SHOW_IP_STORAGE_KEY = 'pandaterm.topStatus.showIp';
 
@@ -57,7 +59,7 @@ type TopMenubarProps = {
   onOpenConnectionCreate: () => void;
   onOpenConnectionManage: () => void;
   onOpenAiSettings: () => void;
-  onSetLeftActivity: (panel: 'files' | 'monitor' | 'processes' | 'ai') => void;
+  onSetLeftActivity: (panel: ActivityPanel) => void;
 };
 
 type AboutState = {
@@ -256,6 +258,14 @@ export function TopMenubar({
             </span>
             {activeMenu === '查看' && (
               <div className="menubar-dropdown" role="menu">
+                <button
+                  className="menubar-menu-item"
+                  role="menuitem"
+                  onClick={() => runAndClose(() => onSetLeftActivity('recent'))}
+                >
+                  <ActivityBarIcon name="files" size={14} />
+                  <span>最近文件</span>
+                </button>
                 <button
                   className="menubar-menu-item"
                   role="menuitem"

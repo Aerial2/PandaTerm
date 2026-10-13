@@ -67,6 +67,16 @@ pub(crate) struct AiStoredMessage {
     pub(crate) tool_calls: Option<Vec<AiStoredToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) usage: Option<AiStoredUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) step_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) phase: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +314,16 @@ fn validate_message(message: &AiStoredMessage) -> Result<usize, String> {
     }
     if message.created_at.len() > 64 || message.content.chars().count() > 64_000 {
         return Err("单条 AI 会话消息过长或时间无效".to_string());
+    }
+    for (label, value, max_len) in [
+        ("Agent", message.agent_id.as_deref(), 100usize),
+        ("账号", message.account_id.as_deref(), 200usize),
+        ("模型", message.model.as_deref(), 200usize),
+        ("阶段", message.phase.as_deref(), 100usize),
+    ] {
+        if value.is_some_and(|value| value.is_empty() || value.len() > max_len || value.chars().any(char::is_control)) {
+            return Err(format!("AI 会话{}元数据无效", label));
+        }
     }
     if message.contexts.len() > 20
         || message.contexts.iter().any(|context| {
@@ -590,6 +610,21 @@ pub(crate) fn upsert_conversation(
                 if node.message.usage.is_none() {
                     node.message.usage = old_node.message.usage.clone();
                 }
+                if node.message.agent_id.is_none() {
+                    node.message.agent_id = old_node.message.agent_id.clone();
+                }
+                if node.message.account_id.is_none() {
+                    node.message.account_id = old_node.message.account_id.clone();
+                }
+                if node.message.model.is_none() {
+                    node.message.model = old_node.message.model.clone();
+                }
+                if node.message.step_index.is_none() {
+                    node.message.step_index = old_node.message.step_index;
+                }
+                if node.message.phase.is_none() {
+                    node.message.phase = old_node.message.phase.clone();
+                }
                 // Missing old action records are history, not a request to delete them.
                 for old_action in &old_node.message.actions {
                     let action_id = |action: &AiStoredAction| match action {
@@ -672,6 +707,16 @@ mod tests {
             .unwrap()
     }
 
+    fn pinned_message(id: &str) -> AiStoredMessage {
+        let mut result = message(id);
+        result.agent_id = Some("agent-1".into());
+        result.account_id = Some("account-1".into());
+        result.model = Some("model-1".into());
+        result.step_index = Some(4);
+        result.phase = Some("tool_pending".into());
+        result
+    }
+
     fn path_ids(conversation: &AiConversation) -> Vec<&str> {
         conversation
             .messages
@@ -706,6 +751,60 @@ mod tests {
     fn legacy_v2_without_tree_also_migrates() {
         let store = decode_store(&store_json(2, &conversation())).unwrap();
         assert!(store.conversations[0].tree.is_some());
+    }
+
+    #[test]
+    fn routing_metadata_round_trips_through_store_encoding() {
+        let mut conversation = conversation();
+        conversation.messages[0] = pinned_message("root");
+        normalize_conversation(&mut conversation).unwrap();
+        let store = AiConversationStore {
+            version: 2,
+            conversations: vec![conversation],
+        };
+
+        let encoded = encode_store(&store).unwrap();
+        let reloaded = decode_store(&encoded).unwrap();
+        let restored = &reloaded.conversations[0].messages[0];
+        assert_eq!(restored.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(restored.account_id.as_deref(), Some("account-1"));
+        assert_eq!(restored.model.as_deref(), Some("model-1"));
+        assert_eq!(restored.step_index, Some(4));
+        assert_eq!(restored.phase.as_deref(), Some("tool_pending"));
+    }
+
+    #[test]
+    fn legacy_json_without_routing_metadata_remains_loadable() {
+        let store = decode_store(&store_json(2, &conversation())).unwrap();
+        let restored = &store.conversations[0].messages[0];
+        assert_eq!(restored.agent_id, None);
+        assert_eq!(restored.account_id, None);
+        assert_eq!(restored.model, None);
+        assert_eq!(restored.step_index, None);
+        assert_eq!(restored.phase, None);
+    }
+
+    #[test]
+    fn partial_upsert_preserves_existing_routing_metadata() {
+        let mut existing = conversation();
+        existing.messages[0] = pinned_message("root");
+        normalize_conversation(&mut existing).unwrap();
+        let mut store = AiConversationStore {
+            version: 2,
+            conversations: vec![existing],
+        };
+
+        let mut incoming = store.conversations[0].clone();
+        incoming.tree = None;
+        incoming.messages[0] = message("root");
+        upsert_conversation(&mut store, incoming).unwrap();
+
+        let restored = &store.conversations[0].messages[0];
+        assert_eq!(restored.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(restored.account_id.as_deref(), Some("account-1"));
+        assert_eq!(restored.model.as_deref(), Some("model-1"));
+        assert_eq!(restored.step_index, Some(4));
+        assert_eq!(restored.phase.as_deref(), Some("tool_pending"));
     }
 
     #[test]

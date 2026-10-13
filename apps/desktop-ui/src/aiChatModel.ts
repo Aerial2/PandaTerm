@@ -22,19 +22,20 @@ export const AI_MODE_OPTIONS: Array<{ value: AiConversationMode; label: string; 
 ];
 
 /** OpenAI-compatible reasoning_effort；none = 请求体不带字段 */
-export type AiReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+export type AiReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export const AI_REASONING_EFFORT_OPTIONS: Array<{ value: AiReasoningEffort; label: string; hint: string }> = [
-  { value: 'none', label: '默认', hint: '不发送推理强度' },
-  { value: 'minimal', label: '最低', hint: 'Minimal' },
-  { value: 'low', label: '低', hint: 'Low' },
-  { value: 'medium', label: '中', hint: 'Medium' },
-  { value: 'high', label: '高', hint: 'High' },
-  { value: 'xhigh', label: '最高', hint: 'Extra High' },
+  { value: 'none', label: 'Disable', hint: '' },
+  { value: 'low', label: 'Low', hint: '' },
+  { value: 'medium', label: 'Medium', hint: '' },
+  { value: 'high', label: 'High', hint: '' },
+  { value: 'xhigh', label: 'X-High', hint: '' },
+  { value: 'max', label: 'Max', hint: '' },
 ];
 
 export function normalizeAiReasoningEffort(value?: string | null): AiReasoningEffort {
   const next = (value ?? 'none').trim().toLowerCase();
+  if (next === 'minimal') return 'minimal';
   return (AI_REASONING_EFFORT_OPTIONS.find((item) => item.value === next)?.value) ?? 'none';
 }
 
@@ -89,9 +90,10 @@ const AI_AGENT_INSTRUCTIONS = `## 模式：Agent（工具循环）
 4. **一步一事**：每回合最多提出完成**当前步骤**必需的动作；不要一次堆叠无关命令。
 
 ### 授权与 UI（关键）
-- 界面上的动作卡片**就是**授权 UI。提交 tool call = 请求授权，**不会**立刻在机器上执行。
+- 界面动作卡片与当前权限模式共同决定工具能否执行。提交 tool call 只提交一个动作请求；后端会按当前模式再次判定，拒绝结果也会作为工具结果回传。
 - **禁止**在正文里再问“要我执行吗 / 是否同意 / 需要我继续吗”。
-- 用户可能开启「低风险自动执行」：低风险终端命令与 MCP 可能在提案后自动跑；**高风险命令与文件修改始终人工确认**。你的行为不变：照常提动作即可。
+- 权限模式为：逐项批准（每次执行由用户批准）、编辑（仅专用文件编辑自动执行）、仅限已允许（仅精确匹配已允许操作的条目执行，未命中即拒绝）、完全访问（注册工具通过参数与目标验证后自动执行）。不要根据模型自述的风险等级判断授权。
+- 终端动作始终按终端工具授权，即使命令会修改文件；仅限已允许只匹配完整操作，不依赖命令前缀或工具名称。
 - 未实际提交 tool call 时，禁止声称“已提交 / 已执行 / 将执行”。
 
 ### 终端 — run_terminal_command
@@ -200,10 +202,12 @@ export function canContinueAiAgent(conversation: AiConversationState): boolean {
 
 export function formatAiRequestContent(message: Pick<AiMessage, 'content' | 'contexts'>): string {
   if (message.contexts.length === 0) return message.content;
-  const context = message.contexts.map(({ kind, label, source, preview }) => ({
+  const context = message.contexts.map(({ kind, label, source, preview, isRemote, terminalId }) => ({
     kind,
     label,
     source: source ?? null,
+    terminal_id: terminalId ?? null,
+    is_remote: isRemote ?? null,
     content: preview,
   }));
   return `${message.content}\n\n<workspace_context_json>\n${JSON.stringify(context)}\n</workspace_context_json>`;

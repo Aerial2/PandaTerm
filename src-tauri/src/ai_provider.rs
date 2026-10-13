@@ -403,7 +403,7 @@ pub fn build_payload(
     if let Some(effort) = reasoning_effort {
         if !matches!(
             effort,
-            "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
         ) {
             return Err("reasoning_effort 值无效".into());
         }
@@ -1399,6 +1399,7 @@ mod tests {
                 name: "run_terminal_command".into(),
                 arguments: json!({"terminal_id":"00000000-0000-0000-0000-000000000001","command":"echo local","timeout_ms":30000}),
                 approved: true,
+                execution_intent: crate::ai_tools::ExecutionIntent::ApproveOnce,
                 timeout_ms: Some(30000),
                 conversation_id: None,
                 agent_id: None,
@@ -1480,6 +1481,40 @@ mod tests {
             true,
             0,
             None,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn reasoning_menu_values_are_validated_and_sent_unchanged() {
+        let messages = [json!({"role":"user","content":"hello"})];
+        for effort in ["none", "low", "medium", "high", "xhigh", "max", "minimal"] {
+            let validated = crate::ai_config::validate_ai_reasoning_effort(effort).unwrap();
+            let payload = build_payload(
+                ProviderKind::OpenAi,
+                "m",
+                &messages,
+                false,
+                0,
+                crate::ai_config::ai_request_reasoning_effort(&validated),
+                false,
+            )
+            .unwrap();
+            if effort == "none" {
+                assert!(payload.get("reasoning_effort").is_none());
+            } else {
+                assert_eq!(payload["reasoning_effort"], effort);
+            }
+        }
+        assert!(crate::ai_config::validate_ai_reasoning_effort("invalid").is_err());
+        assert!(build_payload(
+            ProviderKind::OpenAi,
+            "m",
+            &messages,
+            false,
+            0,
+            Some("invalid"),
             false
         )
         .is_err());

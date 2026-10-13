@@ -192,6 +192,8 @@ pub struct CallMcpToolRequest {
     pub tool_name: String,
     #[serde(default)]
     pub arguments: Option<Value>,
+    #[serde(default)]
+    pub execution_intent: crate::ai_tools::ExecutionIntent,
 }
 
 #[derive(Debug, Clone, Serialize)]

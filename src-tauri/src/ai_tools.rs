@@ -1,5 +1,5 @@
 //! Native tool schemas, fail-closed execution policy, and bounded execution tracking.
-//! Model proposals never supply an executable file edit: only reviewed full content does.
+//! File edits are prepared and verified before the execution gate can write them.
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +28,70 @@ pub enum PermissionDecision {
     Ask,
     Allow,
     Deny,
+}
+
+/// User-selected policy for AI-originated tool execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiPermissionPolicy {
+    Ask,
+    Edit,
+    Allowlist,
+    Full,
+}
+
+impl Default for AiPermissionPolicy {
+    fn default() -> Self {
+        Self::Ask
+    }
+}
+
+/// Why the frontend submitted this concrete invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionIntent {
+    Automatic,
+    ApproveOnce,
+    ApproveAndRemember,
+}
+
+impl Default for ExecutionIntent {
+    fn default() -> Self {
+        Self::Automatic
+    }
+}
+
+/// Evaluate policy after the invocation has been parsed and validated.
+/// `allowlisted` must describe this exact invocation, never a tool-wide grant.
+pub fn evaluate_policy(
+    policy: AiPermissionPolicy,
+    kind: ToolKind,
+    intent: ExecutionIntent,
+    allowlisted: bool,
+) -> PermissionDecision {
+    match (policy, intent) {
+        (AiPermissionPolicy::Ask, ExecutionIntent::Automatic) => PermissionDecision::Deny,
+        (AiPermissionPolicy::Ask, _) => PermissionDecision::Allow,
+        (AiPermissionPolicy::Edit, ExecutionIntent::Automatic) => {
+            if kind == ToolKind::FileEdit {
+                PermissionDecision::Allow
+            } else {
+                PermissionDecision::Deny
+            }
+        }
+        (AiPermissionPolicy::Edit, _) => PermissionDecision::Allow,
+        (AiPermissionPolicy::Allowlist, ExecutionIntent::Automatic) => {
+            if allowlisted {
+                PermissionDecision::Allow
+            } else {
+                PermissionDecision::Deny
+            }
+        }
+        // Allowlist mode is deliberately fail-closed: an explicit one-time
+        // approval cannot silently create an execution outside the list.
+        (AiPermissionPolicy::Allowlist, _) => PermissionDecision::Deny,
+        (AiPermissionPolicy::Full, _) => PermissionDecision::Allow,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,7 +126,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "propose_file_edit".into(),
             kind: ToolKind::FileEdit,
-            description: "提交精确文件编辑授权提案；需要读取、差异预览和审核后才能写入。".into(),
+            description: "提交精确文件编辑提案；系统会在策略授权后读取、校验并执行。".into(),
             permission: PermissionDecision::Ask,
             input_schema: json!({
                 "type":"object", "additionalProperties":false,
@@ -128,7 +192,7 @@ pub fn openai_specs() -> Vec<Value> {
         .collect()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteToolRequest {
     /// Stable UI action identity, distinct from the provider call identity.
     #[serde(default)]
@@ -137,8 +201,12 @@ pub struct ExecuteToolRequest {
     pub name: String,
     #[serde(default)]
     pub arguments: Value,
+    /// Legacy approval bit retained for wire compatibility. New callers must
+    /// use `execution_intent`; policy evaluation does not trust this bit alone.
     #[serde(default)]
     pub approved: bool,
+    #[serde(default)]
+    pub execution_intent: ExecutionIntent,
     pub timeout_ms: Option<u64>,
     /// Conversation routing metadata is echoed on every native result.
     #[serde(default)]
@@ -214,6 +282,8 @@ pub struct FileEditArguments {
     pub terminal_id: Option<String>,
     pub original_content: String,
     pub new_content: String,
+    #[serde(default)]
+    pub edits: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,21 +318,46 @@ pub fn validate_tool_call_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Apply the frontend's sequential edit proposal with the same exact-match
+/// rules used by preparation and execution. Every search must occur exactly
+/// once in the content at that step, and a proposal must change the content.
+pub fn apply_file_edits(original: &str, edits: &[Value]) -> Result<String, String> {
+    if edits.is_empty() {
+        return Err("文件编辑提案不能为空".into());
+    }
+    let mut content = original.to_owned();
+    for edit in edits {
+        let search = edit
+            .get("search")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "文件编辑搜索内容不能为空".to_string())?;
+        let replace = edit
+            .get("replace")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "文件编辑替换内容无效".to_string())?;
+        let occurrences = content.match_indices(search).count();
+        if occurrences != 1 {
+            return Err(if occurrences == 0 {
+                "AI_EDIT_STALE:搜索内容不存在或文件已变化".into()
+            } else {
+                "AI_EDIT_AMBIGUOUS:搜索内容必须只匹配一次".into()
+            });
+        }
+        let position = content.find(search).expect("one match was counted");
+        content.replace_range(position..position + search.len(), replace);
+    }
+    if content == original {
+        return Err("AI_EDIT_NO_CHANGE:文件编辑不会产生变化".into());
+    }
+    Ok(content)
+}
+
 pub fn validate_request(
     request: &ExecuteToolRequest,
 ) -> Result<ValidatedExecution, ToolExecutionResult> {
     let error = |message: String| ToolExecutionResult::new(request, "error", message, true);
     validate_tool_call_id(&request.tool_call_id).map_err(&error)?;
-    if decide(&request.name, request.approved, false, false).map_err(&error)?
-        != PermissionDecision::Allow
-    {
-        return Err(ToolExecutionResult::new(
-            request,
-            "denied",
-            "工具执行尚未获得用户授权；未执行任何操作",
-            true,
-        ));
-    }
     if !request.arguments.is_object() {
         return Err(error("工具 arguments 必须为对象".into()));
     }
@@ -290,7 +385,12 @@ pub fn validate_request(
             Invocation::Terminal(args)
         }
         "propose_file_edit" => {
-            let args: FileEditArguments = serde_json::from_value(request.arguments.clone()).map_err(|e| error(format!("文件执行必须提交审核后的 path/original_content/new_content；不能直接执行 edits：{e}")))?;
+            let args: FileEditArguments = serde_json::from_value(request.arguments.clone())
+                .map_err(|e| {
+                    error(format!(
+                        "文件执行参数无效；需要 path/original_content/new_content，可选 edits：{e}"
+                    ))
+                })?;
             if args.path.trim().is_empty() || args.path.contains('\0') {
                 return Err(error("文件路径无效".into()));
             }
@@ -312,7 +412,7 @@ pub fn validate_request(
             }
             Invocation::Mcp(args)
         }
-        _ => unreachable!("decide rejects unknown tools"),
+        _ => return Err(error("未注册的 Agent 工具".into())),
     };
     if timeout_ms == 0 || timeout_ms > 120_000 {
         return Err(error("工具超时必须为 1-120000 毫秒".into()));
@@ -464,6 +564,7 @@ impl ExecutionTracker {
             name: request.name.clone(),
             arguments: Value::Null,
             approved: false,
+            execution_intent: ExecutionIntent::Automatic,
             timeout_ms: None,
             conversation_id: request.conversation_id.clone(),
             agent_id: request.agent_id.clone(),
@@ -517,6 +618,7 @@ impl ExecutionTracker {
                 _ = tokio::time::sleep_until(deadline) => ToolExecutionResult::new(&request, "timeout", interrupted_message(&request.name, true), true),
                 outcome = &mut operation => match outcome {
                     Ok((content, is_error)) => ToolExecutionResult::new(&request, if is_error { "error" } else { "completed" }, content, is_error),
+                    Err(error) if error.starts_with("denied|") => ToolExecutionResult::new(&request, "denied", error.trim_start_matches("denied|"), true),
                     Err(error) => ToolExecutionResult::new(&request, "error", error, true),
                 },
             }
@@ -617,11 +719,45 @@ mod tests {
             name: "call_mcp_tool".into(),
             arguments: json!({"server":"server-1","tool":"test","arguments":{}}),
             approved: true,
+            execution_intent: ExecutionIntent::ApproveOnce,
             timeout_ms: Some(1000),
             conversation_id: None,
             agent_id: None,
             step_index: None,
         }
+    }
+
+    #[test]
+    fn sequential_file_edits_require_unique_matches_and_change() {
+        let edits = vec![json!({"search":"one", "replace":"ONE"})];
+        assert_eq!(apply_file_edits("one two", &edits).unwrap(), "ONE two");
+        assert!(apply_file_edits("one one", &edits)
+            .unwrap_err()
+            .contains("AMBIGUOUS"));
+        assert!(apply_file_edits("two", &edits)
+            .unwrap_err()
+            .contains("STALE"));
+        assert!(
+            apply_file_edits("one", &[json!({"search":"one", "replace":"one"})])
+                .unwrap_err()
+                .contains("NO_CHANGE")
+        );
+        assert!(apply_file_edits(
+            "one one",
+            &[
+                json!({"search":"one", "replace":"ONE"}),
+                json!({"search":"one", "replace":"TWO"})
+            ]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unknown_file_edit_fields_are_rejected() {
+        let result: Result<FileEditArguments, _> = serde_json::from_value(json!({
+            "path":"/tmp/file", "original_content":"a", "new_content":"b", "authorization_identity":"client"
+        }));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -644,6 +780,86 @@ mod tests {
             .get("target_source")
             .is_some());
         assert_eq!(openai_specs().len(), 3);
+    }
+
+    #[test]
+    fn permission_policy_matrix_is_fail_closed() {
+        for kind in [ToolKind::Terminal, ToolKind::FileEdit, ToolKind::Mcp] {
+            assert_eq!(
+                evaluate_policy(
+                    AiPermissionPolicy::Ask,
+                    kind,
+                    ExecutionIntent::Automatic,
+                    true
+                ),
+                PermissionDecision::Deny
+            );
+            assert_eq!(
+                evaluate_policy(
+                    AiPermissionPolicy::Ask,
+                    kind,
+                    ExecutionIntent::ApproveOnce,
+                    false
+                ),
+                PermissionDecision::Allow
+            );
+            assert_eq!(
+                evaluate_policy(
+                    AiPermissionPolicy::Allowlist,
+                    kind,
+                    ExecutionIntent::Automatic,
+                    false
+                ),
+                PermissionDecision::Deny
+            );
+            assert_eq!(
+                evaluate_policy(
+                    AiPermissionPolicy::Allowlist,
+                    kind,
+                    ExecutionIntent::Automatic,
+                    true
+                ),
+                PermissionDecision::Allow
+            );
+            assert_eq!(
+                evaluate_policy(
+                    AiPermissionPolicy::Allowlist,
+                    kind,
+                    ExecutionIntent::ApproveOnce,
+                    true
+                ),
+                PermissionDecision::Deny
+            );
+            assert_eq!(
+                evaluate_policy(
+                    AiPermissionPolicy::Full,
+                    kind,
+                    ExecutionIntent::Automatic,
+                    false
+                ),
+                PermissionDecision::Allow
+            );
+        }
+        assert_eq!(
+            evaluate_policy(
+                AiPermissionPolicy::Edit,
+                ToolKind::FileEdit,
+                ExecutionIntent::Automatic,
+                false,
+            ),
+            PermissionDecision::Allow
+        );
+        for kind in [ToolKind::Terminal, ToolKind::Mcp] {
+            assert_eq!(
+                evaluate_policy(
+                    AiPermissionPolicy::Edit,
+                    kind,
+                    ExecutionIntent::Automatic,
+                    true
+                ),
+                PermissionDecision::Deny
+            );
+        }
     }
 
     #[test]
@@ -704,7 +920,6 @@ mod tests {
         let tracker = ExecutionTracker::default();
         let count = AtomicUsize::new(0);
         for (id, name, approved) in [
-            ("deny", "call_mcp_tool", false),
             ("unknown", "unknown", true),
             ("bad id", "call_mcp_tool", true),
         ] {

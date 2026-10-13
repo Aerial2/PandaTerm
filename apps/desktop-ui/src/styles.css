@@ -537,6 +537,14 @@ button:disabled {
   background: #303640;
 }
 
+.activity-bar-icon-glyph {
+  display: block;
+  flex: 0 0 auto;
+  background-color: currentColor;
+  -webkit-mask: var(--activity-icon-url) center / contain no-repeat;
+  mask: var(--activity-icon-url) center / contain no-repeat;
+}
+
 /* ============================================================
    Side Panel — Expandable panel beside the activity bar
    ============================================================ */
@@ -847,6 +855,33 @@ button:disabled {
 
 .ai-message-body {
   min-width: 0;
+}
+
+.ai-message-branch-button {
+  display: inline-flex;
+  width: auto;
+  height: 22px;
+  margin-bottom: 5px;
+  padding: 0 7px;
+  align-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 5px;
+  color: var(--text-muted);
+  background: transparent;
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.ai-message-branch-button:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.ai-message-branch-button:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .ai-message-status {
@@ -1510,6 +1545,37 @@ button:disabled {
   gap: 4px;
 }
 
+.ai-input-footer-meta > .ai-composer-menu:first-child {
+  border-radius: 999px;
+  background: #2A2D2E;
+}
+
+.ai-input-footer-meta > .ai-composer-menu:first-child > .ai-composer-trigger {
+  height: 24px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 999px;
+  color: #C8C8C8;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.ai-input-footer-meta > .ai-composer-menu:first-child > .ai-composer-trigger:hover:not(:disabled),
+.ai-input-footer-meta > .ai-composer-menu:first-child > .ai-composer-trigger.open:not(:disabled) {
+  border-color: transparent;
+  color: #E0E0E0;
+  background: #333637;
+}
+
+.ai-input-footer-meta > .ai-composer-menu:first-child .ai-composer-trigger-icon {
+  opacity: 1;
+}
+
+.ai-input-footer-meta > .ai-composer-menu:first-child .ai-composer-trigger > svg:last-child {
+  opacity: 0.55;
+}
+
 /* Cursor 风格：幽灵触发器 + 上浮菜单（portal + fixed，避免面板裁切） */
 .ai-composer-menu {
   position: relative;
@@ -1627,23 +1693,118 @@ button:disabled {
   max-width: min(300px, calc(100vw - 16px));
 }
 
-/* 供应商 + 模型 双栏选择器 */
+/* 左侧上下文/推理设置与右侧模型菜单共用定位及关闭行为。 */
 .ai-composer-popover.provider-model {
-  display: flex;
-  flex-direction: column;
-  max-width: min(480px, calc(100vw - 16px));
-  max-height: min(320px, calc(100vh - 24px));
+  display: grid;
+  grid-template-columns: 148px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+  column-gap: 4px;
+  max-width: min(410px, calc(100vw - 16px));
+  max-height: calc(100vh - 24px);
   padding: 0;
-  overflow: hidden;
-  gap: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.ai-composer-settings-panel {
+  grid-column: 1;
+  grid-row: 1 / 3;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 3px 8px 4px;
+  border: 1px solid #414141;
+  border-radius: 7px;
+  background: #242424;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
 }
 
 .ai-composer-picker-body {
-  display: grid;
-  grid-template-columns: minmax(148px, 188px) minmax(200px, 1fr);
+  grid-column: 2;
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  align-self: end;
   min-height: 0;
-  flex: 1;
+  max-height: min(300px, calc(100vh - 64px));
+  padding: 4px 0 0;
   overflow: hidden;
+  border: 1px solid #414141;
+  border-bottom: 0;
+  border-radius: 7px 7px 0 0;
+  background: #242424;
+}
+
+.ai-composer-provider-select {
+  flex-shrink: 0;
+  min-width: 0;
+  margin: 2px 8px 5px;
+  padding: 4px 6px;
+  border: 1px solid #414141;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  background: #242424;
+  font: inherit;
+}
+
+.ai-composer-unified-section {
+  display: grid;
+  padding: 0 0 3px;
+}
+
+.ai-composer-unified-section + .ai-composer-unified-section {
+  margin-top: 1px;
+  padding-top: 3px;
+  border-top: 1px solid #414141;
+}
+
+.ai-composer-unified-section .ai-composer-popover-label {
+  padding: 5px 4px 4px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+.ai-composer-unified-options {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.ai-composer-unified-options > button {
+  display: flex;
+  min-width: 0;
+  height: 28px;
+  padding: 0 4px;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  border-radius: 4px;
+  color: #d4d4d4;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ai-composer-unified-options > button:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.ai-composer-unified-options .ai-composer-option-text {
+  min-width: 0;
+}
+
+.ai-composer-unified-options .ai-composer-option-text strong {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-composer-unified-options .ai-composer-option-check {
+  flex-shrink: 0;
 }
 
 .ai-composer-picker-col {
@@ -1695,10 +1856,24 @@ button:disabled {
 }
 
 .ai-composer-popover.provider-model .ai-composer-popover-footer {
-  flex-shrink: 0;
+  grid-column: 2;
+  grid-row: 2;
   margin-top: 0;
   padding: 3px 5px 5px;
+  border: 1px solid #414141;
   border-top: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 0 0 7px 7px;
+  background: #242424;
+}
+
+.ai-composer-popover.provider-model .models .ai-composer-picker-list > button {
+  min-height: 30px;
+  padding: 5px 8px;
+}
+
+.ai-composer-popover.provider-model .models .ai-composer-option-text strong {
+  font-size: 12px;
+  font-weight: 400;
 }
 
 .ai-composer-popover.effort {
@@ -1748,8 +1923,8 @@ button:disabled {
 }
 
 .ai-context-usage-ring {
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
   flex-shrink: 0;
   transform: rotate(-90deg);
 }
@@ -1963,6 +2138,57 @@ button:disabled {
   border-top: 1px solid rgba(255, 255, 255, 0.06);
 }
 
+.ai-composer-menu-auto-run {
+  flex-shrink: 0;
+}
+
+.ai-auto-run-popover {
+  max-width: min(320px, calc(100vw - 16px));
+  padding: 5px;
+}
+
+.ai-auto-run-popover-header {
+  display: grid;
+  gap: 3px;
+  padding: 8px 9px 7px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.ai-auto-run-popover-header strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ai-auto-run-popover-header span,
+.ai-auto-run-popover-note {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.ai-auto-run-popover > button {
+  margin-top: 1px;
+  padding: 8px 7px;
+}
+
+.ai-auto-run-popover > button.active {
+  color: var(--text-primary);
+  background: rgba(152, 195, 121, 0.11);
+}
+
+.ai-auto-run-popover > button.active .ai-composer-option-leading,
+.ai-auto-run-popover > button.active .ai-composer-option-check {
+  color: #98c379;
+}
+
+.ai-auto-run-popover-note {
+  margin: 3px 4px 2px;
+  padding: 7px 5px 1px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+
 .ai-composer-popover-action {
   display: flex;
   width: 100%;
@@ -2168,43 +2394,49 @@ button:disabled {
 
 .ai-input-shell {
   overflow: visible;
-  border: 1px solid rgba(var(--ai-fg-rgb), 0.26);
-  border-radius: 9px;
-  background: var(--ai-bg);
+  border: 0;
+  border-radius: 10px;
+  background: #3C3C3C;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16);
-  transition: border-color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
+  transition: box-shadow var(--t-fast) var(--ease);
 }
 
 .ai-input-shell:focus-within {
-  border-color: rgba(var(--ai-fg-rgb), 0.58);
-  box-shadow: 0 0 0 2px rgba(var(--ai-fg-rgb), 0.1), 0 8px 24px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
 }
 
 .ai-input-shell textarea {
   display: block;
   width: 100%;
   box-sizing: border-box;
-  min-height: 40px;
+  min-height: 60px;
   max-height: 180px;
-  padding: 10px 11px 5px;
+  padding: 12px 13px 5px;
   resize: none;
   overflow-x: hidden;
   overflow-y: auto;
   border: 0;
   outline: 0;
-  color: var(--text-primary);
+  color: #B8B8B8;
   background: transparent;
-  font: 12px/1.55 var(--font-ui);
+  font: 13px/1.55 var(--font-ui);
 }
 
 .ai-input-shell textarea::placeholder {
-  color: #676d78;
+  color: #A6A6A6;
+  opacity: 1;
+}
+
+.ai-input-footer-meta .ai-composer-menu-model > .ai-composer-trigger {
+  color: #A6A6A6;
+  font-size: 11px;
+  font-weight: 400;
 }
 
 .ai-input-footer {
   display: flex;
   min-height: 32px;
-  padding: 3px 6px 6px 10px;
+  padding: 3px 6px 6px 7px;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -2219,24 +2451,26 @@ button:disabled {
   padding: 0;
   place-items: center;
   border: 0;
-  border-radius: 6px;
-  color: var(--ai-bg);
-  background: var(--ai-fg);
+  border-radius: 50%;
+  background: transparent;
   cursor: pointer;
 }
 
-.ai-send-button:hover:not(:disabled) {
-  filter: brightness(1.12);
+.ai-send-button:not(.stop):not(:disabled) {
+  background: #0E639C;
+}
+
+.ai-send-button:not(.stop):not(:disabled) img {
+  filter: brightness(0) invert(1);
 }
 
 .ai-send-button.stop {
-  color: #f2c8cc;
-  background: rgba(224, 108, 117, 0.22);
+  background: transparent;
 }
 
 .ai-send-button:disabled {
-  color: #777d87;
-  background: #343942;
+  background: transparent;
+  opacity: 0.4;
   cursor: default;
 }
 

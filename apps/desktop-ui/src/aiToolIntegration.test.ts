@@ -57,6 +57,22 @@ describe('native tool history and continuation', () => {
     expect(resolvedAiToolResults(source).find(({ id }) => id === 'e')?.isError).toBe(status !== 'applied');
   });
 
+  it('pairs mixed permission denials and cancellation before continuing exactly once', () => {
+    const source = withActions();
+    source.terminalActions[0] = { ...source.terminalActions[0], status: 'rejected', error: 'allowlist miss' };
+    source.mcpActions[0] = { ...source.mcpActions[0], status: 'cancelled', error: 'cancelled' };
+    source.proposals[0] = { ...source.proposals[0], status: 'rejected', error: 'prepare denied' };
+    const current = conversation(source);
+    const prepared = prepareAiToolContinuation(current, 'a', () => 'result')!;
+    const results = JSON.parse(prepared.resultMessage.content);
+    expect(results.map(({ tool_call_id, is_error }: { tool_call_id: string; is_error: boolean }) => [tool_call_id, is_error]))
+      .toEqual([['t', true], ['m', true], ['e', true]]);
+    expect(results.map(({ content }: { content: string }) => JSON.parse(content).status))
+      .toEqual(['rejected', 'cancelled', 'rejected']);
+    const restored = JSON.parse(JSON.stringify({ ...current, messages: [...prepared.baseMessages, prepared.resultMessage] }));
+    expect(prepareAiToolContinuation(restored, 'a')).toBeNull();
+  });
+
   it('returns validation failures for a native call with no accepted UI action', () => {
     const source = message('a');
     source.toolCalls = [{ id: 'bad', name: 'unknown', arguments: '{}' }];
