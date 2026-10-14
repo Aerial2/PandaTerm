@@ -3857,6 +3857,7 @@ body.terminal-tab-dragging .workspace-tab {
 /* Workspace body */
 
 .workspace-body {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -3865,6 +3866,34 @@ body.terminal-tab-dragging .workspace-tab {
   padding: 0;
   overflow: hidden;
   background: var(--bg-terminal);
+}
+
+.workspace-surface {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-surface.manual-hidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.linux-manual-workspace {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-primary);
+}
+
+.linux-manual-loading {
+  flex: 1;
+  padding: 24px;
+  color: var(--text-secondary);
 }
 
 /* Empty workspace */

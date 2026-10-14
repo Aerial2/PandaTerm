@@ -1,4 +1,4 @@
-export type ActivityPanel = 'recent' | 'files' | 'monitor' | 'processes' | 'ai';
+export type ActivityPanel = 'recent' | 'files' | 'monitor' | 'processes' | 'ai' | 'manual';
 
 export type LeftActivity = ActivityPanel | null;
 

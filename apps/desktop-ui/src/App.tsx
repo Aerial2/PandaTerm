@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import {
   addLogEntry,
@@ -365,6 +365,9 @@ const AI_AUTO_RUN_OPTIONS: Array<{
   },
 ];
 
+const LinuxManualPanel = lazy(() => import('./LinuxManualPanel'));
+const LinuxManualReader = lazy(() => import('./LinuxManualReader'));
+
 export function App() {
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
@@ -375,6 +378,14 @@ export function App() {
   const sessionContentRef = useRef<HTMLElement | null>(null);
   // Left-side activity bar state — which panel is open
   const [leftActivity, setLeftActivity] = useState<LeftActivity>('files');
+  const manualVisible = leftActivity === 'manual';
+  const manualVisibleRef = useRef(manualVisible);
+  manualVisibleRef.current = manualVisible;
+  const previousActivityRef = useRef<LeftActivity>('files');
+  const previousWorkspaceFocusRef = useRef<HTMLElement | null>(null);
+  const [manualQuery, setManualQuery] = useState('');
+  const [manualCommandId, setManualCommandId] = useState('ls');
+  const [manualHash, setManualHash] = useState<string | undefined>();
   const {
     records: recentFiles,
     loading: recentFilesLoading,
@@ -925,7 +936,7 @@ export function App() {
 
   function focusTerminal(tabId: string) {
     requestAnimationFrame(() => {
-      terminalsRef.current.get(tabId)?.focus();
+      if (!manualVisibleRef.current) terminalsRef.current.get(tabId)?.focus();
     });
   }
 
@@ -1594,6 +1605,24 @@ export function App() {
     scheduleVisibleTerminalFits({ force: true });
   }, [leftActivity, resourcePanelWidth, visibleTerminalPaneIds.join('|')]);
 
+  const wasManualVisibleRef = useRef(manualVisible);
+  useEffect(() => {
+    const wasVisible = wasManualVisibleRef.current;
+    wasManualVisibleRef.current = manualVisible;
+    if (!wasVisible || manualVisible) return;
+    const frame = requestAnimationFrame(() => {
+      if (manualVisibleRef.current) return;
+      scheduleVisibleTerminalFits({ force: true });
+      const previousFocus = previousWorkspaceFocusRef.current;
+      if (previousFocus?.isConnected && !previousFocus.closest('[inert]')) {
+        previousFocus.focus({ preventScroll: true });
+      } else if (activePaneIdRef.current) {
+        focusTerminal(activePaneIdRef.current);
+      }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [manualVisible]);
+
   useEffect(() => {
     const handleWindowResize = () => {
       if (activeTabRef.current?.kind !== 'terminal') return;
@@ -2147,6 +2176,7 @@ export function App() {
       const tabId = terminalTab.id;
 
       terminal.attachCustomKeyEventHandler((event) => {
+        if (manualVisibleRef.current) return false;
         if (event.altKey) return true;
 
         const key = event.key.toLowerCase();
@@ -2206,7 +2236,7 @@ export function App() {
         startedTerminalsRef.current.add(terminalTab.id);
         requestAnimationFrame(() => {
           syncSize();
-          if (tabId === activePaneIdRef.current) terminal.focus();
+          if (!manualVisibleRef.current && tabId === activePaneIdRef.current) terminal.focus();
           void startLocalTerminal(localTerminalProfile.cwd || null, terminal.cols, terminal.rows).then((profile) => {
             if (cancelledConnectionTabIdsRef.current.delete(terminalTab.id)) {
               retireTerminalId(profile.terminal_id);
@@ -2252,12 +2282,12 @@ export function App() {
         startedTerminalsRef.current.add(terminalTab.terminalId);
         requestAnimationFrame(() => {
           syncSize();
-          if (tabId === activePaneIdRef.current) terminal.focus();
+          if (!manualVisibleRef.current && tabId === activePaneIdRef.current) terminal.focus();
         });
       } else {
         requestAnimationFrame(() => {
           syncSize();
-          if (tabId === activePaneIdRef.current) terminal.focus();
+          if (!manualVisibleRef.current && tabId === activePaneIdRef.current) terminal.focus();
         });
       }
     }
@@ -3674,7 +3704,7 @@ export function App() {
       return;
     }
 
-    term.focus();
+    if (!manualVisibleRef.current) term.focus();
     term.paste(prepared.text);
     setStatusMessage(prepared.truncated
       ? `已粘贴前 ${formatTerminalPasteSize(prepared.pasteBytes)}，超出部分已截断`
@@ -4559,9 +4589,32 @@ export function App() {
     }
   }, [aiWorkspace, aiAutoRunEnabled, isAiGenerating, activeAiConversation]);
 
+  function openLeftActivity(panel: ActivityPanel) {
+    if (panel === 'manual' && !manualVisible) {
+      previousActivityRef.current = leftActivity;
+      setTerminalContextMenu(null);
+      setContextMenu(null);
+    }
+    setLeftActivity(panel);
+  }
+
+  function closeLinuxManual() {
+    setLeftActivity(previousActivityRef.current);
+  }
+
+  function selectManualCommand(id: string, hash?: string) {
+    setManualCommandId(id);
+    setManualHash(hash);
+  }
+
   function toggleLeftActivity(panel: ActivityPanel) {
-    // VSCode 风格：再次点击已激活的图标则收起侧边栏
-    setLeftActivity(leftActivity === panel ? null : panel);
+    if (panel === 'manual' && manualVisible) {
+      closeLinuxManual();
+    } else if (leftActivity === panel) {
+      setLeftActivity(null);
+    } else {
+      openLeftActivity(panel);
+    }
   }
 
   async function refreshAiProviderConfig(options?: { fillApiKey?: boolean }) {
@@ -7315,7 +7368,7 @@ export function App() {
           void openConnectionWindow('manage');
         }}
         onOpenAiSettings={() => openAiSettings()}
-        onSetLeftActivity={(panel) => setLeftActivity(panel)}
+        onSetLeftActivity={openLeftActivity}
       />
 
       <section ref={sessionContentRef} className="session-content">
@@ -7369,7 +7422,26 @@ export function App() {
             >
               <ActivityBarIcon name="ai" size={20} />
             </button>
+            <button
+              className={`activity-bar-icon${manualVisible ? ' active' : ''}`}
+              onClick={() => toggleLeftActivity('manual')}
+              title="Linux 命令手册"
+              aria-label="Linux 命令手册"
+              aria-pressed={manualVisible}
+            >
+              <ActivityBarIcon name="linux-manual" size={20} />
+            </button>
           </div>
+          {manualVisible && (
+            <Suspense fallback={<aside className="linux-manual-loading" role="status">正在加载命令索引...</aside>}>
+              <LinuxManualPanel
+                query={manualQuery}
+                setQuery={setManualQuery}
+                selectedId={manualCommandId}
+                onSelect={selectManualCommand}
+              />
+            </Suspense>
+          )}
           {leftActivity === 'recent' && (
             <RecentFilesPanel
               records={recentFiles}
@@ -8676,6 +8748,14 @@ export function App() {
 
         <section className="terminal-panel">
           <div className="workspace-body">
+            <div
+              className={`workspace-surface${manualVisible ? ' manual-hidden' : ''}`}
+              inert={manualVisible}
+              aria-hidden={manualVisible || undefined}
+              onFocusCapture={(event) => {
+                if (!manualVisible) previousWorkspaceFocusRef.current = event.target as HTMLElement;
+              }}
+            >
             {/* 无终端 workspace 时，统一标签栏独立成栏（编辑器/sftp/空态都依赖它做切换与新建入口） */}
             {activeTab && activeTab.kind !== 'terminal' && activeTab.kind !== 'rdp' && (
               <div className="terminal-pane-tabbar standalone">
@@ -8772,6 +8852,19 @@ export function App() {
                     </p>
                   </div>
                 )}
+              </div>
+            )}
+            </div>
+            {manualVisible && (
+              <div className="linux-manual-workspace">
+                <Suspense fallback={<div className="linux-manual-loading" role="status">正在加载命令手册...</div>}>
+                  <LinuxManualReader
+                    selectedId={manualCommandId}
+                    hash={manualHash}
+                    onSelect={selectManualCommand}
+                    onClose={closeLinuxManual}
+                  />
+                </Suspense>
               </div>
             )}
           </div>

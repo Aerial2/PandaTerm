@@ -310,6 +310,13 @@ export function TopMenubar({
                 <button
                   className="menubar-menu-item"
                   role="menuitem"
+                  onClick={() => runAndClose(() => onSetLeftActivity('manual'))}
+                >
+                  <span>Linux 命令手册</span>
+                </button>
+                <button
+                  className="menubar-menu-item"
+                  role="menuitem"
                   onClick={() => runAndClose(openAbout)}
                 >
                   <span>关于</span>

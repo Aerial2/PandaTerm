@@ -1,0 +1,54 @@
+.linux-manual-panel, .linux-manual-reader {
+  display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0;
+  background: var(--bg-secondary); color: var(--text-secondary); overflow: hidden;
+}
+.linux-manual-panel { background: #242425; }
+.linux-manual-panel[hidden], .linux-manual-reader[hidden] { display: none; }
+.linux-manual-panel-header { padding: 12px; border-bottom: 1px solid var(--border-subtle); }
+.linux-manual-panel h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; font-size: 13px; color: var(--text-primary); }
+.linux-manual-search { display: flex; align-items: center; gap: 6px; padding: 5px 7px; background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: 4px; }
+.linux-manual-search:focus-within { border-color: var(--accent-blue); }
+.linux-manual-search input { width: 100%; min-width: 0; padding: 0; border: 0; outline: none; background: transparent; color: var(--text-primary); font-size: 12px; }
+.linux-manual-search input::placeholder { color: var(--text-muted); }
+.linux-manual-result-count { display: block; padding-top: 8px; font-size: 11px; color: var(--text-muted); }
+.linux-manual-command-list { flex: 1; min-height: 0; overflow-y: auto; }
+.linux-manual-command-list ul { padding: 4px 0; margin: 0; list-style: none; }
+.linux-manual-command { display: flex; flex-direction: column; gap: 3px; width: 100%; padding: 8px 12px; border: 0; border-left: 2px solid transparent; background: transparent; color: var(--text-secondary); text-align: left; cursor: pointer; }
+.linux-manual-command strong { font-family: var(--font-mono, monospace); font-size: 13px; color: var(--text-primary); }
+.linux-manual-command span { font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.linux-manual-command:hover { background: var(--bg-primary); }
+.linux-manual-command.is-selected { border-left-color: var(--accent-blue); background: var(--bg-tertiary); }
+.linux-manual-reader { background: var(--bg-tertiary); }
+.linux-manual-reader-header { display: flex; align-items: center; gap: 8px; flex-shrink: 0; padding: 9px 14px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-secondary); }
+.linux-manual-reader-header h2 { margin: 0; color: var(--text-primary); font-size: 14px; overflow-wrap: anywhere; }
+.linux-manual-reader-header > span { color: var(--text-muted); font-size: 11px; }
+.linux-manual-reader-header > button { margin-left: auto; flex-shrink: 0; }
+.linux-manual-panel button, .linux-manual-reader button { cursor: pointer; }
+.linux-manual-search button, .linux-manual-reader-header button { display: inline-flex; align-items: center; justify-content: center; padding: 3px; border: 0; background: transparent; color: var(--text-secondary); border-radius: 3px; }
+.linux-manual-search button:hover, .linux-manual-reader-header button:hover { background: var(--bg-primary); color: var(--text-primary); }
+.linux-manual-panel button:focus-visible, .linux-manual-reader button:focus-visible, .linux-manual-reader a:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: -2px; }
+.linux-manual-reader-scroll { flex: 1; min-height: 0; overflow: auto; padding: 24px clamp(16px, 4vw, 48px); }
+.linux-manual-state { padding: 24px 12px; color: var(--text-muted); font-size: 13px; text-align: center; }
+.linux-manual-notice { color: var(--accent-red); font-size: 12px; }
+.linux-manual-state button, .linux-manual-code-toolbar button { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border-subtle); border-radius: 4px; padding: 5px 9px; background: var(--bg-secondary); color: var(--text-secondary); font-size: 12px; }
+.linux-manual-state button:hover:hover, .linux-manual-code-toolbar button:hover { background: var(--bg-primary); color: var(--text-primary); }
+.linux-manual-markdown { max-width: 960px; margin: 0 auto; font-size: 14px; line-height: 1.75; overflow-wrap: anywhere; }
+.linux-manual-markdown h1, .linux-manual-markdown h2, .linux-manual-markdown h3, .linux-manual-markdown h4, .linux-manual-markdown h5, .linux-manual-markdown h6 { color: var(--text-primary); line-height: 1.4; scroll-margin-top: 20px; }
+.linux-manual-markdown h1 { font-size: 26px; margin: 0 0 20px; }
+.linux-manual-markdown h2 { font-size: 20px; margin: 28px 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--border-subtle); }
+.linux-manual-markdown h3 { font-size: 17px; margin-top: 24px; }
+.linux-manual-markdown a { color: var(--accent-blue); text-decoration: underline; text-underline-offset: 3px; }
+.linux-manual-markdown p { margin: 12px 0; }
+.linux-manual-markdown blockquote { margin: 16px 0; padding: 0 16px; border-left: 3px solid var(--text-muted); color: var(--text-muted); }
+.linux-manual-markdown code { font-family: var(--font-mono, monospace); font-size: .9em; padding: 2px 5px; background: var(--bg-secondary); border-radius: 3px; }
+.linux-manual-code-block { margin: 16px 0; border: 1px solid var(--border-subtle); border-radius: 5px; overflow: hidden; background: var(--bg-secondary); }
+.linux-manual-code-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 5px 8px; border-bottom: 1px solid var(--border-subtle); font-size: 11px; color: var(--text-muted); }
+.linux-manual-code-block pre { margin: 0; padding: 14px; overflow-x: auto; line-height: 1.6; }
+.linux-manual-code-block code { padding: 0; background: transparent; white-space: pre; }
+.linux-manual-markdown table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 16px 0; }
+.linux-manual-markdown th, .linux-manual-markdown td { padding: 7px 12px; border: 1px solid var(--border-subtle); text-align: left; }
+.linux-manual-markdown th { background: var(--bg-secondary); color: var(--text-primary); }
+.linux-manual-markdown input[type="checkbox"] { margin-right: 6px; }
+.linux-manual-markdown hr { border: 0; border-top: 1px solid var(--border-subtle); margin: 24px 0; }
+.linux-manual-illustration, .linux-manual-blocked-link { color: var(--text-muted); }
+@media (max-width: 600px) { .linux-manual-reader-header > span { display: none; } .linux-manual-reader-scroll { padding: 16px; } }
