@@ -18,6 +18,8 @@ import { scrollHorizontallyOnWheel } from './wheelScroll';
 import { VscodeFileIcon } from './FileIcon';
 import { ResourceBottomPanel } from './ResourceBottomPanel';
 import { RecentFilesPanel } from './RecentFilesPanel';
+import { PortForwardPanel } from './PortForwardPanel';
+import { usePortForwards } from './usePortForwards';
 import { AiSessionTabs } from './AiSessionTabs';
 import { ActivityBarIcon } from './ActivityBarIcon';
 import { useRecentFiles } from './useRecentFiles';
@@ -411,6 +413,10 @@ export function App() {
         const sessions = await listSessions();
         if (disposed || currentRequestId !== requestId) return;
         setHomeSessions(sessions);
+        setTabs((current) => current.map((tab) => {
+          const saved = sessions.find((session) => session.id === tab.session.id);
+          return saved ? { ...tab, session: saved } : tab;
+        }));
         setHomeSessionsError(false);
       } catch {
         if (disposed || currentRequestId !== requestId) return;
@@ -1432,6 +1438,19 @@ export function App() {
   const topStatusUser = statusFocusEditor ? '' : (statusFocusSession?.username ?? '');
   const topStatusHost = statusFocusEditor ? '' : (statusFocusSession?.host ?? '');
   const activePaneTabRef = useRef<WorkspaceTab | null>(null);
+  activePaneTabRef.current = activePaneTab;
+  const portForwards = usePortForwards({
+    activePaneTab,
+    activePaneTabRef,
+    onSessionsChanged: (sessions) => {
+      setHomeSessions(sessions);
+      setTabs((current) => current.map((tab) => {
+        const saved = sessions.find((session) => session.id === tab.session.id);
+        return saved ? { ...tab, session: saved } : tab;
+      }));
+      void refreshRecentFileSessions();
+    },
+  });
   useEffect(() => {
     activePaneTabRef.current = activePaneTab;
   }, [activePaneTab]);
@@ -7416,6 +7435,15 @@ export function App() {
               <ActivityBarIcon name="processes" size={20} />
             </button>
             <button
+              className={`activity-bar-icon${leftActivity === 'tunnels' ? ' active' : ''}`}
+              onClick={() => toggleLeftActivity('tunnels')}
+              title="SSH 隧道"
+              aria-label="SSH 隧道"
+              aria-pressed={leftActivity === 'tunnels'}
+            >
+              <ActivityBarIcon name="tunnels" size={20} />
+            </button>
+            <button
               className={`activity-bar-icon${leftActivity === 'ai' ? ' active' : ''}`}
               onClick={() => toggleLeftActivity('ai')}
               title="PandaTerm AI"
@@ -7441,6 +7469,23 @@ export function App() {
                 onSelect={selectManualCommand}
               />
             </Suspense>
+          )}
+          {leftActivity === 'tunnels' && (
+            <PortForwardPanel
+              key={JSON.stringify([activePaneTab?.id, activePaneTab?.terminalId, activePaneTab?.status])}
+              rules={activePaneTab?.session.local_port_forwards ?? []}
+              snapshot={portForwards.snapshot}
+              sessionName={activePaneTab?.session.name ?? null}
+              canConfigure={Boolean(activePaneTab && activePaneTab.session.id !== localSession.id && activePaneTab.kind === 'terminal' && (!activePaneTab.session.protocol || activePaneTab.session.protocol === 'ssh'))}
+              disabledReason={portForwards.disabledReason}
+              loading={portForwards.loading}
+              busy={portForwards.busy}
+              error={portForwards.error}
+              onRefresh={portForwards.refresh}
+              onSave={portForwards.saveRules}
+              onStart={portForwards.start}
+              onStop={portForwards.stop}
+            />
           )}
           {leftActivity === 'recent' && (
             <RecentFilesPanel

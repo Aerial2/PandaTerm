@@ -17,6 +17,7 @@ mod local_shell;
 mod mcp;
 mod rdp;
 mod recent_files;
+mod port_forward;
 mod session_store;
 mod shell_text;
 mod sse;
@@ -64,7 +65,8 @@ use local_shell::{
 };
 use panda_core::{TerminalEvent, TerminalEventKind};
 use panda_crypto::{protect_secret, unprotect_secret, ProtectionMode, SecretError};
-use panda_session::{AuthType, Session, SessionCatalog};
+use panda_session::{AuthType, LocalPortForward, Session, SessionCatalog};
+use port_forward::{PortForwardManager, PortForwardSnapshot};
 use portable_pty::{native_pty_system, Child, MasterPty};
 use reqwest::{redirect::Policy, Client};
 use russh::ChannelMsg;
@@ -134,6 +136,7 @@ struct AppState {
     mcp_runtime: Arc<mcp::McpRuntime>,
     local_terminals: Mutex<HashMap<Uuid, LocalTerminalSession>>,
     remote_terminals: Mutex<HashMap<Uuid, RemoteTerminalSession>>,
+    port_forwards: PortForwardManager,
     /// RDP 图形会话（keyed by 前端 terminal id），持关闭标志用于优雅断开。
     rdp_terminals: Mutex<HashMap<Uuid, rdp::RdpSession>>,
     /// Reused SSH handles for file transfer (keyed by interactive terminal id).
@@ -164,6 +167,8 @@ struct RemoteTerminalSession {
     close_notification: Arc<Notify>,
     handle: SharedRemoteHandle,
     session_id: Uuid,
+    generation: Uuid,
+    transport: Arc<std::net::TcpStream>,
 }
 
 enum RemoteTerminalCommand {
@@ -184,13 +189,15 @@ struct AiProviderAccountView {
     name: String,
     base_url: String,
     model: String,
+    models: Vec<String>,
+    enabled_models: Vec<String>,
     api_format: String,
     api_key_configured: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct AiProviderConfig {
-    /// 当前激活账号
+    /// 本次读取或编辑的目标账号；活动账号由 active_account_id 表示
     account_id: String,
     account_name: String,
     base_url: String,
@@ -216,6 +223,8 @@ struct AiProviderConfig {
 struct SaveAiProviderConfigRequest {
     #[serde(default)]
     account_id: Option<String>,
+    #[serde(default)]
+    activate: Option<bool>,
     #[serde(default)]
     account_name: Option<String>,
     base_url: String,
@@ -255,6 +264,8 @@ struct AiAccountIdRequest {
 /// 使用草稿配置发送一条测试消息（不落盘；流式以测量首字耗时）
 #[derive(Debug, Clone, Deserialize)]
 struct TestAiProviderRequest {
+    #[serde(default)]
+    account_id: Option<String>,
     base_url: String,
     model: String,
     #[serde(default)]
@@ -697,7 +708,7 @@ async fn connect_russh_session(
     app: &AppHandle,
     terminal_id: &str,
     session: &Session,
-) -> Result<russh::client::Handle<SshHandler>, String> {
+) -> Result<(russh::client::Handle<SshHandler>, Arc<std::net::TcpStream>), String> {
     emit_remote_log(
         app,
         terminal_id,
@@ -722,9 +733,16 @@ async fn connect_russh_session(
         host_key_error: Arc::clone(&host_key_error),
     };
 
-    let mut handle = tokio::time::timeout(
+    let (mut handle, transport) = tokio::time::timeout(
         SSH_CONNECT_TIMEOUT,
-        russh::client::connect(config, (session.host.as_str(), session.port), handler),
+        async {
+            let socket = tokio::net::TcpStream::connect((session.host.as_str(), session.port)).await?;
+            let socket = socket.into_std()?;
+            let transport = Arc::new(socket.try_clone()?);
+            let socket = tokio::net::TcpStream::from_std(socket)?;
+            let handle = russh::client::connect_stream(config, socket, handler).await?;
+            Ok::<_, russh::Error>((handle, transport))
+        },
     )
     .await
     .map_err(|_| {
@@ -780,7 +798,7 @@ async fn connect_russh_session(
     }
 
     emit_remote_log(app, terminal_id, "Authentication successful");
-    Ok(handle)
+    Ok((handle, transport))
 }
 
 async fn interactive_remote_handle(
@@ -840,7 +858,7 @@ async fn connect_russh_transfer_session(
     };
     let transfer_terminal_id = format!("{terminal_id}:transfer");
     match connect_russh_session(app, &transfer_terminal_id, &session).await {
-        Ok(handle) => {
+        Ok((handle, _transport)) => {
             drop(session);
             let shared = Arc::new(handle);
             match exec_remote_command_full(&shared, "true").await {
@@ -907,8 +925,9 @@ async fn spawn_russh_terminal(
     app: AppHandle,
     terminal_id: String,
     session_id: Uuid,
-    handle: russh::client::Handle<SshHandler>,
+    connection: (russh::client::Handle<SshHandler>, Arc<std::net::TcpStream>),
 ) -> Result<RemoteTerminalSession, String> {
+    let (handle, transport) = connection;
     emit_remote_log(&app, &terminal_id, "Opening channel...");
 
     let channel = handle
@@ -1112,6 +1131,8 @@ async fn spawn_russh_terminal(
         close_notification,
         handle: shared_handle,
         session_id,
+        generation: Uuid::new_v4(),
+        transport,
     })
 }
 
@@ -4507,6 +4528,11 @@ fn prepare_session_for_save(
         passphrase,
     } = request;
 
+    if let Some(existing) = existing {
+        // Forwarding configuration has its own command; profile edits preserve it.
+        session.local_port_forwards = existing.local_port_forwards.clone();
+    }
+
     match &mut session.auth {
         AuthType::Password { secret_id } => {
             let id = credential_id(session.id, "password");
@@ -4609,10 +4635,11 @@ fn is_claude_stop_event(data: &str) -> bool {
 
 fn ai_config_snapshot(
     config: &AiProviderConfigStore,
+    account_id: Option<&str>,
     api_key: Option<String>,
     error: Option<String>,
 ) -> Result<AiProviderConfig, String> {
-    let active = find_ai_account(config, None)?;
+    let target = find_ai_account(config, account_id)?;
     let accounts = config
         .accounts
         .iter()
@@ -4621,23 +4648,25 @@ fn ai_config_snapshot(
             name: item.name.clone(),
             base_url: item.base_url.clone(),
             model: item.model.clone(),
+            models: item.models.clone(),
+            enabled_models: item.enabled_models.clone(),
             api_format: item.api_format.clone(),
             api_key_configured: item.api_key_secret_id.is_some(),
         })
         .collect();
     Ok(AiProviderConfig {
-        account_id: active.id.clone(),
-        account_name: active.name.clone(),
-        base_url: active.base_url.clone(),
-        model: active.model.clone(),
-        models: active.models.clone(),
-        enabled_models: active.enabled_models.clone(),
+        account_id: target.id.clone(),
+        account_name: target.name.clone(),
+        base_url: target.base_url.clone(),
+        model: target.model.clone(),
+        models: target.models.clone(),
+        enabled_models: target.enabled_models.clone(),
         reasoning_effort: config.reasoning_effort.clone(),
-        api_format: active.api_format.clone(),
-        context_window: active.context_window,
-        max_tokens: active.max_tokens,
-        use_api_key: active.use_api_key,
-        api_key_configured: active.api_key_secret_id.is_some(),
+        api_format: target.api_format.clone(),
+        context_window: target.context_window,
+        max_tokens: target.max_tokens,
+        use_api_key: target.use_api_key,
+        api_key_configured: target.api_key_secret_id.is_some(),
         api_key,
         accounts,
         active_account_id: config.active_account_id.clone(),
@@ -4896,20 +4925,21 @@ fn extract_provider_error(body: &str) -> String {
 
 #[tauri::command]
 async fn get_ai_provider_config(
+    account_id: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<AiProviderConfig, String> {
     let config = state.ai_config.lock().await.clone();
     let error = state.ai_config_error.lock().await.clone();
-    let active = find_ai_account(&config, None)?;
+    let target = find_ai_account(&config, account_id.as_deref())?;
     let credentials = state.credentials.lock().await;
-    let api_key = match resolve_ai_api_key(&credentials, active.api_key_secret_id.as_deref()) {
+    let api_key = match resolve_ai_api_key(&credentials, target.api_key_secret_id.as_deref()) {
         Ok(key) => key,
         Err(reveal_error) => {
             eprintln!("[AI] reveal api key failed: {reveal_error}");
             None
         }
     };
-    ai_config_snapshot(&config, api_key, error)
+    ai_config_snapshot(&config, account_id.as_deref(), api_key, error)
 }
 
 #[tauri::command]
@@ -4989,7 +5019,9 @@ async fn save_ai_provider_config(
         account.use_api_key = request.use_api_key;
         account.api_key_secret_id = next_secret_id.clone();
     }
-    current.active_account_id = account_id;
+    if request.activate.unwrap_or(true) {
+        current.active_account_id = account_id.clone();
+    }
     current.reasoning_effort = reasoning_effort;
     current.version = AI_CONFIG_VERSION;
     normalize_ai_config_store(&mut current)?;
@@ -5007,15 +5039,16 @@ async fn save_ai_provider_config(
     let api_key = if let Some(key) = supplied_key {
         Some(key.trim().to_string())
     } else {
-        let active = find_ai_account(&current, None)?;
-        resolve_ai_api_key(&credentials, active.api_key_secret_id.as_deref())?
+        let target = find_ai_account(&current, Some(&account_id))?;
+        resolve_ai_api_key(&credentials, target.api_key_secret_id.as_deref())?
     };
     *state.ai_config.lock().await = current.clone();
-    ai_config_snapshot(&current, api_key, None)
+    ai_config_snapshot(&current, Some(&account_id), api_key, None)
 }
 
 #[tauri::command]
 async fn add_ai_provider_account(
+    activate: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<AiProviderConfig, String> {
     if let Some(error) = state.ai_config_error.lock().await.clone() {
@@ -5039,13 +5072,16 @@ async fn add_ai_provider_account(
         use_api_key: true,
         api_key_secret_id: None,
     };
-    current.active_account_id = account.id.clone();
+    let account_id = account.id.clone();
     current.accounts.push(account);
+    if activate.unwrap_or(true) {
+        current.active_account_id = account_id.clone();
+    }
     current.version = AI_CONFIG_VERSION;
     normalize_ai_config_store(&mut current)?;
     save_ai_config(&current)?;
     *state.ai_config.lock().await = current.clone();
-    ai_config_snapshot(&current, None, None)
+    ai_config_snapshot(&current, Some(&account_id), None, None)
 }
 
 #[tauri::command]
@@ -5083,7 +5119,7 @@ async fn delete_ai_provider_account(
     let active = find_ai_account(&current, None)?;
     let credentials = state.credentials.lock().await;
     let api_key = resolve_ai_api_key(&credentials, active.api_key_secret_id.as_deref())?;
-    ai_config_snapshot(&current, api_key, None)
+    ai_config_snapshot(&current, None, api_key, None)
 }
 
 #[tauri::command]
@@ -5110,7 +5146,7 @@ async fn set_active_ai_provider_account(
             None
         }
     };
-    ai_config_snapshot(&current, api_key, None)
+    ai_config_snapshot(&current, None, api_key, None)
 }
 
 #[tauri::command]
@@ -5189,12 +5225,16 @@ async fn sync_ai_provider_models(
         ));
     }
     let synced = parse_openai_model_ids(&body)?;
+    // 网络请求期间可能切换活动账号；只将模型目录写回最新的目标账号。
+    let mut stored = state.ai_config.lock().await;
+    current = stored.clone();
+    let target = find_ai_account(&current, Some(&account_id))?;
     let models = normalize_ai_models(
-        &merge_ai_models(&existing.models, &synced)?,
-        &existing.model,
+        &merge_ai_models(&target.models, &synced)?,
+        &target.model,
     )?;
     let enabled_models =
-        normalize_enabled_ai_models(&models, &existing.enabled_models, &existing.model)?;
+        normalize_enabled_ai_models(&models, &target.enabled_models, &target.model)?;
     {
         let account = find_ai_account_mut(&mut current, Some(&account_id))?;
         account.models = models;
@@ -5202,9 +5242,9 @@ async fn sync_ai_provider_models(
     }
     current.version = AI_CONFIG_VERSION;
     save_ai_config(&current)?;
-    *state.ai_config.lock().await = current.clone();
+    *stored = current.clone();
     let revealed = api_key.as_ref().map(|key| key.as_str().to_string());
-    ai_config_snapshot(&current, revealed, None)
+    ai_config_snapshot(&current, Some(&account_id), revealed, None)
 }
 
 #[tauri::command]
@@ -5446,9 +5486,9 @@ async fn test_ai_provider(
     let base_url = validate_ai_base_url(&request.base_url)?.to_string();
     let model = validate_ai_model(&request.model)?;
     let current = state.ai_config.lock().await.clone();
-    let active = find_ai_account(&current, None)?;
+    let target = find_ai_account(&current, request.account_id.as_deref())?;
     let api_format =
-        validate_ai_api_format(request.api_format.as_deref().unwrap_or(&active.api_format))?;
+        validate_ai_api_format(request.api_format.as_deref().unwrap_or(&target.api_format))?;
     let use_api_key = request.use_api_key.unwrap_or(true);
     let supplied_key = request
         .api_key
@@ -5460,7 +5500,7 @@ async fn test_ai_provider(
         if let Some(key) = supplied_key {
             Some(Zeroizing::new(key))
         } else {
-            let secret_id = active
+            let secret_id = target
                 .api_key_secret_id
                 .as_deref()
                 .ok_or_else(|| "尚未配置 AI API Key".to_string())?;
@@ -6321,6 +6361,158 @@ async fn set_credential_protection(
     Ok(credential_status_snapshot(&credentials))
 }
 
+fn port_forward_events(app: &AppHandle) -> Arc<dyn Fn(PortForwardSnapshot) + Send + Sync> {
+    let app = app.clone();
+    Arc::new(move |snapshot| {
+        let _ = app.emit("port-forwards-changed", snapshot);
+    })
+}
+
+fn persist_forward_rules(
+    sessions: &mut SessionCatalog,
+    session_id: Uuid,
+    rules: Vec<LocalPortForward>,
+    persist: impl FnOnce(&[Session]) -> Result<(), String>,
+) -> Result<Vec<Session>, String> {
+    let mut candidate = sessions.clone();
+    let mut session = candidate
+        .all()
+        .iter()
+        .find(|s| s.id == session_id)
+        .cloned()
+        .ok_or_else(|| format!("session not found: {session_id}"))?;
+    session.local_port_forwards = rules;
+    candidate.upsert(session).map_err(|e| e.to_string())?;
+    persist(candidate.all())?;
+    *sessions = candidate;
+    Ok(sessions.all().to_vec())
+}
+
+#[tauri::command]
+async fn save_local_port_forwards(
+    session_id: Uuid,
+    rules: Vec<LocalPortForward>,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<Session>, String> {
+    ensure_session_store_available(&state).await?;
+    let mut sessions = state.sessions.lock().await;
+    let result = persist_forward_rules(&mut sessions, session_id, rules, save_persistent_sessions)?;
+    drop(sessions);
+    let _ = app.emit("sessions-changed", ());
+    Ok(result)
+}
+
+#[tauri::command]
+async fn start_local_port_forward(
+    terminal_id: Uuid,
+    rule_id: Uuid,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<PortForwardSnapshot, String> {
+    // Read configuration first; the terminal table always precedes the runtime lock.
+    let (session_id, generation) = {
+        let terminals = state.remote_terminals.lock().await;
+        let remote = terminals
+            .get(&terminal_id)
+            .ok_or("SSH terminal is not connected")?;
+        (remote.session_id, remote.generation)
+    };
+    let rule = {
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .all()
+            .iter()
+            .find(|s| s.id == session_id)
+            .ok_or("session not found")?;
+        session
+            .local_port_forwards
+            .iter()
+            .find(|r| r.id == rule_id)
+            .cloned()
+            .ok_or("saved forwarding rule not found")?
+    };
+    let terminals = state.remote_terminals.lock().await;
+    let remote = terminals
+        .get(&terminal_id)
+        .filter(|r| {
+            r.generation == generation && !r.closed.load(Ordering::SeqCst) && !r.handle.is_closed()
+        })
+        .ok_or("SSH connection changed or closed")?;
+    // Start publishes only after the terminal table guard is released. Runtime
+    // updates from the spawned listener also wait for this release gate.
+    let release = Arc::new(AtomicBool::new(false));
+    let release_events = release.clone();
+    let actual_events = port_forward_events(&app);
+    let queued = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let queued_events = queued.clone();
+    let events: Arc<dyn Fn(PortForwardSnapshot) + Send + Sync> = Arc::new(move |event| {
+        let mut queue = queued_events.lock().unwrap();
+        if !release_events.load(Ordering::SeqCst) {
+            queue.push(event);
+        } else {
+            drop(queue);
+            actual_events(event);
+        }
+    });
+    let result = state
+        .port_forwards
+        .start(terminal_id, generation, rule, remote.handle.clone(), events)
+        .await;
+    drop(terminals);
+    let queued = {
+        let mut queued = queued.lock().unwrap();
+        release.store(true, Ordering::SeqCst);
+        std::mem::take(&mut *queued)
+    };
+    for event in queued {
+        port_forward_events(&app)(event);
+    }
+    result
+}
+
+#[tauri::command]
+async fn list_local_port_forwards(
+    terminal_id: Uuid,
+    state: State<'_, Arc<AppState>>,
+) -> Result<PortForwardSnapshot, String> {
+    let terminals = state.remote_terminals.lock().await;
+    let remote = terminals
+        .get(&terminal_id)
+        .ok_or("SSH terminal is not connected")?;
+    Ok(state
+        .port_forwards
+        .list(terminal_id, remote.generation)
+        .await)
+}
+
+#[tauri::command]
+async fn stop_local_port_forward(
+    terminal_id: Uuid,
+    rule_id: Uuid,
+    instance_id: Uuid,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<PortForwardSnapshot, String> {
+    let generation = {
+        let terminals = state.remote_terminals.lock().await;
+        terminals
+            .get(&terminal_id)
+            .ok_or("SSH terminal is not connected")?
+            .generation
+    };
+    Ok(state
+        .port_forwards
+        .stop(
+            terminal_id,
+            generation,
+            rule_id,
+            instance_id,
+            port_forward_events(&app),
+        )
+        .await)
+}
+
 #[tauri::command]
 async fn list_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<Session>, String> {
     ensure_session_store_available(&state).await?;
@@ -6481,14 +6673,28 @@ async fn connect_session(
     let closed = Arc::clone(&remote_session.closed);
     let close_notification = Arc::clone(&remote_session.close_notification);
     let cleanup_state = Arc::clone(state.inner());
-    {
+    let generation = remote_session.generation;
+    let cleanup_events = port_forward_events(&app);
+    let cleanup_transport = remote_session.transport.clone();
+    let previous = {
         let mut terminals = state.remote_terminals.lock().await;
         // 同一 terminal_id 重连（含 React StrictMode 双触发）时主动关闭旧会话，
         // 防止旧 SSH 连接与写入循环被覆盖后悬挂泄漏（对齐 rdp_connect 的处理）。
-        if let Some(prev) = terminals.insert(terminal_id, remote_session) {
-            prev.closed.store(true, Ordering::SeqCst);
-            prev.close_notification.notify_one();
-        }
+        terminals.insert(terminal_id, remote_session)
+    };
+    if let Some(prev) = previous {
+        prev.closed.store(true, Ordering::SeqCst);
+        prev.close_notification.notify_one();
+        state
+            .port_forwards
+            .stop_generation(terminal_id, prev.generation, port_forward_events(&app))
+            .await;
+        let _ = prev.control.try_send(RemoteTerminalCommand::Close);
+        let _ = prev.transport.shutdown(std::net::Shutdown::Both);
+        state
+            .port_forwards
+            .drain_generation(terminal_id, prev.generation)
+            .await;
     }
     tokio::spawn(async move {
         if !closed.load(Ordering::SeqCst) {
@@ -6502,6 +6708,15 @@ async fn connect_session(
                 &session.closed
             })
         };
+        cleanup_state
+            .port_forwards
+            .stop_generation(terminal_id, generation, cleanup_events)
+            .await;
+        let _ = cleanup_transport.shutdown(std::net::Shutdown::Both);
+        cleanup_state
+            .port_forwards
+            .drain_generation(terminal_id, generation)
+            .await;
         if owned_slot {
             invalidate_transfer_handle(&cleanup_state, terminal_id).await;
         }
@@ -6518,6 +6733,7 @@ async fn connect_session(
 #[tauri::command]
 async fn disconnect_session(
     terminal_id: Uuid,
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<TerminalEvent, String> {
     let session = {
@@ -6526,7 +6742,17 @@ async fn disconnect_session(
     };
     if let Some(session) = session {
         session.closed.store(true, Ordering::SeqCst);
-        let _ = session.control.send(RemoteTerminalCommand::Close).await;
+        session.close_notification.notify_one();
+        state
+            .port_forwards
+            .stop_generation(terminal_id, session.generation, port_forward_events(&app))
+            .await;
+        let _ = session.control.try_send(RemoteTerminalCommand::Close);
+        let _ = session.transport.shutdown(std::net::Shutdown::Both);
+        state
+            .port_forwards
+            .drain_generation(terminal_id, session.generation)
+            .await;
     }
     invalidate_transfer_handle(&state, terminal_id).await;
 
@@ -6814,6 +7040,7 @@ fn main() {
         mcp_runtime: Arc::clone(&mcp_runtime),
         local_terminals: Mutex::new(HashMap::new()),
         remote_terminals: Mutex::new(HashMap::new()),
+        port_forwards: PortForwardManager::default(),
         rdp_terminals: Mutex::new(HashMap::new()),
         transfer_handles: Mutex::new(HashMap::new()),
         transfer_cancellations: Mutex::new(HashMap::new()),
@@ -6889,6 +7116,10 @@ fn main() {
             local_terminal_stop,
             local_terminal_write,
             list_sessions,
+            save_local_port_forwards,
+            start_local_port_forward,
+            stop_local_port_forward,
+            list_local_port_forwards,
             save_session,
             delete_session,
             reorder_sessions,
@@ -6965,14 +7196,129 @@ fn main() {
             about::fetch_latest_github_version,
             about::open_external_url,
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run PandaTerm");
+        .build(tauri::generate_context!())
+        .expect("failed to build PandaTerm")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                let state = app.state::<Arc<AppState>>();
+                tauri::async_runtime::block_on(async {
+                    let terminals: Vec<_> = state.remote_terminals.lock().await.drain().collect();
+                    for (_, session) in &terminals {
+                        session.closed.store(true, Ordering::SeqCst);
+                    }
+                    state.port_forwards.stop_all(port_forward_events(app)).await;
+                    for (id, session) in terminals {
+                        let _ = session.transport.shutdown(std::net::Shutdown::Both);
+                        state
+                            .port_forwards
+                            .drain_generation(id, session.generation)
+                            .await;
+                    }
+                });
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ai_config::ai_chat_completions_url;
+
+    #[test]
+    fn ai_provider_snapshot_reads_target_without_activating_or_exposing_summary_secrets() {
+        let mut config = AiProviderConfigStore::default();
+        let active_id = config.active_account_id.clone();
+        let mut target = config.accounts[0].clone();
+        target.id = "editing-target".into();
+        target.name = "Target account".into();
+        target.model = "target-model".into();
+        target.models = vec!["target-model".into(), "disabled-model".into()];
+        target.enabled_models = vec!["target-model".into()];
+        target.api_key_secret_id = Some("private-vault-reference".into());
+        config.accounts.push(target.clone());
+
+        let snapshot = ai_config_snapshot(&config, Some(&target.id), None, None).unwrap();
+        assert_eq!(snapshot.account_id, target.id);
+        assert_eq!(snapshot.account_name, target.name);
+        assert_eq!(snapshot.model, target.model);
+        assert_eq!(snapshot.models, target.models);
+        assert_eq!(snapshot.enabled_models, target.enabled_models);
+        assert_eq!(snapshot.active_account_id, active_id);
+        assert_eq!(config.active_account_id, active_id);
+        assert!(snapshot.api_key_configured);
+        assert!(snapshot.api_key.is_none());
+        let summary = serde_json::to_value(&snapshot.accounts[1]).unwrap();
+        assert_eq!(summary["models"], json!(target.models));
+        assert_eq!(summary["enabled_models"], json!(target.enabled_models));
+        assert!(summary.get("api_key").is_none());
+        assert!(summary.get("api_key_secret_id").is_none());
+        assert!(!summary.to_string().contains("private-vault-reference"));
+
+        let legacy = ai_config_snapshot(&config, None, None, None).unwrap();
+        assert_eq!(legacy.account_id, active_id);
+        assert_eq!(legacy.active_account_id, active_id);
+        assert!(ai_config_snapshot(&config, Some("missing-account"), None, None).is_err());
+    }
+
+    #[test]
+    fn ai_provider_request_defaults_preserve_legacy_activation_and_target_fallback() {
+        let legacy = json!({
+            "base_url": "https://provider.example/v1", "model": "m", "use_api_key": false
+        });
+        let save: SaveAiProviderConfigRequest = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(save.activate.unwrap_or(true));
+        assert!(save.account_id.is_none());
+        let save: SaveAiProviderConfigRequest = serde_json::from_value(json!({
+            "base_url": "https://provider.example/v1", "model": "m", "use_api_key": false,
+            "account_id": "target", "activate": false
+        })).unwrap();
+        assert!(!save.activate.unwrap_or(true));
+        assert_eq!(save.account_id.as_deref(), Some("target"));
+        let test: TestAiProviderRequest = serde_json::from_value(legacy).unwrap();
+        assert!(test.account_id.is_none());
+        let test: TestAiProviderRequest = serde_json::from_value(json!({
+            "base_url": "https://provider.example/v1", "model": "m", "account_id": "target"
+        })).unwrap();
+        assert_eq!(test.account_id.as_deref(), Some("target"));
+    }
+
+    #[test]
+    fn forwarding_save_preserves_profile_and_rolls_back_failed_persistence() {
+        let original = panda_session::demo_sessions().remove(0);
+        let mut catalog = SessionCatalog::new(vec![original.clone()]);
+        let rule = LocalPortForward {
+            id: Uuid::new_v4(),
+            name: "panel".into(),
+            local_host: "127.0.0.1".into(),
+            local_port: 18685,
+            remote_host: "panel.internal".into(),
+            remote_port: 18685,
+        };
+        assert!(
+            persist_forward_rules(&mut catalog, original.id, vec![rule.clone()], |_| Err(
+                "disk failure".into()
+            ))
+            .is_err()
+        );
+        assert_eq!(catalog.all(), &[original.clone()]);
+        let saved =
+            persist_forward_rules(&mut catalog, original.id, vec![rule.clone()], |candidate| {
+                assert_eq!(candidate[0].local_port_forwards, vec![rule.clone()]);
+                Ok(())
+            })
+            .unwrap();
+        let mut expected = original;
+        expected.local_port_forwards = vec![rule];
+        assert_eq!(saved, vec![expected]);
+    }
+
+    #[test]
+    fn old_session_json_defaults_to_empty_forward_rules() {
+        let mut old = serde_json::to_value(panda_session::demo_sessions().remove(0)).unwrap();
+        old.as_object_mut().unwrap().remove("local_port_forwards");
+        let session: Session = serde_json::from_value(old).unwrap();
+        assert!(session.local_port_forwards.is_empty());
+    }
 
     #[test]
     fn ai_chat_usage_after_finish_reason_is_retained() {

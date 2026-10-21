@@ -7,6 +7,7 @@ import {
   type AiConversationState,
 } from './aiRuntime';
 import { aiTreePath, branchAiTree, migrateAiTree, switchAiTree } from './aiConversationTree';
+import { prepareAiToolContinuation } from './aiAgentContinuation';
 
 const conversation = (): AiConversationState => ({
   id: '2e9b8336-8fb7-4268-8eb8-84113cf716a4',
@@ -165,6 +166,27 @@ describe('AI runtime persistence', () => {
     expect(stored.messages.map(({ id }) => id)).toEqual([ancestor.id, 'descendant']);
     const activeStreaming = toStoredAiConversation({ ...current, messages: [ancestor, streaming] });
     expect(activeStreaming.tree?.active_leaf_id).toBe(ancestor.id);
+  });
+
+  it('persists tool continuation during a streaming reply and avoids continuing it twice after restore', () => {
+    const current = conversation();
+    current.messages[0].proposals = [];
+    const continuation = prepareAiToolContinuation(current, 'assistant-1', () => 'tool-result')!;
+    expect(continuation).not.toBeNull();
+    const streamingReply = { ...current.messages[0], id: 'next-reply', status: 'streaming' as const };
+    const stored = toStoredAiConversation({
+      ...current,
+      messages: [...continuation.baseMessages, continuation.resultMessage, streamingReply],
+    });
+    expect(stored.messages.map(({ role }) => role)).toEqual(['assistant', 'tool']);
+    expect(stored.messages[1]).toMatchObject({ tool_call_id: 'call-terminal-1', status: 'complete' });
+    expect(stored.tree?.active_leaf_id).toBe('tool-result');
+
+    const restored = fromStoredAiConversation(stored);
+    expect(restored.messages[1]).toMatchObject({
+      role: 'tool', toolCallId: 'call-terminal-1', content: continuation.resultMessage.content,
+    });
+    expect(prepareAiToolContinuation(restored, 'assistant-1')).toBeNull();
   });
 
   it('loads legacy conversations that do not contain actions', () => {

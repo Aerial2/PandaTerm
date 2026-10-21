@@ -35,6 +35,7 @@ export const localSession: Session = {
   auth: { type: 'agent' },
   tags: ['local', 'system'],
   last_connected_at: null,
+  local_port_forwards: [],
   reconnect: { enabled: false, max_attempts: 0, delay_ms: 0 },
 };
 

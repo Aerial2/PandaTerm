@@ -1,11 +1,55 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 import { invoke } from '@tauri-apps/api/core';
-import { cancelAiTool, executeAiTool, getAiPermissionSettings, removeAiAllowlistRule, prepareAiFileEdit, sendAiChat, setAiPermissionPolicy, streamAiChat, type AiChatMessage } from './api';
+import { addAiProviderAccount, cancelAiTool, executeAiTool, getAiPermissionSettings, getAiProviderConfig, removeAiAllowlistRule, prepareAiFileEdit, saveAiProviderConfig, sendAiChat, setAiPermissionPolicy, streamAiChat, syncAiProviderModels, testAiProvider, type AiChatMessage } from './api';
 
 beforeEach(() => vi.mocked(invoke).mockReset());
 
 describe('AI command compatibility', () => {
+  it('reads a target account without invoking activation and keeps the legacy read call', async () => {
+    await getAiProviderConfig();
+    expect(invoke).toHaveBeenLastCalledWith('get_ai_provider_config');
+    const snapshot = { account_id: 'target', active_account_id: 'active', accounts: [{ id: 'target', models: ['m'], enabled_models: ['m'] }] };
+    vi.mocked(invoke).mockResolvedValueOnce(snapshot);
+    await expect(getAiProviderConfig('target')).resolves.toEqual(snapshot);
+    expect(invoke).toHaveBeenLastCalledWith('get_ai_provider_config', { accountId: 'target' });
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([undefined, true, false])('saves a target with activate=%s and preserves the returned target snapshot', async (activate) => {
+    const snapshot = { account_id: 'target', active_account_id: activate === false ? 'active' : 'target' };
+    vi.mocked(invoke).mockResolvedValueOnce(snapshot);
+    await expect(saveAiProviderConfig({ account_id: 'target', base_url: 'https://provider.example/v1', model: 'm', use_api_key: true, activate })).resolves.toEqual(snapshot);
+    expect(invoke).toHaveBeenLastCalledWith('save_ai_provider_config', { request: {
+      account_id: 'target', activate: activate ?? true, account_name: null,
+      base_url: 'https://provider.example/v1', model: 'm', models: null, enabled_models: null,
+      reasoning_effort: null, api_format: null, context_window: null, max_tokens: null,
+      use_api_key: true, api_key: null,
+    } });
+  });
+
+  it.each([undefined, true, false])('adds an account with activate=%s', async (activate) => {
+    await addAiProviderAccount(activate);
+    expect(invoke).toHaveBeenLastCalledWith('add_ai_provider_account', { activate: activate ?? true });
+  });
+
+  it('syncs the target and passes its snapshot through without invoking activation', async () => {
+    const snapshot = { account_id: 'target', active_account_id: 'active', models: ['m', 'synced'] };
+    vi.mocked(invoke).mockResolvedValueOnce(snapshot);
+    await expect(syncAiProviderModels({ account_id: 'target' })).resolves.toEqual(snapshot);
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('sync_ai_provider_models', { request: {
+      account_id: 'target', base_url: null, use_api_key: null, api_key: null, api_format: null,
+    } });
+  });
+
+  it.each([undefined, 'target'])('tests with account_id=%s and leaves the saved key fallback to the backend', async (account_id) => {
+    await testAiProvider({ account_id, base_url: 'https://provider.example/v1', model: 'm' });
+    expect(invoke).toHaveBeenLastCalledWith('test_ai_provider', { request: {
+      account_id: account_id ?? null, base_url: 'https://provider.example/v1', model: 'm',
+      api_format: null, use_api_key: true, api_key: null,
+    } });
+  });
+
   it('pins explicit conversation, agent, account and model on the existing stream command', async () => {
     const messages = [{ role: 'user' as const, content: 'task' }];
     await streamAiChat('r', messages, 'agent', { conversation_id: 'c', agent_id: 'a', account_id: 'account', model: 'model' });

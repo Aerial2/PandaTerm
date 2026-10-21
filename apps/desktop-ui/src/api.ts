@@ -257,6 +257,51 @@ export type RecentFile = {
   opened_at: string;
 };
 
+export type LocalPortForward = {
+  id: string;
+  name: string;
+  local_host: string;
+  local_port: number;
+  remote_host: string;
+  remote_port: number;
+};
+
+export type PortForwardStatus = {
+  rule_id: string;
+  instance_id: string;
+  state: 'listening' | 'stopping' | 'failed';
+  local_host: string;
+  local_port: number;
+  remote_host: string;
+  remote_port: number;
+  last_error?: string | null;
+};
+
+export type PortForwardSnapshot = {
+  terminal_id: string;
+  generation: string;
+  revision: number;
+  forwards: PortForwardStatus[];
+};
+
+export type PortForwardsChanged = Pick<PortForwardSnapshot, 'terminal_id' | 'generation' | 'revision'>;
+
+export async function saveLocalPortForwards(sessionId: string, rules: LocalPortForward[]): Promise<Session[]> {
+  return await invoke<Session[]>('save_local_port_forwards', { sessionId, rules });
+}
+
+export async function startLocalPortForward(terminalId: string, ruleId: string): Promise<PortForwardSnapshot> {
+  return await invoke<PortForwardSnapshot>('start_local_port_forward', { terminalId, ruleId });
+}
+
+export async function stopLocalPortForward(terminalId: string, ruleId: string, instanceId: string): Promise<PortForwardSnapshot> {
+  return await invoke<PortForwardSnapshot>('stop_local_port_forward', { terminalId, ruleId, instanceId });
+}
+
+export async function listLocalPortForwards(terminalId: string): Promise<PortForwardSnapshot> {
+  return await invoke<PortForwardSnapshot>('list_local_port_forwards', { terminalId });
+}
+
 export type Session = {
   id: string;
   name: string;
@@ -269,6 +314,7 @@ export type Session = {
   auth: AuthType;
   tags: string[];
   last_connected_at?: string | null;
+  local_port_forwards?: LocalPortForward[];
   reconnect: {
     enabled: boolean;
     max_attempts: number;
@@ -445,12 +491,15 @@ export type AiProviderAccountView = {
   name: string;
   base_url: string;
   model: string;
+  /** 账号模型目录；可选以兼容旧版后端 */
+  models?: string[];
+  enabled_models?: string[];
   api_format: string;
   api_key_configured: boolean;
 };
 
 export type AiProviderConfig = {
-  /** 当前激活账号 */
+  /** 本次读取或编辑的目标账号；活动账号由 active_account_id 表示 */
   account_id: string;
   account_name: string;
   base_url: string;
@@ -733,13 +782,16 @@ export async function runAiTerminalCommand(request: {
   return await invoke<AiTerminalCommandResult>('run_ai_terminal_command', { request });
 }
 
-export async function getAiProviderConfig(): Promise<AiProviderConfig> {
-  return await invoke<AiProviderConfig>('get_ai_provider_config');
+export async function getAiProviderConfig(accountId?: string): Promise<AiProviderConfig> {
+  if (accountId === undefined) return await invoke<AiProviderConfig>('get_ai_provider_config');
+  return await invoke<AiProviderConfig>('get_ai_provider_config', { accountId });
 }
 
 export async function saveAiProviderConfig(
   config: Pick<AiProviderConfig, 'base_url' | 'model' | 'use_api_key'> & {
     account_id?: string;
+    /** 默认 true；false 仅保存目标账号，不切换活动账号 */
+    activate?: boolean;
     account_name?: string;
     models?: string[];
     enabled_models?: string[];
@@ -753,6 +805,7 @@ export async function saveAiProviderConfig(
   return await invoke<AiProviderConfig>('save_ai_provider_config', {
     request: {
       account_id: config.account_id ?? null,
+      activate: config.activate ?? true,
       account_name: config.account_name ?? null,
       base_url: config.base_url,
       model: config.model,
@@ -768,8 +821,8 @@ export async function saveAiProviderConfig(
   });
 }
 
-export async function addAiProviderAccount(): Promise<AiProviderConfig> {
-  return await invoke<AiProviderConfig>('add_ai_provider_account');
+export async function addAiProviderAccount(activate = true): Promise<AiProviderConfig> {
+  return await invoke<AiProviderConfig>('add_ai_provider_account', { activate });
 }
 
 export async function deleteAiProviderAccount(accountId: string): Promise<AiProviderConfig> {
@@ -817,6 +870,7 @@ export type AiProviderTestResult = {
 
 /** 使用草稿配置流式探测连通性（不落盘；返回首字/总耗时） */
 export async function testAiProvider(request: {
+  account_id?: string | null;
   base_url: string;
   model: string;
   api_format?: string | null;
@@ -825,6 +879,7 @@ export async function testAiProvider(request: {
 }): Promise<AiProviderTestResult> {
   return await invoke<AiProviderTestResult>('test_ai_provider', {
     request: {
+      account_id: request.account_id ?? null,
       base_url: request.base_url,
       model: request.model,
       api_format: request.api_format ?? null,

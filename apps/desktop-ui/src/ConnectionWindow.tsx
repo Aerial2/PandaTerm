@@ -419,6 +419,7 @@ export function ConnectionWindow() {
       auth: buildConnectionAuth(),
       tags: [...new Set(connectionForm.tags.split(',').map((tag) => tag.trim()).filter(Boolean))],
       last_connected_at: original?.last_connected_at ?? null,
+      local_port_forwards: original?.local_port_forwards ?? [],
       reconnect: original?.reconnect ?? { enabled: true, max_attempts: 3, delay_ms: 1500 },
     };
 

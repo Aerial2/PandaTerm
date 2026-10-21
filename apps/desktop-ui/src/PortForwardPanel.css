@@ -1,0 +1,30 @@
+.port-forward-panel { flex: 1; min-width: 0; overflow: auto; padding: 16px; color: var(--text-primary); }
+.port-forward-header, .port-forward-card-head, .port-forward-editor-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.port-forward-header h2 { font-size: 14px; margin: 0 0 4px; }
+.port-forward-header span, .port-forward-loading { font-size: 12px; opacity: .65; }
+.port-forward-panel button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: 1px solid var(--menu-border); border-radius: 5px; background: transparent; color: inherit; padding: 6px 8px; cursor: pointer; font-size: 12px; }
+.port-forward-panel button:disabled { opacity: .4; cursor: default; }
+.port-forward-panel button:hover:not(:disabled) { background: var(--hover-bg, #ffffff10); }
+.port-forward-list { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+.port-forward-card, .port-forward-editor { border: 1px solid var(--menu-border); border-radius: 7px; padding: 12px; }
+.port-forward-card-head strong { font-size: 13px; overflow-wrap: anywhere; }
+.port-forward-state { font-size: 11px; white-space: nowrap; opacity: .65; }
+.port-forward-state.listening { color: var(--success-color, #98c379); opacity: 1; }
+.port-forward-state.failed { color: var(--error-color, #e06c75); opacity: 1; }
+.port-forward-route { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 10px 0; font-size: 12px; overflow-wrap: anywhere; }
+.port-forward-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.port-forward-notice, .port-forward-error, .port-forward-warning, .port-forward-card-error { margin-top: 10px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.port-forward-notice { opacity: .7; }
+.port-forward-error, .port-forward-card-error { color: var(--error-color, #e06c75); }
+.port-forward-warning { color: var(--warning-color, #e5c07b); }
+.port-forward-empty { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 32px 0; opacity: .65; font-size: 13px; }
+.port-forward-editor { margin-top: 16px; }
+.port-forward-editor-head { margin-bottom: 12px; font-size: 13px; }
+.port-forward-editor label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
+.port-forward-editor input { min-width: 0; width: 100%; box-sizing: border-box; border: 1px solid var(--menu-border); border-radius: 4px; background: var(--input-bg, #ffffff08); color: inherit; padding: 7px; }
+.port-forward-fields { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 10px; margin-top: 10px; }
+.port-forward-save { margin-top: 12px; }
+.port-forward-help { color: var(--text-muted); font-size: 12px; line-height: 1.6; }
+.port-forward-header > div:first-child { min-width: 0; }
+.port-forward-header span { overflow-wrap: anywhere; }
+.port-forward-panel input:focus-visible, .port-forward-panel button:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }

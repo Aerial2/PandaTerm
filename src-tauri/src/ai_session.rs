@@ -66,6 +66,8 @@ pub(crate) struct AiStoredMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tool_calls: Option<Vec<AiStoredToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) usage: Option<AiStoredUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) agent_id: Option<String>,
@@ -307,8 +309,13 @@ fn validate_message(message: &AiStoredMessage) -> Result<usize, String> {
     if !valid_message_id(&message.id) {
         return Err("AI 会话消息 ID 无效".to_string());
     }
-    if !matches!(message.role.as_str(), "user" | "assistant") {
+    if !matches!(message.role.as_str(), "user" | "assistant" | "tool") {
         return Err("AI 会话消息角色无效".to_string());
+    }
+    if message.tool_call_id.as_ref().is_some_and(|id| {
+        id.trim().is_empty() || id.len() > 200 || id.chars().any(char::is_control)
+    }) {
+        return Err("AI 会话工具调用 ID 无效".to_string());
     }
     // Checkpoints may be saved while a response is in flight. Recovery changes these
     // states to cancelled/error; it never replays a tool or invents its result.
@@ -615,6 +622,9 @@ pub(crate) fn upsert_conversation(
                 if node.message.tool_calls.is_none() {
                     node.message.tool_calls = old_node.message.tool_calls.clone();
                 }
+                if node.message.tool_call_id.is_none() {
+                    node.message.tool_call_id = old_node.message.tool_call_id.clone();
+                }
                 if node.message.usage.is_none() {
                     node.message.usage = old_node.message.usage.clone();
                 }
@@ -812,6 +822,70 @@ mod tests {
         assert_eq!(restored.duration_ms, Some(125_000));
         assert_eq!(restored.generation_duration_ms, Some(100_000));
         assert_eq!(restored.first_token_duration_ms, Some(1_250));
+    }
+
+    #[test]
+    fn tool_result_checkpoint_round_trips_and_preserves_call_id_on_partial_update() {
+        let mut incoming = conversation();
+        let mut result = pinned_message("tool-result");
+        result.role = "tool".into();
+        result.tool_call_id = Some("call-1".into());
+        result.content = r#"[{"role":"tool","tool_call_id":"call-1","content":"ok"}]"#.into();
+        incoming.messages.push(result);
+        let mut store = AiConversationStore::default();
+        upsert_conversation(&mut store, incoming).unwrap();
+
+        let mut restored = decode_store(&encode_store(&store).unwrap()).unwrap();
+        let result = &restored.conversations[0].messages[2];
+        assert_eq!(result.role, "tool");
+        assert_eq!(result.tool_call_id.as_deref(), Some("call-1"));
+        assert!(result.content.contains("\"content\":\"ok\""));
+        assert_eq!(result.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(
+            restored.conversations[0].tree.as_ref().unwrap().nodes[2]
+                .message
+                .tool_call_id
+                .as_deref(),
+            Some("call-1")
+        );
+
+        let mut partial = restored.conversations[0].clone();
+        partial.tree = None;
+        partial.messages[2].tool_call_id = None;
+        upsert_conversation(&mut restored, partial).unwrap();
+        assert_eq!(
+            restored.conversations[0].messages[2]
+                .tool_call_id
+                .as_deref(),
+            Some("call-1")
+        );
+    }
+
+    #[test]
+    fn legacy_tool_result_without_call_id_remains_loadable() {
+        let mut legacy = conversation();
+        legacy.messages[1].role = "tool".into();
+        let restored = decode_store(&store_json(2, &legacy)).unwrap();
+        assert_eq!(restored.conversations[0].messages[1].role, "tool");
+        assert_eq!(restored.conversations[0].messages[1].tool_call_id, None);
+    }
+
+    #[test]
+    fn rejects_unknown_roles_and_invalid_tool_call_ids() {
+        let mut result = message("result");
+        result.role = "system".into();
+        assert_eq!(
+            validate_message(&result).unwrap_err(),
+            "AI 会话消息角色无效"
+        );
+        result.role = "tool".into();
+        for id in [" ".to_string(), "x".repeat(201), "call\n1".to_string()] {
+            result.tool_call_id = Some(id);
+            assert_eq!(
+                validate_message(&result).unwrap_err(),
+                "AI 会话工具调用 ID 无效"
+            );
+        }
     }
 
     #[test]

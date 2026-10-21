@@ -88,6 +88,7 @@ fn parse_xshell_session(path: &Path) -> Option<Session> {
         tags: vec!["xshell".to_string(), protocol.to_lowercase()],
         last_connected_at: None,
         reconnect: ReconnectPolicy::default(),
+        local_port_forwards: Vec::new(),
     })
 }
 

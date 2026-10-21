@@ -1,4 +1,5 @@
 import type { CSSProperties } from 'react';
+import { Network } from 'lucide-react';
 
 import aiIcon from './assets/activity/ai.svg';
 import filesIcon from './assets/activity/files.svg';
@@ -9,7 +10,7 @@ import resourceMonitorIcon from './assets/activity/resource-monitor.svg';
 type ActivityBarIconName = 'ai' | 'files' | 'processes' | 'resource-monitor' | 'linux-manual';
 
 type ActivityBarIconProps = {
-  name: ActivityBarIconName;
+  name: ActivityBarIconName | 'tunnels';
   size?: number;
   className?: string;
   title?: string;
@@ -32,6 +33,7 @@ const ACTIVITY_ICON_ASPECT_RATIOS: Record<ActivityBarIconName, number> = {
 };
 
 export function ActivityBarIcon({ name, size = 20, className, title }: ActivityBarIconProps) {
+  if (name === 'tunnels') return <Network size={size} className={className} aria-label={title} aria-hidden={title ? undefined : true} />;
   const aspectRatio = ACTIVITY_ICON_ASPECT_RATIOS[name];
 
   return (
