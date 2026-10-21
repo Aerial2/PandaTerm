@@ -13,6 +13,56 @@ pub enum Protocol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalPortForward {
+    pub id: Uuid,
+    pub name: String,
+    pub local_host: String,
+    pub local_port: u16,
+    pub remote_host: String,
+    pub remote_port: u16,
+}
+
+pub fn validate_local_port_forwards(rules: &[LocalPortForward]) -> SessionResult<()> {
+    let mut ids = std::collections::HashSet::new();
+    let mut listeners = std::collections::HashSet::new();
+    for rule in rules {
+        if rule.id.is_nil() || !ids.insert(rule.id) {
+            return Err(SessionError::Validation(
+                "forward rule IDs must be non-nil and unique".into(),
+            ));
+        }
+        if rule.name.trim().is_empty() {
+            return Err(SessionError::Validation("forward name is required".into()));
+        }
+        let ip = rule
+            .local_host
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| SessionError::Validation("local host must be an IP address".into()))?;
+        if rule.local_port == 0 || rule.remote_port == 0 {
+            return Err(SessionError::Validation(
+                "forward ports must be greater than zero".into(),
+            ));
+        }
+        if rule.remote_host.trim().is_empty()
+            || rule
+                .remote_host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(SessionError::Validation(
+                "remote host must be a nonempty IP or DNS name".into(),
+            ));
+        }
+        if !listeners.insert((ip, rule.local_port)) {
+            return Err(SessionError::Validation(
+                "duplicate local forwarding address and port".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Session {
     pub id: Uuid,
     pub name: String,
@@ -29,6 +79,8 @@ pub struct Session {
     pub tags: Vec<String>,
     pub last_connected_at: Option<String>,
     pub reconnect: ReconnectPolicy,
+    #[serde(default)]
+    pub local_port_forwards: Vec<LocalPortForward>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,7 +144,10 @@ pub struct SessionCatalog {
 impl SessionCatalog {
     pub fn new(sessions: Vec<Session>) -> Self {
         Self {
-            sessions: sessions.into_iter().map(normalize_session_metadata).collect(),
+            sessions: sessions
+                .into_iter()
+                .map(normalize_session_metadata)
+                .collect(),
         }
     }
 
@@ -158,8 +213,11 @@ impl SessionCatalog {
     /// or out-of-date id list never drops data.
     pub fn reorder(&mut self, ordered_ids: &[Uuid]) -> SessionResult<()> {
         use std::collections::HashMap;
-        let by_id: HashMap<Uuid, &Session> =
-            self.sessions.iter().map(|session| (session.id, session)).collect();
+        let by_id: HashMap<Uuid, &Session> = self
+            .sessions
+            .iter()
+            .map(|session| (session.id, session))
+            .collect();
         let mut next = Vec::with_capacity(self.sessions.len());
         for id in ordered_ids {
             if let Some(session) = by_id.get(id) {
@@ -207,7 +265,7 @@ pub fn validate_session(session: &Session) -> SessionResult<()> {
         ));
     }
 
-    Ok(())
+    validate_local_port_forwards(&session.local_port_forwards)
 }
 
 #[cfg(test)]
@@ -228,14 +286,57 @@ mod tests {
             tags: tags.iter().map(|tag| (*tag).into()).collect(),
             last_connected_at: None,
             reconnect: ReconnectPolicy::default(),
+            local_port_forwards: Vec::new(),
         }
+    }
+
+    #[test]
+    fn forwarding_validation_accepts_ip_bindings_and_dns_targets() {
+        let mut rule = LocalPortForward {
+            id: Uuid::new_v4(),
+            name: "panel".into(),
+            local_host: "0.0.0.0".into(),
+            local_port: 18685,
+            remote_host: "panel.internal".into(),
+            remote_port: 443,
+        };
+        assert!(validate_local_port_forwards(&[rule.clone()]).is_ok());
+        rule.local_host = "::1".into();
+        assert!(validate_local_port_forwards(&[rule.clone()]).is_ok());
+        assert!(validate_local_port_forwards(&[rule.clone(), rule.clone()]).is_err());
+        let mut duplicate = rule.clone();
+        duplicate.id = Uuid::new_v4();
+        assert!(validate_local_port_forwards(&[rule.clone(), duplicate]).is_err());
+        for invalid in ["localhost", "256.0.0.1", "", "127.0.0.1:80"] {
+            let mut bad = rule.clone();
+            bad.local_host = invalid.into();
+            assert!(validate_local_port_forwards(&[bad]).is_err());
+        }
+        for invalid in ["", "bad host", "host\n"] {
+            let mut bad = rule.clone();
+            bad.remote_host = invalid.into();
+            assert!(validate_local_port_forwards(&[bad]).is_err());
+        }
+        let mut bad = rule.clone();
+        bad.id = Uuid::nil();
+        assert!(validate_local_port_forwards(&[bad]).is_err());
+        let mut bad = rule.clone();
+        bad.name = " ".into();
+        assert!(validate_local_port_forwards(&[bad]).is_err());
+        let mut bad = rule.clone();
+        bad.local_port = 0;
+        assert!(validate_local_port_forwards(&[bad]).is_err());
+        rule.remote_port = 0;
+        assert!(validate_local_port_forwards(&[rule]).is_err());
     }
 
     #[test]
     fn upsert_normalizes_metadata() {
         let id = Uuid::new_v4();
         let mut catalog = SessionCatalog::default();
-        catalog.upsert(make_session(id, "  ", &[" linux ", "", "linux"])).unwrap();
+        catalog
+            .upsert(make_session(id, "  ", &[" linux ", "", "linux"]))
+            .unwrap();
         assert_eq!(catalog.all()[0].group, "Custom");
         assert_eq!(catalog.all()[0].tags, vec!["linux"]);
     }
@@ -288,6 +389,7 @@ pub fn demo_sessions() -> Vec<Session> {
             tags: vec!["gateway".into(), "critical".into()],
             last_connected_at: None,
             reconnect: ReconnectPolicy::default(),
+            local_port_forwards: Vec::new(),
         },
         Session {
             id: Uuid::new_v4(),
@@ -304,6 +406,7 @@ pub fn demo_sessions() -> Vec<Session> {
             tags: vec!["test".into()],
             last_connected_at: None,
             reconnect: ReconnectPolicy::default(),
+            local_port_forwards: Vec::new(),
         },
     ]
 }
